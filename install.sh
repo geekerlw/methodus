@@ -3,6 +3,9 @@ set -e
 
 REPO="https://raw.githubusercontent.com/geekerlw/methodus/main"
 
+# When piped via curl|bash, stdin is the pipe — redirect all reads from /dev/tty
+exec < /dev/tty
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 prompt_choice() {
@@ -16,7 +19,6 @@ prompt_choice() {
   while true; do
     printf "Enter numbers separated by spaces (e.g. 1 2): "
     read -r input
-    # validate: all tokens are valid indices
     local valid=true
     for tok in $input; do
       if ! [[ "$tok" =~ ^[0-9]+$ ]] || (( tok < 1 || tok > ${#options[@]} )); then
@@ -25,22 +27,9 @@ prompt_choice() {
         break
       fi
     done
-    $valid && break
+    $valid && [ -n "$input" ] && break
   done
   CHOICE_RESULT="$input"
-}
-
-prompt_yn() {
-  local question="$1"
-  while true; do
-    printf "%s [y/n]: " "$question"
-    read -r yn
-    case "$yn" in
-      [Yy]*) return 0 ;;
-      [Nn]*) return 1 ;;
-      *) echo "  Please answer y or n." ;;
-    esac
-  done
 }
 
 install_to() {
