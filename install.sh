@@ -3,9 +3,6 @@ set -e
 
 REPO="https://raw.githubusercontent.com/geekerlw/methodus/main"
 
-# When piped via curl|bash, stdin is the pipe — redirect all reads from /dev/tty
-exec < /dev/tty
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 prompt_choice() {
@@ -18,7 +15,7 @@ prompt_choice() {
   done
   while true; do
     printf "Enter numbers separated by spaces (e.g. 1 2): "
-    read -r input
+    read -r input </dev/tty
     local valid=true
     for tok in $input; do
       if ! [[ "$tok" =~ ^[0-9]+$ ]] || (( tok < 1 || tok > ${#options[@]} )); then
@@ -56,7 +53,7 @@ echo "  1) Global  — ~/.{platform}/agents/  (available in all projects)"
 echo "  2) Project — .{platform}/agents/    (current directory only)"
 while true; do
   printf "Choose scope [1/2]: "
-  read -r scope
+  read -r scope </dev/tty
   case "$scope" in
     1|2) break ;;
     *) echo "  Please enter 1 or 2." ;;
