@@ -64,20 +64,26 @@ Step 2: <skill-name> — <rationale> → <expected output>
 Proceed? (yes / adjust / cancel)
 ```
 
-Do not begin execution until the user confirms.
+Wait for the user to reply with one of:
+- **`yes`** — begin execution from Step 1
+- **`adjust`** — ask the user what to change, update the plan, show the revised plan, and wait for confirmation again — **do not execute anything yet**
+- **`cancel`** — stop entirely
+
+Do not begin execution until the user explicitly replies `yes` to the current plan.
 
 ## Phase 4: Execution Loop
 
-For each confirmed step:
+Each skill must run interactively — the user drives it, not methodus. For each confirmed step:
 
 1. Announce: `Executing step N: <skill-name> — <rationale>`
-2. Invoke the skill
-3. Evaluate: confirm the expected output artifact exists or success signal was observed
-4. On failure:
+2. Invoke the skill by name so it runs in the current conversation, **not as a sub-agent or pre-filled background task** — the skill must be able to ask the user questions and receive answers directly
+3. Wait for the skill to complete and the user to acknowledge before moving to the next step
+4. Evaluate: confirm the expected output artifact exists or success signal was observed
+5. On failure:
    - Record the failure reason
    - Check `skill_fallibles` in `~/.methodus/experience.json` for an alternative skill
    - Replan the remaining steps (maximum 2 replans total to avoid loops)
-   - Announce the revised plan before continuing
+   - Show the revised plan and wait for `yes` before continuing
 
 ## Phase 5: Experience Update
 
