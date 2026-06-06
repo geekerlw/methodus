@@ -24,20 +24,28 @@ SELECTED_PLATFORMS=()
 if [[ -n "${METHODUS_PLATFORMS:-}" ]]; then
   IFS=',' read -ra SELECTED_PLATFORMS <<< "$METHODUS_PLATFORMS"
 elif [[ -t 1 ]]; then
-  printf "Which platforms to install? (options: claude, cursor, all) [all]: " > /dev/tty
-  if read -r platform_input < /dev/tty; then
-    :
-  else
-    platform_input="all"
-  fi
+  printf "Which platforms to install? (Enter = all)\n" > /dev/tty
+  printf "  [1] claude  [2] cursor  [space/Enter] all\n" > /dev/tty
+  printf "Select: " > /dev/tty
+  read -r platform_input < /dev/tty
   platform_input="${platform_input:-all}"
-  if [[ "$platform_input" == "all" ]]; then
-    SELECTED_PLATFORMS=("${PLATFORMS[@]}")
-  else
-    IFS=',' read -ra SELECTED_PLATFORMS <<< "$platform_input"
-  fi
+
+  case "$platform_input" in
+    ""|" "|all|a)
+      SELECTED_PLATFORMS=("${PLATFORMS[@]}")
+      ;;
+    *)
+      for tok in $platform_input; do
+        case "$tok" in
+          1|claude|c)   SELECTED_PLATFORMS+=("claude") ;;
+          2|cursor|u)   SELECTED_PLATFORMS+=("cursor") ;;
+        esac
+      done
+      [[ ${#SELECTED_PLATFORMS[@]} -eq 0 ]] && SELECTED_PLATFORMS=("${PLATFORMS[@]}")
+      ;;
+  esac
 else
-  echo "Non-interactive session detected → installing to all platforms."
+  echo "Non-interactive session → installing to all platforms."
   echo "Set METHODUS_PLATFORMS=claude or METHODUS_PLATFORMS=cursor to limit."
   SELECTED_PLATFORMS=("${PLATFORMS[@]}")
 fi
@@ -49,15 +57,17 @@ scope=""
 if [[ -n "${METHODUS_SCOPE:-}" ]]; then
   scope="$METHODUS_SCOPE"
 elif [[ -t 1 ]]; then
-  printf "Install scope — global or project? [global]: " > /dev/tty
-  if read -r scope_input < /dev/tty; then
-    :
-  else
-    scope_input="global"
-  fi
-  scope="${scope_input:-global}"
+  printf "Install scope? (Enter = global)\n" > /dev/tty
+  printf "  [1/g] global  [2/p] project\n" > /dev/tty
+  printf "Select: " > /dev/tty
+  read -r scope_input < /dev/tty
+  case "${scope_input:-g}" in
+    ""|1|g|global)   scope="global" ;;
+    2|p|project)     scope="project" ;;
+    *)               scope="global" ;;
+  esac
 else
-  echo "Non-interactive session detected → installing globally."
+  echo "Non-interactive session → installing globally."
   echo "Set METHODUS_SCOPE=project to install into the current directory."
   scope="global"
 fi
@@ -91,7 +101,7 @@ install_to() {
 installed=0
 
 for platform in "${SELECTED_PLATFORMS[@]}"; do
-  platform="$(echo "$platform" | xargs)"  # trim whitespace
+  platform="$(echo "$platform" | xargs)"
   if [[ "$scope" == "project" ]]; then
     base="$(pwd)/.$platform"
   else
