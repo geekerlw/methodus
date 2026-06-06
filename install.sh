@@ -3,6 +3,7 @@
 set -euo pipefail
 
 REPO="https://raw.githubusercontent.com/geekerlw/methodus/main"
+TTY=/dev/tty
 
 cat <<'BANNER'
   __  __      _   _               _
@@ -16,38 +17,123 @@ echo "  Dynamic Skill Planning Agent"
 echo "  Author : Steven Lee"
 echo ""
 
+# ── interactive UI ────────────────────────────────────────────────────────────
+
+# multi_select <prompt> <opt1> <opt2> ...  →  MULTI_RESULT array
+multi_select() {
+  local prompt="$1"; shift
+  local options=("$@")
+  local n=${#options[@]}
+  local cursor=0
+  local i
+  local selected=()
+  for ((i=0; i<n; i++)); do selected[$i]=1; done  # default: all selected
+
+  _ms_draw() {
+    for ((i=0; i<n; i++)); do
+      local box="[ ]"
+      [[ "${selected[$i]}" -eq 1 ]] && box="[x]"
+      if [[ $i -eq $cursor ]]; then
+        printf "\r\033[K  \033[36m❯\033[0m \033[1m%s %s\033[0m\n" "$box" "${options[$i]}" > "$TTY"
+      else
+        printf "\r\033[K    %s %s\n" "$box" "${options[$i]}" > "$TTY"
+      fi
+    done
+  }
+
+  printf "\n%s\n" "$prompt" > "$TTY"
+  printf "  \033[2m↑↓ navigate · space toggle · enter confirm\033[0m\n" > "$TTY"
+  tput civis > "$TTY" 2>/dev/null || true
+  _ms_draw
+
+  while true; do
+    printf "\033[%dA" "$n" > "$TTY"
+    local key=""
+    IFS= read -rsn1 key < "$TTY" || true
+    if [[ "$key" == $'\x1b' ]]; then
+      local esc=""
+      IFS= read -rsn2 -t 0.1 esc < "$TTY" || true
+      case "$esc" in
+        '[A') [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
+        '[B') [[ $cursor -lt $((n-1)) ]] && cursor=$((cursor + 1)) ;;
+      esac
+    elif [[ "$key" == " " ]]; then
+      selected[$cursor]=$(( 1 - selected[$cursor] ))
+    elif [[ -z "$key" ]]; then
+      break
+    fi
+    _ms_draw
+  done
+
+  tput cnorm > "$TTY" 2>/dev/null || true
+  printf "\n" > "$TTY"
+
+  MULTI_RESULT=()
+  for ((i=0; i<n; i++)); do
+    [[ "${selected[$i]}" -eq 1 ]] && MULTI_RESULT+=("${options[$i]}")
+  done
+}
+
+# single_select <prompt> <opt1> <opt2> ...  →  SINGLE_RESULT
+single_select() {
+  local prompt="$1"; shift
+  local options=("$@")
+  local n=${#options[@]}
+  local cursor=0
+  local i
+
+  _ss_draw() {
+    for ((i=0; i<n; i++)); do
+      if [[ $i -eq $cursor ]]; then
+        printf "\r\033[K  \033[36m❯\033[0m \033[1m(*) %s\033[0m\n" "${options[$i]}" > "$TTY"
+      else
+        printf "\r\033[K    ( ) %s\n" "${options[$i]}" > "$TTY"
+      fi
+    done
+  }
+
+  printf "\n%s\n" "$prompt" > "$TTY"
+  printf "  \033[2m↑↓ navigate · enter confirm\033[0m\n" > "$TTY"
+  tput civis > "$TTY" 2>/dev/null || true
+  _ss_draw
+
+  while true; do
+    printf "\033[%dA" "$n" > "$TTY"
+    local key=""
+    IFS= read -rsn1 key < "$TTY" || true
+    if [[ "$key" == $'\x1b' ]]; then
+      local esc=""
+      IFS= read -rsn2 -t 0.1 esc < "$TTY" || true
+      case "$esc" in
+        '[A') [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
+        '[B') [[ $cursor -lt $((n-1)) ]] && cursor=$((cursor + 1)) ;;
+      esac
+    elif [[ -z "$key" ]]; then
+      break
+    fi
+    _ss_draw
+  done
+
+  tput cnorm > "$TTY" 2>/dev/null || true
+  printf "\n" > "$TTY"
+
+  SINGLE_RESULT="${options[$cursor]}"
+}
+
 # ── platform selection ────────────────────────────────────────────────────────
 
-PLATFORMS=("claude" "cursor")
 SELECTED_PLATFORMS=()
 
 if [[ -n "${METHODUS_PLATFORMS:-}" ]]; then
   IFS=',' read -ra SELECTED_PLATFORMS <<< "$METHODUS_PLATFORMS"
 elif [[ -t 1 ]]; then
-  printf "Which platforms to install? (Enter = all)\n" > /dev/tty
-  printf "  [1] claude  [2] cursor  [space/Enter] all\n" > /dev/tty
-  printf "Select: " > /dev/tty
-  read -r platform_input < /dev/tty
-  platform_input="${platform_input:-all}"
-
-  case "$platform_input" in
-    ""|" "|all|a)
-      SELECTED_PLATFORMS=("${PLATFORMS[@]}")
-      ;;
-    *)
-      for tok in $platform_input; do
-        case "$tok" in
-          1|claude|c)   SELECTED_PLATFORMS+=("claude") ;;
-          2|cursor|u)   SELECTED_PLATFORMS+=("cursor") ;;
-        esac
-      done
-      [[ ${#SELECTED_PLATFORMS[@]} -eq 0 ]] && SELECTED_PLATFORMS=("${PLATFORMS[@]}")
-      ;;
-  esac
+  multi_select "Which platforms to install?" "claude" "cursor"
+  SELECTED_PLATFORMS=("${MULTI_RESULT[@]}")
+  [[ ${#SELECTED_PLATFORMS[@]} -eq 0 ]] && SELECTED_PLATFORMS=("claude" "cursor")
 else
   echo "Non-interactive session → installing to all platforms."
   echo "Set METHODUS_PLATFORMS=claude or METHODUS_PLATFORMS=cursor to limit."
-  SELECTED_PLATFORMS=("${PLATFORMS[@]}")
+  SELECTED_PLATFORMS=("claude" "cursor")
 fi
 
 # ── scope selection ───────────────────────────────────────────────────────────
@@ -57,15 +143,8 @@ scope=""
 if [[ -n "${METHODUS_SCOPE:-}" ]]; then
   scope="$METHODUS_SCOPE"
 elif [[ -t 1 ]]; then
-  printf "Install scope? (Enter = global)\n" > /dev/tty
-  printf "  [1/g] global  [2/p] project\n" > /dev/tty
-  printf "Select: " > /dev/tty
-  read -r scope_input < /dev/tty
-  case "${scope_input:-g}" in
-    ""|1|g|global)   scope="global" ;;
-    2|p|project)     scope="project" ;;
-    *)               scope="global" ;;
-  esac
+  single_select "Install scope?" "global (~/.{platform}/agents/)" "project (./{platform}/agents/)"
+  [[ "$SINGLE_RESULT" == global* ]] && scope="global" || scope="project"
 else
   echo "Non-interactive session → installing globally."
   echo "Set METHODUS_SCOPE=project to install into the current directory."
@@ -77,7 +156,6 @@ fi
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
-echo ""
 echo "⬇️  Downloading methodus agent..."
 if command -v curl >/dev/null 2>&1; then
   curl -fsSL "$REPO/methodus.md" -o "$TMP"
@@ -99,9 +177,8 @@ install_to() {
 }
 
 installed=0
-
 for platform in "${SELECTED_PLATFORMS[@]}"; do
-  platform="$(echo "$platform" | xargs)"
+  platform="$(printf '%s' "$platform" | xargs)"
   if [[ "$scope" == "project" ]]; then
     base="$(pwd)/.$platform"
   else
