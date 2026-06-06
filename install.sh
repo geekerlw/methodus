@@ -51,9 +51,10 @@ multi_select() {
     local key=""
     IFS= read -rsn1 key < "$TTY" || true
     if [[ "$key" == $'\x1b' ]]; then
-      local esc=""
-      IFS= read -rsn2 -t 0.1 esc < "$TTY" || true
-      case "$esc" in
+      local k2="" k3=""
+      IFS= read -rsn1 k2 < "$TTY" || true
+      IFS= read -rsn1 k3 < "$TTY" || true
+      case "$k2$k3" in
         '[A') [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
         '[B') [[ $cursor -lt $((n-1)) ]] && cursor=$((cursor + 1)) ;;
       esac
@@ -102,9 +103,10 @@ single_select() {
     local key=""
     IFS= read -rsn1 key < "$TTY" || true
     if [[ "$key" == $'\x1b' ]]; then
-      local esc=""
-      IFS= read -rsn2 -t 0.1 esc < "$TTY" || true
-      case "$esc" in
+      local k2="" k3=""
+      IFS= read -rsn1 k2 < "$TTY" || true
+      IFS= read -rsn1 k3 < "$TTY" || true
+      case "$k2$k3" in
         '[A') [[ $cursor -gt 0 ]] && cursor=$((cursor - 1)) ;;
         '[B') [[ $cursor -lt $((n-1)) ]] && cursor=$((cursor + 1)) ;;
       esac
