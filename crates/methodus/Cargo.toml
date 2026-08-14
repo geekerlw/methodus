@@ -1,0 +1,21 @@
+[package]
+name = "methodus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Methodus — Persistent Personal Expert System (CLI + TUI binary)"
+
+[[bin]]
+name = "methodus"
+path = "src/main.rs"
+
+[dependencies]
+methodus-domain = { path = "../methodus-domain" }
+methodus-store = { path = "../methodus-store" }
+methodus-runtime = { path = "../methodus-runtime" }
+methodus-core = { path = "../methodus-core" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

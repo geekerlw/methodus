@@ -1,0 +1,18 @@
+[package]
+name = "methodus-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RuntimeAdapter trait and executor implementations (Claude Code, Codex, Cursor)"
+
+[dependencies]
+methodus-domain = { path = "../methodus-domain" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+libc.workspace = true

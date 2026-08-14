@@ -1,1 +1,17 @@
 .DS_Store
+
+# Local agent/tooling config
+.cursor/
+.nex/
+.claude/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Methodus local runtime state (never commit)
+/.methodus/
+*.db
+*.db-shm
+*.db-wal

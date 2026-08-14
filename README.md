@@ -1,42 +1,87 @@
-# methodus
+# Methodus
 
-A goal-directed planning agent for software development. Dynamically composes available skills into an execution plan, adapts on failure, and learns from past workflows.
+> **Persistent Personal Expert System** — a long-running local daemon that picks the
+> right expert perspective, method, and skills for your task, drives an AI coding
+> agent to do the work in an isolated workspace, supervises the result, and distills
+> vetted experience into reusable knowledge over time.
 
-Works standalone — no other tooling required.
+Methodus is **not** another coding agent. It is the brain that orchestrates one:
+it selects, prepares, observes, evaluates, and remembers — while an external
+executor (Claude Code, Codex, or Cursor) acts as the hands.
 
-## Install
+> Methodus does not have one fixed expertise. It learns better methods for the
+> problems you care about.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/geekerlw/methodus/main/install.sh | bash
+## Status
+
+**Pre-implementation.** This repository currently contains the product reference and
+technical design only. The runtime has not been built yet.
+
+- Product & design: [`docs/design/`](./docs/design/) — the product contract
+  ([`00-product.md`](./docs/design/00-product.md): the *what & why*) plus the technical
+  design (*how*: runtime adapters, architecture, data model, roadmap).
+- v1 (archived prompt agent): [`docs/legacy/`](./docs/legacy/).
+
+## Core ideas
+
+- **Persistent** — a single long-lived local process you keep open (e.g. in `tmux`);
+  background work is scheduled, budgeted, and policy-controlled (never an unbounded
+  `while true` LLM loop).
+- **Personal** — knowledge, experience, and project context are yours, stored locally.
+- **Adaptive** — no permanently bound role; each task loads one or more *Faces*
+  (domain expert snapshots) on demand.
+- **Evidence-first** — observations, experiences, hypotheses, candidate knowledge,
+  and committed knowledge are layered; a single model output is never treated as fact.
+- **Executor-agnostic** — Methodus drives Claude Code / Codex / Cursor through a
+  uniform `RuntimeAdapter`; it is not welded to any one of them.
+- **Human-in-the-loop** — dangerous actions, knowledge promotion, and proactive
+  questions are gated by policy.
+
+## Architecture at a glance
+
+```text
+methodus (one long-lived Rust process, kept open in tmux)
+  ├── Engine (methodus-core, a UI-free library)
+  │     ├── Task / Face / Method / Skill resolution
+  │     ├── Policy engine (permission decisions)
+  │     ├── Knowledge & Experience store (SQLite + YAML/Markdown)
+  │     ├── Learning / Curiosity scheduling (queued jobs, budgeted)
+  │     └── Session Manager
+  │           ├── Claude Code adapter   (print/stream-json, --resume; --bg for recovery)
+  │           ├── Codex adapter         (exec --json; app-server JSON-RPC later)
+  │           └── Cursor adapter        (agent --print stream-json + --resume)
+  └── TUI (ratatui, same process; observes the Engine, issues commands in-process)
 ```
 
-Installs `methodus.md` to the agents directory of any supported platform detected on your machine. Creates `~/.methodus/` for the experience store.
+The one process owns all state and the executor sessions. Executor sessions also
+persist on the executor side (session ids + `--resume`), so a Methodus restart
+reconciles and resumes rather than losing work. Run it in `tmux` to keep it alive
+across terminal sessions.
 
-## Usage
+> No separate daemon/client split in v1. `methodus-core` is kept UI-free so that
+> split can be added later as an optional layer *if* an unattended service, multiple
+> simultaneous clients, or a desktop app is ever required. See
+> [`docs/design/02-architecture.md`](./docs/design/02-architecture.md) §0.
 
-In Claude Code or Cursor, describe any open-ended development goal:
+## Technology
 
-```
-@methodus refactor the auth module and add unit tests
-```
+Rust. Async runtime on `tokio`, SQLite for lifecycle/queue/events, YAML/Markdown for
+human-readable domain content (Faces, Methods, Knowledge), `ratatui` for the in-process
+TUI. See [`docs/design/02-architecture.md`](./docs/design/02-architecture.md).
 
-methodus will:
-1. **Clarify** — invoke a clarification skill if available, otherwise ask up to 3 focused questions if the goal is ambiguous
-2. **Discover** — scan all installed skills across detected platforms
-3. **Load experience** — surface past workflow hints from `~/.methodus/experience.json`
-4. **Plan** — show a step-by-step skill sequence for your confirmation
-5. **Execute** — run each step, replanning on failure (max 2 replans)
-6. **Learn** — record the outcome to improve future plans
+## Supported executors
 
-## How it works
+All three have been verified to support non-interactive execution, structured event
+streams, and session resume. See
+[`docs/design/01-runtime-adapters.md`](./docs/design/01-runtime-adapters.md) for the
+full capability matrix and integration details.
 
-- **Skill discovery** — for each supported platform, scans `~/.{platform}/plugins/*/skills/`, `~/.{platform}/skills/`, `~/.{platform}/commands/`, and project-local `.{platform}/skills/`. Works with any SKILL.md-compatible skill, regardless of origin.
-- **Experience store** — `~/.methodus/experience.json` accumulates keyword-matched workflow patterns across all your projects.
-- **Replanning** — on step failure, checks for known alternatives and replans remaining steps (max 2 replans per run).
+| Executor    | Non-interactive | Structured events | Session resume | Real-time approval | Persistent daemon |
+|-------------|:---------------:|:-----------------:|:--------------:|:------------------:|:-----------------:|
+| Claude Code | ✅ `--print`     | ✅ stream-json     | ✅ `--resume`   | ✅                  | ✅ `--bg`          |
+| Codex       | ✅ `exec`        | ✅ `--json`        | ✅ `exec resume`| ✅ (app-server)     | ✅ (app-server)    |
+| Cursor      | ✅ `--print`     | ✅ stream-json     | ✅ `--resume`   | ⚠️ coarse           | ❌                 |
 
-## Supported platforms
+## License
 
-| Platform | Agent directory |
-|----------|----------------|
-| Claude Code | `~/.claude/agents/methodus.md` |
-| Cursor | `~/.cursor/agents/methodus.md` |
+See [`LICENSE`](./LICENSE).

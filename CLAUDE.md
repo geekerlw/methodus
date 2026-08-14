@@ -1,28 +1,96 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (and any AI executor) when working in this repository.
 
 ## What this repo is
 
-methodus is a single-file agent definition (`methodus.md`) plus a shell installer (`install.sh`). There is no build step, no package manager, and no runtime code — the deliverables are plain text files.
+Methodus is a **Persistent Personal Expert System**: a single long-running local Rust
+process that orchestrates an external AI coding agent (Claude Code, Codex, or Cursor)
+to complete tasks, then distills vetted experience into reusable knowledge. You keep
+the one `methodus` process open (e.g. in `tmux`). Methodus is the *brain*; the executor
+is the *hands*.
 
-## Architecture
+**Current state: pre-implementation.** The repo holds the product reference and
+technical design only. There is no Rust code yet. Do not assume a build exists until
+`Cargo.toml` is present.
 
-- **`methodus.md`** — the agent definition. YAML frontmatter (name, model, description) followed by a Markdown system prompt. Installed to `~/.claude/agents/` and/or `~/.cursor/agents/` on the user's machine.
-- **`install.sh`** — downloads `methodus.md` from the GitHub raw URL and copies it to the agents directory of any supported platform detected (`~/.claude/`, `~/.cursor/`). Also creates `~/.methodus/` for the experience store.
+## Source of truth (read before writing code)
 
-The agent itself operates in six phases at runtime: clarify → discover skills → load experience → plan → execute → update experience. The experience store lives at `~/.methodus/experience.json` on the user's machine (never in this repo).
+All documentation lives in [`docs/design/`](./docs/design/):
 
-## Agent file conventions
+1. `00-product.md` — the **product contract** (*what & why*): domain abstractions
+   (Task, Face, Method, Skill, Knowledge, Experience, Question, Hypothesis,
+   Evolution), the three loops (Execution / Learning / Curiosity), the event catalog,
+   permission model, CLI/TUI surface, out-of-scope list, and acceptance scenarios.
+2. `01-runtime-adapters.md` — **verified** executor capabilities (spike results),
+   the `RuntimeAdapter` trait, and per-executor integration. Read this before
+   touching any session/adapter code; the CLI flags and JSON event shapes here
+   were empirically confirmed, not guessed.
+3. `02-architecture.md` — Rust stack, crate/module layout, the single-process
+   runtime model (no daemon/client split), async model, crash recovery.
+4. `03-data-model.md` — SQLite schema DDL, file layout, source-of-truth rules.
+5. `04-roadmap.md` — implementation order and acceptance criteria per milestone.
+6. [`docs/legacy/`](./docs/legacy/) — the archived v1 prompt agent. Reference only;
+   do not extend it.
 
-- Frontmatter fields: `name`, `model`, `description`. Keep `model: claude-sonnet-4-6` unless intentionally changing the target model.
-- Skill discovery uses a platform-parameterized pattern — `~/.{platform}/plugins/*/skills/*/SKILL.md` etc. — so adding a new platform means adding one entry to the platform list in Phase 1, not new scan paths.
-- The exclude list in Phase 1 (meta-skills) must be kept in sync if new meta-skills are added.
+`00-product.md` defines product intent; `01`–`04` define implementation. When they
+appear to disagree, `01`–`04` win for implementation detail and `00` wins for product
+intent. If neither is clear, ask.
 
-## Testing changes
+## Non-negotiable design principles (from `00-product.md`)
 
-There is no automated test suite. Verify changes by:
+- **Prompt is an interface, not a database.** State machines, permission decisions,
+  path isolation, version resolution, retries, knowledge promotion, and conflict
+  detection live in Rust — never in a prompt. Prompts carry only resolved task
+  context, method steps, and output constraints.
+- **Executor-agnostic.** Core logic depends only on the `RuntimeAdapter` trait.
+  Never hard-code Claude Code (or any one executor) behavior into the core.
+- **Evidence-first.** A single model output is never committed as knowledge. Respect
+  the promotion path: Observation → Experience → Hypothesis/Candidate → committed
+  Knowledge, with conflict checks.
+- **Auditable & recoverable.** All long-lived state is in SQLite + files; events are
+  append-only; the process must recover tasks/sessions after a restart (via executor
+  session ids + `--resume`).
+- **Budgeted background work.** No unbounded LLM loops. Learning/Curiosity work is
+  queued, rate-limited, and cancelable.
+- **Workspace isolation.** Each task gets its own workspace; global skills/MCP stay
+  visible but task-specific context is only additive. Writes are bounded by
+  project/workspace roots and gated by policy.
 
-1. Running `bash install.sh` locally to confirm it copies `methodus.md` to the correct agent directory.
-2. Invoking `@methodus <goal>` in Claude Code to exercise the agent end-to-end.
-3. Checking that `~/.methodus/experience.json` is created/updated after a completed run.
+## Engineering conventions (once code exists)
+
+- Language: **Rust**, async on `tokio`. See `docs/design/02-architecture.md` for the
+  crate/module boundaries and dependency choices.
+- Define types, state-machine enums, SQLite schema, and the event model **before**
+  wiring any LLM/executor integration.
+- All side effects go through injectable traits (e.g. `RuntimeAdapter`, repositories,
+  clock) so they can be tested and swapped.
+- Every feature needs: an explicit state model, success/failure/cancel/recovery
+  paths, events + logs, a policy/error boundary, and at least one unit test plus an
+  integration test where applicable.
+- Verify structured executor output by parsing and validating it; never rely on a
+  model happening to follow a format.
+
+## Runtime facts you can rely on (verified)
+
+These were confirmed empirically (see `docs/design/01-runtime-adapters.md`):
+
+- Claude Code: `claude --print --output-format stream-json --verbose`
+  (needs `--verbose` with stream-json); `--session-id <uuid>` + `--resume <id>`
+  round-trip context; `--permission-mode manual` returns structured
+  `permission_denials`; `--allowed-tools` grants precisely; `--bg` + `claude agents`
+  provide a built-in background daemon.
+- Codex: `codex exec --json` emits clean JSONL; `codex exec resume <id>` restores
+  context; `codex app-server` exposes a full JSON-RPC protocol (thread/turn
+  lifecycle + `item/*/requestApproval`) over stdio/unix/ws for real-time approval.
+- Cursor: `cursor agent --print --output-format stream-json` + `--resume <id>` work;
+  permission control is coarse (`--force` / `--plan` / `--auto-review`), tool calls
+  are visible but no background daemon.
+
+## Safety
+
+- Never modify the user's global executor config (`~/.claude`, `~/.codex`, `~/.cursor`)
+  from the core; Methodus only forwards to each executor's own permission machinery.
+- Treat `.env`, credential files, and `*.db` runtime state as sensitive; they are
+  git-ignored and must not be committed.
+- Do not run destructive git operations without explicit user confirmation.

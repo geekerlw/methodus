@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "crates/methodus-domain",
+    "crates/methodus-store",
+    "crates/methodus-runtime",
+    "crates/methodus-core",
+    "crates/methodus",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Domain
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+thiserror = "2.0"
+
+# Store
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Async
+tokio = { version = "1.0", features = ["full"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Runtime
+async-trait = "0.1"
+libc = "0.2"
+
+# Testing
+tempfile = "3.0"
