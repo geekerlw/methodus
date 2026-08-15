@@ -1,3 +1,9 @@
 # Methodus user config
 default_runtime: claude-code
 permission_mode: acceptEdits
+
+# Per-task executor working directory (Claude/Codex/Cursor cwd).
+# Default if unset: <METHODUS_HOME>/workspaces
+# Absolute, ~/..., or relative to this home directory.
+# OS notifications when a run needs you (approval / your turn / idle question).
+# notifications: true

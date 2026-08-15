@@ -92,6 +92,29 @@ Persistent state includes: `identity`, `knowledge`, `experiences`, `hypotheses`,
 `questions`, `methods`, `skills`. A Face is not bound to a specific runtime — the same
 Face can run under different executors across tasks.
 
+A Face is **not** a persona the executor invents, and **not** a dump of a
+repository's modules. Growing a Face means: committed Knowledge under that Face is
+selected and injected into later tasks (minimal slice, never the whole store); after
+enough Experience, Evolution may *propose* tag / method / skill-list diffs for Review.
+The executor must not write live `face.yaml` files.
+
+Concrete inventory of a codebase (modules, crates, ownership, “this dir does X”)
+belongs to the **Project**, not to Methodus: `projects/<id>/` and/or files in the
+repo itself. Methodus ships only the *capability* (a Method such as repo-survey, plus
+review/index). Calling Methodus can run that Method against a path; it must not absorb
+the module tree into global Faces or into the Methodus product.
+
+### 3.3a Pack (team baseline)
+A **Methodus-format folder** the user can load as a team baseline: `pack.yaml` plus
+`faces/`, `skills/`, and knowledge markdown. Several packs may be active at once; one
+is the **focus** (search priority). Personal `faces/` and `skills/` overlay all packs.
+Methodus registers directory paths (`packs.yaml`); copying those folders between
+people (git, USB, shared drive) is an organizational act, not a Methodus feature.
+
+Resolution stack (first match wins): personal home → focus pack → other active packs.
+Knowledge injects from the same stack; personal committed notes overlay pack files of
+the same name.
+
 ### 3.4 Method
 A **step-by-step methodology** for a class of problem — answers "how should this be
 done". A verifiable procedure, not a generic prompt: preconditions, steps, evidence
@@ -121,12 +144,14 @@ workspace on demand; the executor loads and uses them by its own native rules.
 Skill source priority: (1) user-specified, (2) current project, (3) user global skill
 dir, (4) Methodus built-in, (5) approved auto-generated. Default to read-only symlink
 or controlled materialization; any write into the global skill dir requires human
-approval.
+approval. After a non-trivial task (several tool calls, or an explicit `/learn`),
+Methodus may draft a Candidate Skill for Review — it never silently installs a live
+skill the way some agent runtimes do.
 
 ### 3.6 Knowledge
 A reusable, relatively stable, sourced, confidence-scored entry. Records source
-(experience, user answer, doc, research), evidence, update time, applicability, and
-conflict state. Promotion path:
+(experience, user answer, doc, research/web), evidence, update time, applicability,
+and conflict state. Promotion path:
 
 ```text
 Observation → Experience → Hypothesis / Candidate Knowledge
@@ -135,6 +160,15 @@ Observation → Experience → Hypothesis / Candidate Knowledge
 
 A single execution result never directly overwrites existing knowledge; conflicts enter
 a review state.
+
+Company charters, engineering standards, process pages, and similar “people just
+know this” material are first-class **ingest sources**, not Face dumps and not
+Methodus product content. Calling Methodus can run an ingest Method against a local
+path or (with network approval) a URL; the distilled notes land as candidate
+Knowledge under the **Project** or a user-level org corpus (`projects/` / org
+knowledge), with the original path or URL as source. Methodus ships only the Method
+and the review pipeline. No unbounded crawl; a fetched page is evidence, not
+committed fact until Review.
 
 ### 3.7 Experience
 A structured record of what happened in one task/experiment: commands, output
@@ -202,7 +236,10 @@ Experience + Knowledge + Hypothesis
   → update knowledge or hypothesis
 ```
 Question value combines at least `importance * frequency * impact * uncertainty`, with
-an interruption budget, cooldowns, and project relevance.
+an interruption budget, cooldowns, and project relevance. Pending questions stay quiet
+while a session is running; when the user is idle, Methodus promotes the highest-value
+item to Asked, notifies, and opens the Review answer box. That idle ask is how the
+habit forms — not a Review page the user has to remember to open.
 
 ## 5. Permission, approval, human-in-the-loop
 
@@ -210,7 +247,18 @@ Policy distinguishes at least: read-only file access; project-dir writes; shell
 execution; network/research; config change or skill install; global knowledge/skill
 writes; process deletion or forced termination.
 
-Default: reads and low-risk analysis auto-run; destructive commands, external sends,
+Default daily mode is **acceptEdits**: file edits auto-run (like Claude Code), so the
+user is not prompted on every write. Shell, network, global config, and other sensitive
+operations still pause. The user can cycle modes in Setup:
+
+- `acceptEdits` — daily; edits auto, sensitive ops still ask
+- `plan` — read-only / analyze
+- `cautious` — ask on writes and shell (Claude `manual` + Methodus approval)
+
+Never a full bypass (`bypassPermissions` / Cursor `--force`). Cursor has no mid-turn
+approval callback; Methodus picks `--auto-review` or `--plan` before spawn.
+
+Reads and low-risk analysis auto-run; destructive commands, external sends,
 global writes, unknown commands, and high-risk permissions **pause the session** and
 raise an approval request. The user may `approve once`, `approve session`, `deny`, or
 `abort`. Methodus only decides policy and forwards — it never bypasses the executor's
@@ -250,44 +298,32 @@ Trigger types: **event-driven** (task done, user answer, session failure),
 time or user idle). A queue job carries at least: `kind`, `priority`, `dedupe_key`,
 `input_refs`, `status`, `attempts`, `not_before`, `budget`, `requires_approval`.
 
-MVP learning jobs: `extract_experience`, `detect_gaps`, `propose_knowledge` (never
-auto-overwrites existing entries). Deferred: auto-research, Method synthesis, Skill
-generation, cross-Face debate. All jobs are pausable, retryable, cancelable, and
-recoverable after a restart.
+MVP learning jobs: `extract_experience`, `detect_gaps`, `propose_knowledge`,
+`propose_skill` (never auto-overwrites existing entries). Skill drafts are written
+to `skills/.candidates/<name>/SKILL.md` and promote to `skills/<name>/` only after
+Review commit (or `methodus knowledge review <id> --decision commit`). Mid-task
+`/learn` (or `methodus learn skill <task-id>`) skips the “worthy” threshold and
+drafts immediately. Deferred: auto-research, Method synthesis, cross-Face debate.
+All jobs are pausable, retryable, cancelable, and recoverable after a restart.
 
 ## 8. CLI / TUI surface
 
-CLI command name is `methodus`. Illustrative commands:
+The binary is the TUI. `methodus` (no subcommands) opens it and keeps the process
+running (typically in `tmux`). First launch seeds `~/.methodus`. There is no
+operational CLI: tasks, approvals, review, packs, project directories, and settings
+all happen on TUI pages.
 
-```text
-methodus init | doctor
-methodus task create "<goal>" [--project PATH] [--face NAME] [--method NAME]
-methodus task list | show | cancel | retry
-methodus run <task-id>
-methodus session list | show | input | cancel | kill
-methodus face list | show | activate
-methodus method list | show
-methodus skill list | inspect | scan | resolve
-methodus knowledge list | search | show | review
-methodus experience list | show
-methodus question list | answer | snooze | dismiss
-methodus approve <approval-id>
-methodus workspace show | open | prune
-methodus events tail
-methodus tui
-```
+Pages: **work** (tasks + session + approvals), **faces**, **review**, **setup**.
 
-MVP must implement at least: `init`, `doctor`, `task create/list/show`, `run`,
-`session list/show/cancel`, `face list/show`, `experience list/show`, `events tail`,
-`tui`. Mutating/session control is primarily driven from the TUI (single-process
-model — see `02-architecture.md` §4); read-only queries are safe from a second
-terminal.
+Setup is where the user:
 
-The TUI is the first-class UI and must close the core loop in the terminal. Suggested
-pages: Dashboard (queue / current task / pending approvals / pending questions),
-Tasks, Session (live transcript, input, approval), Faces, Queue, Review (candidate
-knowledge, conflicts, Evolution diffs). Keyboard actions must be visible, cancelable,
-recoverable; the TUI is part of the same process as the Engine (kept open in `tmux`).
+- cycles default runtime (Claude Code first) / permission mode (`acceptEdits` / `plan` / `cautious`) / workspace root
+- registers **project directories** (the user's repos; focus project is attached to new tasks)
+- registers **pack folders** (`pack.yaml`; focus / enable / disable)
+- sees a health check (home files, executor CLIs on PATH)
+
+Keyboard actions must be visible, cancelable, recoverable. The TUI is part of the
+same process as the Engine.
 
 ## 9. Workspace & isolation (product rules)
 
@@ -296,8 +332,10 @@ back through workspace temp files; workspaces are retained by default for audit
 (cleanup is an explicit command); global skills/MCP/user tools stay visible while the
 workspace only adds task-specific capabilities; writes to the user's project dir are
 bounded by the project root and gated by policy; never copy the entire knowledge base
-to the executor — inject only the minimal task-relevant context. (Concrete layout:
-`03-data-model.md` §5.)
+to the executor — inject only the minimal task-relevant context. The user's source
+trees stay where they are: `@` browses the launch directory and registered projects,
+and the executor reads those paths in place (`--add-dir`), not from copies inside the
+task workspace. (Concrete layout: `03-data-model.md` §5.)
 
 ## 10. Explicitly out of scope (v1)
 
@@ -306,10 +344,15 @@ to the executor — inject only the minimal task-relevant context. (Concrete lay
 - No forcing ACP/A2A as the only backend protocol.
 - No reimplementing the executor's permission/skill/MCP mechanisms.
 - No auto-modifying the user's global skill/MCP/shell config.
-- No auto-generating large volumes of expert knowledge without real Experience.
+- No auto-generating large volumes of expert knowledge without a sourced corpus
+  (Experience, user-provided docs/standards, or an approved web fetch).
+- No absorbing a company wiki, module tree, or standard library into the Methodus
+  product or into global Faces.
 - No complex web UI, cloud accounts, remote collaboration, vector search, or
   cross-device sync.
 - No unbudgeted background scheduler continuously calling the LLM.
+- No git pull / push / commit as a Methodus feature. Packs are folders; how a team
+  copies them is outside the product.
 
 ## 11. Development constraints
 
@@ -339,8 +382,8 @@ session enters `waiting_user` and the TUI shows an explicit scope; approve → c
 deny → safe return; both are logged.
 
 **C — Learning & questions.** A repeated unknown across Experiences generates a
-Question; the user answers in the TUI; the answer becomes sourced candidate Knowledge;
-an existing conflicting entry is never silently overwritten.
+Question; when the user is idle, Methodus asks it in the TUI; the answer becomes sourced
+candidate Knowledge; an existing conflicting entry is never silently overwritten.
 
 **D — Crash recovery.** The process exits during a session and restarts; it recovers
 task state, discovers the existing executor session, shows the transcript, and lets the

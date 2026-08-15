@@ -14,12 +14,12 @@ executor (Claude Code, Codex, or Cursor) acts as the hands.
 
 ## Status
 
-**M0–M3 in progress.** `methodus` / `methodus tui` is the daily-driver UI (same
-process as the Engine). CLI still covers `init` / `task create` / `run` /
-`recover` / `approve` / `events tail` for scripting. Skills stay Methodus-owned
-(`~/.methodus/skills`); executor user dirs are not scanned.
-
-Not yet: learning loop.
+**M0–M3 in progress.** `methodus` opens the TUI (same process as the Engine). First
+launch seeds `~/.methodus`. Daily work, review, packs, project directories, and
+settings happen on TUI pages — there is no operational CLI. Skills stay
+Methodus-owned (`~/.methodus/skills`); executor user dirs are not scanned. After a
+task, Methodus may draft a candidate skill; it is live only after Review commit
+(`/learn` in the TUI).
 
 - Product & design: [`docs/design/`](./docs/design/) — the product contract
   ([`00-product.md`](./docs/design/00-product.md): the *what & why*) plus the technical
@@ -51,9 +51,9 @@ methodus (one long-lived Rust process, kept open in tmux)
   │     ├── Knowledge & Experience store (SQLite + YAML/Markdown)
   │     ├── Learning / Curiosity scheduling (queued jobs, budgeted)
   │     └── Session Manager
-  │           ├── Claude Code adapter   (print/stream-json, --resume; --bg for recovery)
-  │           ├── Codex adapter         (exec --json; app-server JSON-RPC later)
-  │           └── Cursor adapter        (agent --print stream-json + --resume)
+  │           ├── Claude Code adapter   (print/stream-json, --resume; --bg for recovery; default)
+  │           ├── Cursor adapter        (agent --print stream-json + --resume)
+  │           └── Codex adapter         (exec --json; app-server JSON-RPC later)
   └── TUI (ratatui, same process; observes the Engine, issues commands in-process)
 ```
 
@@ -76,7 +76,7 @@ TUI. See [`docs/design/02-architecture.md`](./docs/design/02-architecture.md).
 ## Supported executors
 
 All three have been verified to support non-interactive execution, structured event
-streams, and session resume. See
+streams, and session resume. **Default runtime is Claude Code.** See
 [`docs/design/01-runtime-adapters.md`](./docs/design/01-runtime-adapters.md) for the
 full capability matrix and integration details.
 

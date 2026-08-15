@@ -38,11 +38,11 @@ technical risk in the original design.**
   and the single `methodus` binary.
 - `methodus-domain`: core enums + `Task`/`Session` structs + state-transition
   functions (pure, unit-tested).
-- Decide `sqlx` vs `rusqlite`; wire the first migration; `methodus init` creates
+- Decide `sqlx` vs `rusqlite`; wire the first migration; first TUI launch creates
   `~/.methodus/` + `state.db`.
 - CI: `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt --check`.
 
-**Acceptance:** `methodus init` on an empty machine creates the home dir + DB;
+**Acceptance:** first launch of `methodus` on an empty machine creates the home dir + DB;
 `cargo test` passes on the domain state machine; the workspace builds clean.
 
 ---
@@ -56,15 +56,14 @@ end to end, with the least code, inside one process.
 
 - One `methodus` process runs the core `Engine` in-process (no socket, no daemon).
   A single-instance lock (`~/.methodus/methodus.lock`) prevents two drivers.
-- `methodus task create "<goal>" [--face X]` → task row; rule resolver picks a single
+- `methodus` opens the TUI; type a goal in the session pane → task row; rule resolver picks a single
   Face (hard-coded/seed is fine) and produces `selected-context.md`.
 - Workspace Builder creates `~/.methodus/workspaces/<task-id>/` with path-safety
   checks.
 - **Claude Code adapter** implementing base `RuntimeAdapter` via
   `claude --print --output-format stream-json --verbose --session-id ...`; normalize
   the JSONL into `RuntimeEvent`; persist events + transcript.
-- `methodus run <task-id>` runs the session inside the process and streams
-  `RuntimeEvent`s to the terminal live.
+- The session pane streams `RuntimeEvent`s live while the executor runs.
 - On completion, persist result + a raw `Experience` record (file + index row).
 - **Persistence check:** run the process in `tmux`; detach the terminal; the run
   continues; re-attach the `tmux` window and see it still going / completed.
@@ -88,8 +87,7 @@ Thicken the spine into a dependable system and prove executor-agnosticism.
 
 **Scope:**
 
-- Full event log + append-only guarantees + idempotent handlers; `methodus events
-  tail` (read-only, safe from a second terminal).
+- Full event log + append-only guarantees + idempotent handlers (visible in the TUI).
 - Crash-recovery reconciliation per `02-architecture.md` §6 (Claude `agents --json`;
   `--resume`).
 - **Policy engine + guarded approval loop** for Claude Code: `--permission-mode
@@ -132,14 +130,19 @@ completable from the TUI; detaching the `tmux` window keeps sessions running.
 Only now, and only with a real Experience corpus from dogfooding.
 
 **Scope (the Learning + Curiosity loops, `00-product.md` §4.2–4.3):** Learning Queue + scheduler (event/threshold/idle);
-`extract_experience` → `detect_gaps` → `propose_knowledge`; Question state machine +
-valuation; candidate Knowledge with conflict detection; TUI Review page. No unbounded
-loops — every job is budgeted, retryable, cancelable, and recoverable. The scheduler
+`extract_experience` → `detect_gaps` → `propose_knowledge` / `propose_skill`; Question state machine +
+valuation; candidate Knowledge with conflict detection; Candidate Skills land in
+`skills/.candidates/` and promote only on Review commit; TUI Review page + `/learn`.
+Team **packs** as Methodus-format folders: register paths in `packs.yaml`,
+focus / enable / disable; resolution overlays personal home on packs. Copying folders
+(git, USB, shared drive) is outside Methodus — no pull/push/commit in the product.
+No unbounded loops — every job is budgeted, retryable, cancelable, and recoverable. The scheduler
 runs inside the always-on process; background work happens while the process is open.
 
 **Acceptance (`00-product.md` §12 scenario C):** task completion enqueues learning jobs; committed
 knowledge is never silently overwritten; a high-value repeated unknown surfaces as a
-Question; answering it produces sourced candidate Knowledge.
+Question; when the user is idle the TUI asks it; answering it produces sourced candidate Knowledge.
+Claude Code is the default runtime; Cursor and Codex remain adapters.
 
 > **Revisit the daemon/client split here.** If, and only if, "Methodus must do
 > background work with no window open at all" becomes a hard requirement, evaluate
@@ -151,8 +154,10 @@ Question; answering it produces sourced candidate Knowledge.
 ## Milestone M5+ — Deferred (unchanged from spec)
 
 Multi-Face composition & dynamic Methods; Evolution with human-approved
-versioned upgrades; Codex **app-server** full `InteractiveRuntime`
-(real-time approval + interrupt + steer); Cursor adapter; advanced collaboration,
+versioned upgrades; pack promote / PR-style contribution back to a team folder
+(still not git inside Methodus); repo-survey as a Method that writes **project**
+knowledge (not global Faces); Codex **app-server** full `InteractiveRuntime`
+(real-time approval + interrupt + steer); advanced collaboration,
 research, desktop (Tauri) client, remote nodes.
 
 The Codex app-server client and a future Tauri desktop client are enabled by the

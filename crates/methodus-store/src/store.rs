@@ -18,6 +18,11 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
+        self.conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))
+    }
     /// Open (or create) a SQLite database at the given path, enable WAL mode,
     /// and run all pending migrations.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -630,6 +635,10 @@ impl Store {
         Ok(experiences)
     }
 
+    pub fn get_experience(&self, id: &str) -> Result<Option<Experience>, StoreError> {
+        Ok(self.list_experiences()?.into_iter().find(|e| e.id == id))
+    }
+
     // ─── Workspace CRUD ──────────────────────────────────────────────────
 
     pub fn insert_workspace(
@@ -737,7 +746,7 @@ struct TaskRow {
     updated_at: String,
 }
 
-fn parse_datetime(s: &str) -> Result<DateTime<Utc>, StoreError> {
+pub(crate) fn parse_datetime(s: &str) -> Result<DateTime<Utc>, StoreError> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| StoreError::Migration(format!("failed to parse datetime '{}': {}", s, e)))

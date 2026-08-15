@@ -31,10 +31,34 @@ impl WorkspaceBuilder {
         }
 
         fs::write(ws_root.join(".methodus/selected-context.md"), context)?;
+        write_runtime_guides(&ws_root)?;
         Ok(ws_root)
     }
 
-    /// Copy the resolved method YAML and selected SKILL.md files into the workspace.
+    /// Copy a few vetted knowledge files into the workspace (never the whole Face store).
+    pub fn materialize_knowledge(
+        ws_root: &Path,
+        files: &[(String, PathBuf)],
+    ) -> Result<(), std::io::Error> {
+        let dest_dir = ws_root.join("face-context").join("knowledge");
+        fs::create_dir_all(&dest_dir)?;
+        for (name, src) in files {
+            if !src.is_file() {
+                continue;
+            }
+            let stem = Path::new(name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !is_safe_segment(&stem) || Path::new(name).extension().is_some_and(|e| e != "md") {
+                continue;
+            }
+            fs::copy(src, dest_dir.join(format!("{stem}.md")))?;
+        }
+        Ok(())
+    }
+
+    /// Copy the resolved method YAML and selected skill packages into the workspace.
     /// Skills are placed where Claude Code looks (`./.claude/skills/`) and under `.methodus/`.
     pub fn materialize_resolution(
         ws_root: &Path,
@@ -47,18 +71,89 @@ impl WorkspaceBuilder {
             }
         }
         for (name, src) in skills {
-            if !is_safe_segment(name) || !src.is_file() {
+            if !is_safe_segment(name) {
                 continue;
             }
             let claude_dest = ws_root.join(".claude/skills").join(name);
             let methodus_dest = ws_root.join(".methodus/skills").join(name);
-            fs::create_dir_all(&claude_dest)?;
-            fs::create_dir_all(&methodus_dest)?;
-            fs::copy(src, claude_dest.join("SKILL.md"))?;
-            fs::copy(src, methodus_dest.join("SKILL.md"))?;
+            install_skill(name, src, &claude_dest)?;
+            install_skill(name, src, &methodus_dest)?;
         }
+        write_runtime_guides(ws_root)?;
         Ok(())
     }
+}
+
+const RUNTIME_GUIDE: &str = "\
+# Methodus task workspace
+
+This directory is an isolated sandbox for one task. The user's source trees are
+not copied here.
+
+- Follow `.methodus/selected-context.md`.
+- Directories listed under **Readable directories** are the real folders on disk.
+  Read / Glob / LS them in place (they are also passed as extra dirs to the CLI).
+- Vetted Face notes (if any) live in `face-context/knowledge/` — prefer them over guessing.
+- Project skills live in `.claude/skills/<name>/SKILL.md` (copy also under `.methodus/skills/`).
+- If you have a Skill tool, invoke each listed skill by name before improvising.
+- Otherwise read those SKILL.md files and follow them.
+";
+
+fn write_runtime_guides(ws_root: &Path) -> Result<(), std::io::Error> {
+    fs::write(ws_root.join("CLAUDE.md"), RUNTIME_GUIDE)?;
+    fs::write(ws_root.join("AGENTS.md"), RUNTIME_GUIDE)?;
+    Ok(())
+}
+
+fn install_skill(name: &str, src: &Path, dest: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(dest)?;
+    if src.is_dir() {
+        return copy_skill_tree(src, dest);
+    }
+    if !src.is_file() {
+        return Ok(());
+    }
+    let parent = src.parent();
+    let parent_is_package = parent
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == name);
+    if parent_is_package {
+        if let Some(p) = parent {
+            return copy_skill_tree(p, dest);
+        }
+    }
+    fs::copy(src, dest.join("SKILL.md"))?;
+    if let Some(p) = parent {
+        for extra in ["references", "scripts", "assets"] {
+            let from = p.join(extra);
+            if from.is_dir() {
+                copy_skill_tree(&from, &dest.join(extra))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_skill_tree(src: &Path, dest: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(dest)?;
+    let Ok(entries) = fs::read_dir(src) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == ".git" || name_str == "node_modules" || name_str == "target" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dest.join(&name);
+        if from.is_dir() {
+            copy_skill_tree(&from, &to)?;
+        } else if from.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_task_id(task_id: &str) -> Result<(), std::io::Error> {
@@ -131,6 +226,31 @@ mod tests {
             .is_file());
         assert!(ws
             .join(".methodus/skills/workspace-hygiene/SKILL.md")
+            .is_file());
+        assert!(ws.join("CLAUDE.md").is_file());
+        assert!(ws.join("AGENTS.md").is_file());
+    }
+
+    #[test]
+    fn materialize_copies_skill_scripts() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceBuilder::build(dir.path(), "task_abc123def456", "# ctx").unwrap();
+        let pkg = dir.path().join("skills/tcp-debug");
+        fs::create_dir_all(pkg.join("scripts")).unwrap();
+        fs::write(
+            pkg.join("SKILL.md"),
+            "---\nname: tcp-debug\ndescription: debug tcp\n---\n",
+        )
+        .unwrap();
+        fs::write(pkg.join("scripts/capture.sh"), "#!/bin/sh\necho ok\n").unwrap();
+        WorkspaceBuilder::materialize_resolution(
+            &ws,
+            None,
+            &[("tcp-debug".to_string(), pkg.join("SKILL.md"))],
+        )
+        .unwrap();
+        assert!(ws
+            .join(".claude/skills/tcp-debug/scripts/capture.sh")
             .is_file());
     }
 }

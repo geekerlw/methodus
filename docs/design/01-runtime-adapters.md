@@ -41,7 +41,8 @@ original design
 
 **Ranking for Methodus:** Claude Code (richest control) ≥ Codex (via app-server,
 near-parity + best interrupt/approval granularity) > Cursor (usable baseline, coarse
-permissions, no daemon).
+permissions, no daemon). **Default runtime is Claude Code**; Cursor and Codex
+remain selectable. The matrix above is capability, not a ranking of daily use.
 
 ## 3. The `RuntimeAdapter` trait
 
@@ -98,7 +99,7 @@ pub struct SpawnInput {
     pub session_id: Option<Uuid>,    // caller-assigned when supported
     pub permission: PermissionMode,   // mapped per-adapter (see §7)
     pub allowed_tools: Vec<String>,   // Claude Code honors precisely
-    pub extra_dirs: Vec<PathBuf>,     // --add-dir / --add-dir / --add-dir
+    pub extra_dirs: Vec<PathBuf>,     // always the launch cwd ∪ registered projects (`claude --add-dir`); source is read in place, not copied into cwd
     pub model: Option<String>,
 }
 

@@ -1,8 +1,6 @@
 //! Single-instance advisory lock (`~/.methodus/methodus.lock`).
 //!
-//! Mutating commands (`run`, `task create`, `recover`) take the lock.
-//! Read-only queries bypass it so a second terminal can `task list` while a run
-//! is in progress.
+//! The TUI takes the lock for the life of the process.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -10,7 +8,7 @@ use std::path::Path;
 
 use crate::error::CoreError;
 
-/// Held for the lifetime of a mutating CLI invocation. Dropping releases the lock.
+/// Held for the lifetime of the Methodus process. Dropping releases the lock.
 #[derive(Debug)]
 pub struct InstanceLock {
     _file: File,

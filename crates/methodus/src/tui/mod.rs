@@ -15,7 +15,7 @@ use futures::StreamExt;
 use methodus_core::{Engine, InstanceLock, RecoveredSession};
 use ratatui::prelude::{CrosstermBackend, Terminal};
 
-use app::{App, Command, Mode};
+use app::{App, Command, StatusLevel};
 
 pub async fn run(
     engine: Engine,
@@ -43,6 +43,7 @@ async fn run_loop(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App::new(engine, recovered);
     app.refresh();
+    app.restore_recovered();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -80,19 +81,38 @@ async fn run_loop(
         match cmd {
             Command::None => {}
             Command::Quit => app.should_quit = true,
-            Command::Create { goal, face } => {
-                match app
-                    .engine
-                    .create_task(&goal, &goal, face.as_deref(), app.runtime.as_deref())
-                {
-                    Ok(task) => {
-                        app.status = format_created(&task);
-                        app.input.clear();
-                        app.mode = Mode::Normal;
-                        app.select_task(&task.id);
-                        app.refresh();
+            Command::Send { task_id, text } => {
+                let id = match task_id {
+                    Some(id) => Some(id),
+                    None => match app.engine.create_task(
+                        &text,
+                        &text,
+                        app.default_face.as_deref(),
+                        app.runtime.as_deref(),
+                    ) {
+                        Ok(task) => {
+                            app.select_task(&task.id);
+                            app.refresh();
+                            Some(task.id)
+                        }
+                        Err(e) => {
+                            app.input_error = Some(format!("could not create: {e}"));
+                            app.set_status(StatusLevel::Error, format!("create failed: {e}"));
+                            None
+                        }
+                    },
+                };
+                if let Some(id) = id {
+                    match app.engine.send_turn(&id, &text).await {
+                        Ok(rx) => {
+                            app.attach_session(id, rx);
+                            app.refresh();
+                        }
+                        Err(e) => {
+                            app.input_error = Some(e.to_string());
+                            app.set_status(StatusLevel::Error, format!("send failed: {e}"));
+                        }
                     }
-                    Err(e) => app.status = format!("create failed: {e}"),
                 }
             }
             Command::Run { task_id, resume } => match app.engine.run_task(&task_id, resume).await {
@@ -100,16 +120,81 @@ async fn run_loop(
                     app.attach_session(task_id, rx);
                     app.refresh();
                 }
-                Err(e) => app.status = format!("run failed: {e}"),
+                Err(e) => {
+                    app.input_error = Some(e.to_string());
+                    app.set_status(StatusLevel::Error, format!("run failed: {e}"));
+                }
             },
             Command::Approve { id, decision } => {
                 match app.engine.approve(&id, decision, "tui").await {
                     Ok(rx) => {
-                        app.status = format!("approval {id} → {decision}");
+                        app.set_status(StatusLevel::Ok, format!("approval {id} → {decision}"));
                         app.attach_receiver(rx);
                         app.refresh();
                     }
-                    Err(e) => app.status = format!("approve failed: {e}"),
+                    Err(e) => app.set_status(StatusLevel::Error, format!("approve failed: {e}")),
+                }
+            }
+            Command::Cancel { task_id } => match app.engine.cancel_task(&task_id) {
+                Ok(()) => {
+                    app.set_status(StatusLevel::Ok, format!("cancelled {task_id}"));
+                    app.refresh();
+                }
+                Err(e) => app.set_status(StatusLevel::Error, format!("cancel failed: {e}")),
+            },
+            Command::ReviewKnowledge { id, commit } => {
+                match app.engine.review_knowledge(&id, commit) {
+                    Ok(item) => {
+                        app.set_status(StatusLevel::Ok, format!("{} → {}", item.id, item.status));
+                        app.refresh();
+                    }
+                    Err(e) => app.set_status(StatusLevel::Error, format!("review failed: {e}")),
+                }
+            }
+            Command::AnswerQuestion { id, text } => match app.engine.answer_question(&id, &text) {
+                Ok(q) => {
+                    app.set_status(StatusLevel::Ok, format!("{} answered", q.id));
+                    app.mode = app::Mode::Normal;
+                    app.input.clear();
+                    app.input_error = None;
+                    app.answering_id = None;
+                    app.refresh();
+                }
+                Err(e) => {
+                    app.input_error = Some(e.to_string());
+                    app.set_status(StatusLevel::Error, format!("answer failed: {e}"));
+                }
+            },
+            Command::SnoozeQuestion { id } => match app.engine.snooze_question(&id) {
+                Ok(q) => {
+                    app.set_status(StatusLevel::Ok, format!("{} snoozed", q.id));
+                    app.refresh();
+                }
+                Err(e) => app.set_status(StatusLevel::Error, format!("snooze failed: {e}")),
+            },
+            Command::DismissQuestion { id } => match app.engine.dismiss_question(&id) {
+                Ok(q) => {
+                    app.set_status(StatusLevel::Ok, format!("{} dismissed", q.id));
+                    app.refresh();
+                }
+                Err(e) => app.set_status(StatusLevel::Error, format!("dismiss failed: {e}")),
+            },
+            Command::LearnSkill { task_id, hint } => {
+                match app.engine.learn_skill(&task_id, hint.as_deref()) {
+                    Ok(item) => {
+                        app.input.clear();
+                        app.input_error = None;
+                        app.page = app::Page::Review;
+                        app.refresh();
+                        app.set_status(
+                            StatusLevel::Ok,
+                            format!("{} drafted — y to commit on review", item.id),
+                        );
+                    }
+                    Err(e) => {
+                        app.input_error = Some(e.to_string());
+                        app.set_status(StatusLevel::Error, format!("learn failed: {e}"));
+                    }
                 }
             }
         }
@@ -125,7 +210,7 @@ fn key_command(app: &mut App, ev: Option<Result<Event, std::io::Error>>) -> Comm
             app.handle_key(key)
         }
         Some(Err(e)) => {
-            app.status = format!("input error: {e}");
+            app.set_status(StatusLevel::Error, format!("input error: {e}"));
             Command::None
         }
         _ => Command::None,
@@ -138,30 +223,12 @@ async fn recv_runtime(app: &mut App) -> Option<methodus_domain::RuntimeEvent> {
             Some(ev) => Some(ev),
             None => {
                 app.event_rx = None;
-                app.status = "session ended".to_string();
+                app.set_status(StatusLevel::Ok, "your turn — type a follow-up");
+                app.notify("turn", "your turn — type a follow-up");
                 app.refresh();
                 None
             }
         },
         None => std::future::pending().await,
-    }
-}
-
-fn format_created(task: &methodus_domain::Task) -> String {
-    if let Some(res) =
-        methodus_core::Resolution::parse_json(task.resolution.as_deref().unwrap_or(""))
-    {
-        let method = res.method.as_ref().map(|m| m.id.as_str()).unwrap_or("-");
-        let low = if res.low_confidence {
-            "  LOW CONFIDENCE — pin a Face on the Faces page"
-        } else {
-            ""
-        };
-        format!(
-            "created {}  face={} method={} conf={:.2}{low}",
-            task.id, res.face_id, method, res.confidence
-        )
-    } else {
-        format!("created {}", task.id)
     }
 }

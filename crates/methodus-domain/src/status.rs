@@ -17,6 +17,7 @@ use crate::error::DomainError;
 /// State machine:
 /// `queued → planning → running → {waiting_user, reviewing} → {completed, failed, cancelled}`
 ///
+/// `reviewing → running` is a follow-up chat turn on the same task.
 /// Additionally, `cancelled` is reachable from any non-terminal state.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -45,7 +46,12 @@ impl TaskStatus {
                 Self::Cancelled,
             ],
             Self::WaitingUser => vec![Self::Running, Self::Cancelled],
-            Self::Reviewing => vec![Self::Completed, Self::Failed, Self::Cancelled],
+            Self::Reviewing => vec![
+                Self::Running,
+                Self::Completed,
+                Self::Failed,
+                Self::Cancelled,
+            ],
             // Terminal states
             Self::Completed => vec![],
             Self::Failed => vec![],
@@ -240,6 +246,35 @@ impl KnowledgeStatus {
     pub fn can_transition_to(&self, next: &Self) -> bool {
         self.transitions().contains(next)
     }
+
+    pub fn checked_transition(&self, next: Self) -> Result<Self, DomainError> {
+        if self.can_transition_to(&next) {
+            Ok(next)
+        } else {
+            Err(DomainError::InvalidTransition {
+                entity: "knowledge",
+                from: self.to_string(),
+                to: next.to_string(),
+            })
+        }
+    }
+}
+
+impl FromStr for KnowledgeStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "candidate" => Ok(Self::Candidate),
+            "committed" => Ok(Self::Committed),
+            "conflicted" => Ok(Self::Conflicted),
+            "rejected" => Ok(Self::Rejected),
+            other => Err(DomainError::InvalidStatus {
+                entity: "knowledge",
+                value: other.to_string(),
+            }),
+        }
+    }
 }
 
 impl fmt::Display for KnowledgeStatus {
@@ -286,6 +321,36 @@ impl QuestionStatus {
     pub fn can_transition_to(&self, next: &Self) -> bool {
         self.transitions().contains(next)
     }
+
+    pub fn checked_transition(&self, next: Self) -> Result<Self, DomainError> {
+        if self.can_transition_to(&next) {
+            Ok(next)
+        } else {
+            Err(DomainError::InvalidTransition {
+                entity: "question",
+                from: self.to_string(),
+                to: next.to_string(),
+            })
+        }
+    }
+}
+
+impl FromStr for QuestionStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "asked" => Ok(Self::Asked),
+            "answered" => Ok(Self::Answered),
+            "snoozed" => Ok(Self::Snoozed),
+            "dismissed" => Ok(Self::Dismissed),
+            other => Err(DomainError::InvalidStatus {
+                entity: "question",
+                value: other.to_string(),
+            }),
+        }
+    }
 }
 
 impl fmt::Display for QuestionStatus {
@@ -298,6 +363,47 @@ impl fmt::Display for QuestionStatus {
             Self::Dismissed => "dismissed",
         };
         write!(f, "{}", s)
+    }
+}
+
+// ─── JobKind ─────────────────────────────────────────────────────────────────
+
+/// MVP learning-queue job kinds (`00-product.md` §7).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    ExtractExperience,
+    DetectGaps,
+    ProposeKnowledge,
+    ProposeSkill,
+}
+
+impl fmt::Display for JobKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::ExtractExperience => "extract_experience",
+            Self::DetectGaps => "detect_gaps",
+            Self::ProposeKnowledge => "propose_knowledge",
+            Self::ProposeSkill => "propose_skill",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl FromStr for JobKind {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "extract_experience" => Ok(Self::ExtractExperience),
+            "detect_gaps" => Ok(Self::DetectGaps),
+            "propose_knowledge" => Ok(Self::ProposeKnowledge),
+            "propose_skill" => Ok(Self::ProposeSkill),
+            other => Err(DomainError::InvalidStatus {
+                entity: "job_kind",
+                value: other.to_string(),
+            }),
+        }
     }
 }
 
@@ -332,6 +438,36 @@ impl JobStatus {
     /// Whether a transition from `self` to `next` is valid.
     pub fn can_transition_to(&self, next: &Self) -> bool {
         self.transitions().contains(next)
+    }
+
+    pub fn checked_transition(&self, next: Self) -> Result<Self, DomainError> {
+        if self.can_transition_to(&next) {
+            Ok(next)
+        } else {
+            Err(DomainError::InvalidTransition {
+                entity: "job",
+                from: self.to_string(),
+                to: next.to_string(),
+            })
+        }
+    }
+}
+
+impl FromStr for JobStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(DomainError::InvalidStatus {
+                entity: "job",
+                value: other.to_string(),
+            }),
+        }
     }
 }
 
@@ -384,6 +520,11 @@ mod tests {
     #[test]
     fn task_reviewing_to_completed() {
         assert!(TaskStatus::Reviewing.can_transition_to(&TaskStatus::Completed));
+    }
+
+    #[test]
+    fn task_reviewing_to_running_follow_up() {
+        assert!(TaskStatus::Reviewing.can_transition_to(&TaskStatus::Running));
     }
 
     #[test]
@@ -568,5 +709,30 @@ mod tests {
         assert_eq!(JobStatus::Queued.to_string(), "queued");
         assert_eq!(JobStatus::Done.to_string(), "done");
         assert_eq!(JobStatus::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn job_kind_roundtrip() {
+        assert_eq!(JobKind::ExtractExperience.to_string(), "extract_experience");
+        assert_eq!(
+            "propose_knowledge".parse::<JobKind>().unwrap(),
+            JobKind::ProposeKnowledge
+        );
+        assert_eq!(
+            "propose_skill".parse::<JobKind>().unwrap(),
+            JobKind::ProposeSkill
+        );
+    }
+
+    #[test]
+    fn knowledge_and_question_parse() {
+        assert_eq!(
+            "conflicted".parse::<KnowledgeStatus>().unwrap(),
+            KnowledgeStatus::Conflicted
+        );
+        assert_eq!(
+            "snoozed".parse::<QuestionStatus>().unwrap(),
+            QuestionStatus::Snoozed
+        );
     }
 }

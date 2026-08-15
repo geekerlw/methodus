@@ -4,7 +4,7 @@ mod skills;
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,12 @@ pub struct Resolution {
     pub confidence: f32,
     #[serde(default)]
     pub low_confidence: bool,
+    /// Directory that contains `face.yaml` for this Face (personal or pack).
+    #[serde(default)]
+    pub face_dir: String,
+    /// `personal` or `team:<pack-id>`
+    #[serde(default)]
+    pub face_source: String,
 }
 
 impl Resolution {
@@ -105,16 +111,21 @@ impl Resolution {
         let skills_block = if self.skills.is_empty() {
             "(none selected)".to_string()
         } else {
-            self.skills
+            let listed = self
+                .skills
                 .iter()
                 .map(|s| {
                     format!(
-                        "- `{}` ({}) — {}\n  path: {}",
-                        s.name, s.source, s.description, s.path
+                        "- `{}` ({}) — {}\n  file: `.claude/skills/{}/SKILL.md`",
+                        s.name, s.source, s.description, s.name
                     )
                 })
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n");
+            format!(
+                "Invoke each skill by name with your native Skill tool if you have one. \
+                 Otherwise read the SKILL.md file and follow it before improvising.\n{listed}"
+            )
         };
         format!(
             "# Selected context\n\n\
@@ -127,7 +138,8 @@ impl Resolution {
              ## Task: {title}\n\n\
              {request}\n\n\
              ## Constraints\n\n\
-             - Work inside this workspace unless a project path is explicitly in the request.\n\
+             - Work inside this workspace unless a project path is in selected context.\n\
+             - Vetted Face notes live in `face-context/knowledge/` when present; prefer them.\n\
              - Do not modify Methodus home state (`~/.methodus`).\n",
             name = self.face_name,
             id = self.face_id,
@@ -135,7 +147,7 @@ impl Resolution {
             rationale = self.rationale,
             conf = self.confidence,
             low = if self.low_confidence {
-                "; LOW CONFIDENCE — pin with --face if this is wrong"
+                "; LOW CONFIDENCE — pin a Face on the faces page if this is wrong"
             } else {
                 ""
             },
@@ -159,6 +171,10 @@ struct FaceFile {
     methods: Vec<String>,
     #[serde(default)]
     skills: Vec<String>,
+    #[serde(default, skip_deserializing)]
+    source: String,
+    #[serde(default, skip_deserializing)]
+    dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,6 +246,8 @@ pub fn resolve(opts: ResolveOpts<'_>) -> Result<Resolution, CoreError> {
         rationale,
         confidence: face_conf,
         low_confidence,
+        face_dir: face.dir.to_string_lossy().into_owned(),
+        face_source: face.source.clone(),
     })
 }
 
@@ -238,6 +256,7 @@ pub struct FaceSummary {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub source: String,
 }
 
 /// Faces on disk under `~/.methodus/faces/*/face.yaml` (builtin general if none).
@@ -249,6 +268,7 @@ pub fn list_faces(home: &Path) -> Vec<FaceSummary> {
             id: face.id,
             name: face.name,
             description: face.description,
+            source: "personal".to_string(),
         }];
     }
     faces
@@ -257,6 +277,11 @@ pub fn list_faces(home: &Path) -> Vec<FaceSummary> {
             id: face.id,
             name: face.name,
             description: face.description,
+            source: if face.source.is_empty() {
+                "personal".to_string()
+            } else {
+                face.source
+            },
         })
         .collect()
 }
@@ -278,27 +303,46 @@ fn builtin_face() -> FaceFile {
         intent_tags: vec!["general".to_string(), "default".to_string()],
         methods: vec![DEFAULT_METHOD_ID.to_string()],
         skills: vec!["workspace-hygiene".to_string()],
+        source: "personal".to_string(),
+        dir: PathBuf::new(),
     }
 }
 
 fn load_faces(home: &Path) -> Vec<FaceFile> {
-    let dir = home.join("faces");
-    let Ok(entries) = fs::read_dir(&dir) else {
+    let mut out = load_faces_from(&home.join("faces"), "personal");
+    let mut seen: HashSet<String> = out.iter().map(|f| f.id.clone()).collect();
+    for layer in crate::pack::overlay_roots(home) {
+        for face in load_faces_from(&layer.root.join("faces"), &layer.source) {
+            if seen.contains(&face.id) {
+                continue;
+            }
+            seen.insert(face.id.clone());
+            out.push(face);
+        }
+    }
+    out
+}
+
+fn load_faces_from(dir: &Path, source: &str) -> Vec<FaceFile> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path().join("face.yaml");
+        let face_dir = entry.path();
+        let path = face_dir.join("face.yaml");
         if !path.is_file() {
             continue;
         }
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(face) = serde_yaml::from_str::<FaceFile>(&raw) else {
+        let Ok(mut face) = serde_yaml::from_str::<FaceFile>(&raw) else {
             continue;
         };
         if is_safe_segment(&face.id) {
+            face.source = source.to_string();
+            face.dir = face_dir;
             out.push(face);
         }
     }
@@ -479,6 +523,8 @@ fn clone_face(face: &FaceFile) -> FaceFile {
         intent_tags: face.intent_tags.clone(),
         methods: face.methods.clone(),
         skills: face.skills.clone(),
+        source: face.source.clone(),
+        dir: face.dir.clone(),
     }
 }
 
@@ -488,7 +534,7 @@ fn tag_overlap(tags: &[String], tokens: &HashSet<String>) -> usize {
         .count()
 }
 
-fn tokenize(text: &str) -> HashSet<String> {
+pub(crate) fn tokenize(text: &str) -> HashSet<String> {
     text.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| w.len() >= 2)
@@ -585,9 +631,77 @@ mod tests {
             rationale: "x".into(),
             confidence: 0.45,
             low_confidence: true,
+            face_dir: String::new(),
+            face_source: String::new(),
         };
         let parsed = Resolution::parse_json(&r.to_json()).unwrap();
         assert_eq!(parsed.face_id, "general");
         assert!(parsed.low_confidence);
+    }
+
+    #[test]
+    fn list_faces_reads_disk() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("faces/network")).unwrap();
+        fs::write(
+            dir.path().join("faces/network/face.yaml"),
+            "id: network\nname: Network\ndescription: Packets.\n",
+        )
+        .unwrap();
+        let faces = list_faces(dir.path());
+        assert!(faces.iter().any(|f| f.id == "network"));
+    }
+
+    #[test]
+    fn pack_face_and_skill_overlay_personal_wins() {
+        let home = tempdir().unwrap();
+        let pack = tempdir().unwrap();
+        fs::create_dir_all(pack.path().join("faces/storage")).unwrap();
+        fs::write(pack.path().join("pack.yaml"), "id: team-x\nname: Team X\n").unwrap();
+        fs::write(
+            pack.path().join("faces/storage/face.yaml"),
+            "id: storage\nname: Storage\nintent_tags: [storage, disk]\nskills: [disk-check]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(pack.path().join("skills/disk-check")).unwrap();
+        fs::write(
+            pack.path().join("skills/disk-check/SKILL.md"),
+            "---\nname: disk-check\ndescription: check disks\n---\n",
+        )
+        .unwrap();
+        crate::pack::add_pack(home.path(), pack.path()).unwrap();
+
+        let r = resolve(ResolveOpts {
+            methodus_home: home.path(),
+            request: "investigate storage disk errors",
+            requested_face: None,
+        })
+        .unwrap();
+        assert_eq!(r.face_id, "storage");
+        assert!(r.face_source.starts_with("team:"));
+        assert!(r.skills.iter().any(|s| s.name == "disk-check"));
+        assert!(r.skills.iter().any(|s| s.source.starts_with("team:")));
+
+        fs::create_dir_all(home.path().join("faces/storage")).unwrap();
+        fs::write(
+            home.path().join("faces/storage/face.yaml"),
+            "id: storage\nname: Personal Storage\nintent_tags: [storage, disk]\nskills: [disk-check]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(home.path().join("skills/disk-check")).unwrap();
+        fs::write(
+            home.path().join("skills/disk-check/SKILL.md"),
+            "---\nname: disk-check\ndescription: personal copy\n---\n",
+        )
+        .unwrap();
+        let r = resolve(ResolveOpts {
+            methodus_home: home.path(),
+            request: "investigate storage disk errors",
+            requested_face: Some("storage"),
+        })
+        .unwrap();
+        assert_eq!(r.face_source, "personal");
+        let skill = r.skills.iter().find(|s| s.name == "disk-check").unwrap();
+        assert_eq!(skill.source, "builtin");
     }
 }

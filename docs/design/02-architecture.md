@@ -52,7 +52,7 @@ meant to be maintained and trusted over years.
 | Concern | Choice | Notes |
 |---------|--------|-------|
 | Async runtime | `tokio` (multi-thread) | concurrent sessions, timers, scheduler |
-| CLI parsing | `clap` (derive) | one `methodus` binary with subcommands |
+| CLI parsing | `clap` (derive) | `methodus` binary (`--help` / `--version`); no operational subcommands |
 | SQLite | `sqlx` (async, compile-time-checked) or `rusqlite` (sync + pool) | see §7; leaning `sqlx` for async + migrations |
 | Migrations | `sqlx::migrate!` (or `refinery` if `rusqlite`) | versioned, embedded |
 | Serialization | `serde` + `serde_json` + `serde_yaml` | events, executor I/O, YAML domain files |
@@ -87,7 +87,7 @@ methodus/
 │   ├── methodus-core/         # orchestration LIBRARY: resolver, policy, scheduler,
 │   │   │                        loops, session manager, event bus — no UI, no main()
 │   │   └── (depends on domain, store, and the runtime trait)
-│   └── methodus/              # THE binary: clap CLI + ratatui TUI, runs core in-proc
+│   └── methodus/              # THE binary: opens the TUI, runs core in-proc
 │       └── (depends on core, store, runtime)
 ├── migrations/                # SQL migration files (embedded by methodus-store)
 ├── resources/                 # seed Faces / Methods / Skills shipped with the build
@@ -115,9 +115,12 @@ methodus-core/src/
 ├── policy/         # permission decisions, approval routing, budgets
 ├── session/        # Session Manager: lifecycle over RuntimeAdapter, event fan-out
 ├── workspace/      # Workspace Builder + path-safety validation
+├── pack.rs         # team pack folders: packs.yaml registry, focus, overlay roots
+├── project.rs      # project directories: projects.yaml registry + focus
+├── home.rs         # first-launch seed + health checks
 ├── events/         # event bus (in-proc broadcast) + append-only persistence hook
 ├── scheduler/      # job queue driver (event/threshold/idle triggers)
-├── learning/       # extract_experience, detect_gaps, propose_knowledge jobs
+├── learning/       # extract_experience, detect_gaps, propose_knowledge, propose_skill jobs
 ├── curiosity/      # knowledge-gap → question valuation
 └── engine.rs       # top-level orchestrator tying the Execution Loop together;
                     # the binary constructs one Engine and the TUI observes it
@@ -153,17 +156,11 @@ methodus-core/src/
   back later") is achieved by running the process in `tmux`/`screen`, plus
   executor-session resume for recovery after a real restart.
 
-### One-off CLI commands
+### No second-terminal CLI
 
-Because there is no daemon to talk to, a one-off `methodus <cmd>` in a second terminal
-does **not** reach the running instance. Rule:
-
-- **Read-only queries** (`task list`, `task show`, `experience list`, `events tail`)
-  open `state.db` (WAL mode) read-only and work fine alongside the running process.
-- **Mutating / session commands** (`run`, `session ...`, `approve`) are performed
-  **inside the running TUI**, which owns the live sessions. For scripting, these can
-  also be exposed as subcommands that refuse to run if another instance holds the lock
-  (see §5) — but interactive control is the TUI.
+Because there is no daemon to talk to, a second `methodus` in another terminal cannot
+drive the running instance (the lock refuses it). Observe from the TUI; keep the
+process in `tmux`. Scripting subcommands are out of v1.
 
 ## 5. Async, concurrency & single-instance
 
@@ -180,7 +177,7 @@ does **not** reach the running instance. Rule:
   tool outputs go to the session transcript file, with only a summary in SQLite.
 - **Single-instance guard:** since state lives in `state.db`, hold an advisory
   lock/lockfile (`~/.methodus/methodus.lock`) so two full instances don't drive
-  sessions or the scheduler concurrently. Read-only CLI queries bypass the lock.
+  sessions or the scheduler concurrently.
 
 ## 6. Crash / restart recovery
 
@@ -220,9 +217,7 @@ early, then fall back to `rusqlite` + a blocking pool. Decide in M0 and record h
 ## 8. Open questions
 
 1. **`sqlx` vs `rusqlite`** — finalize in M0 (§7).
-2. **One-off mutating CLI** — do we expose any mutating subcommands for scripting, or
-   is all control TUI-only in v1? Leaning: read-only CLI queries + TUI-only control,
-   to keep the single-instance model simple.
+2. **One-off mutating CLI** — closed: v1 is TUI-only; no operational subcommands.
 3. **Event bus durability ordering** — guarantee persist-before-UI-push, or allow the
    UI to see events slightly ahead of the durable write? Prefer persist-first for
    auditability; measure latency impact.

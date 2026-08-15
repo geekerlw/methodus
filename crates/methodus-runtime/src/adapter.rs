@@ -16,6 +16,9 @@ pub struct SpawnInput {
     pub allowed_tools: Vec<String>,
     /// Codex `--sandbox` value (`read-only` | `workspace-write` | `danger-full-access`).
     pub sandbox: Option<String>,
+    /// Additional directories the executor may read in place (`claude --add-dir`).
+    /// Launch cwd ∪ registered projects; source is not copied into `cwd`.
+    pub extra_dirs: Vec<PathBuf>,
     pub model: Option<String>,
 }
 

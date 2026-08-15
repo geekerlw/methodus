@@ -38,7 +38,7 @@ pub(crate) fn claude_args(input: &SpawnInput, resume: Option<&str>) -> Vec<Strin
         args.push(input.session_id.clone());
     }
     args.push("--permission-mode".to_string());
-    args.push(input.permission_mode.clone());
+    args.push(claude_permission_mode(&input.permission_mode).to_string());
     for tool in &input.allowed_tools {
         args.push("--allowed-tools".to_string());
         args.push(tool.clone());
@@ -47,8 +47,22 @@ pub(crate) fn claude_args(input: &SpawnInput, resume: Option<&str>) -> Vec<Strin
         args.push("--model".to_string());
         args.push(model.clone());
     }
+    for dir in &input.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
     args.push(input.prompt.clone());
     args
+}
+
+/// Map Methodus permission mode to Claude `--permission-mode`.
+/// Never `bypassPermissions`: edits auto-run in `acceptEdits`; shell still gated.
+pub(crate) fn claude_permission_mode(mode: &str) -> &'static str {
+    match mode {
+        "plan" => "plan",
+        "cautious" | "manual" | "default" => "manual",
+        _ => "acceptEdits",
+    }
 }
 
 async fn spawn_claude(
@@ -386,6 +400,7 @@ mod tests {
             permission_mode: "acceptEdits".to_string(),
             allowed_tools: Vec::new(),
             sandbox: None,
+            extra_dirs: Vec::new(),
             model: None,
         }
     }
@@ -404,6 +419,16 @@ mod tests {
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"exec-sid-1".to_string()));
         assert!(!args.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn spawn_args_pass_add_dir() {
+        let mut input = sample_input();
+        input.extra_dirs = vec!["/tmp/proj".into()];
+        let args = claude_args(&input, None);
+        assert!(args.contains(&"--add-dir".to_string()));
+        assert!(args.contains(&"/tmp/proj".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("do the thing"));
     }
 
     #[test]
@@ -558,5 +583,18 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].session_id, "sid-2");
         assert_eq!(agents[0].id, "ag-2");
+    }
+
+    #[test]
+    fn maps_methodus_modes_never_bypass() {
+        assert_eq!(claude_permission_mode("acceptEdits"), "acceptEdits");
+        assert_eq!(claude_permission_mode("plan"), "plan");
+        assert_eq!(claude_permission_mode("cautious"), "manual");
+        assert_eq!(claude_permission_mode("default"), "manual");
+        let mut input = sample_input();
+        input.permission_mode = "cautious".to_string();
+        let args = claude_args(&input, None);
+        assert!(args.contains(&"manual".to_string()));
+        assert!(!args.iter().any(|a| a.contains("bypass")));
     }
 }

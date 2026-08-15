@@ -35,7 +35,10 @@ triggers a re-index (never a silent overwrite of the file).
 │       └── hypotheses/*.md
 ├── methods/                    # <method>.yaml (procedure definitions)
 ├── skills/                     # global Methodus-owned skills (SKILL.md packages)
-├── projects/                   # <project>/project.yaml + project-local knowledge
+├── packs.yaml                  # registered team packs + focus (paths only)
+├── packs/                      # optional local copies of team packs
+├── projects.yaml               # registered project directories + focus
+├── projects/                   # <project>/ : repo map, module notes — not global Faces
 ├── workspaces/                 # one isolated dir per task (see §5)
 │   └── <task-id>/
 └── queue/                      # (optional) durable job artifacts too big for SQLite
@@ -43,6 +46,46 @@ triggers a re-index (never a silent overwrite of the file).
 
 Domain-content roots (`faces/`, `methods/`, `skills/`, `projects/`) are the file
 source-of-truth. `state.db` indexes them.
+
+A **pack** is a Methodus-format folder Methodus loads by path (it does not clone or
+push). `packs.yaml` only records `id`, `path`, `active`, and `focus`. Sharing the
+folder is an organizational choice.
+
+```text
+<pack>/
+├── pack.yaml                   # required: id (and optional name, description)
+├── faces/<id>/face.yaml
+├── faces/<id>/knowledge/*.md   # Face-scoped notes
+├── skills/<name>/SKILL.md
+└── knowledge/*.md              # pack-level notes (any Face)
+```
+
+```yaml
+# ~/.methodus/packs.yaml
+focus: team-x
+packs:
+  - id: team-x
+    path: /path/to/team-x          # absolute, or relative to Methodus home
+    active: true
+```
+
+Optional local copies may live under `~/.methodus/packs/<id>/`; dropping a folder
+with `pack.yaml` there is enough for discovery. Personal `faces/` and `skills/`
+overlay every pack (same id/name: personal wins). Among active packs, the focus pack
+is searched first.
+
+A **project** is a directory on disk (the user's repo). `projects.yaml` records `id`,
+`name`, `path`, and `focus`. New tasks pick up the focus project. Register paths from
+the TUI setup page — Methodus does not clone or pull.
+
+```yaml
+# ~/.methodus/projects.yaml
+focus: methodus
+projects:
+  - id: methodus
+    name: methodus
+    path: /path/to/methodus
+```
 
 ## 3. SQLite schema (DDL)
 
@@ -100,6 +143,22 @@ CREATE TABLE events (
 );
 CREATE INDEX idx_events_task ON events(task_id, occurred_at);
 CREATE INDEX idx_events_session ON events(session_id, seq);
+
+-- Executor token / cost (one row per Result that reported usage)
+CREATE TABLE usage_rolls (
+    id                  TEXT PRIMARY KEY,
+    task_id             TEXT,
+    session_id          TEXT,
+    runtime             TEXT,
+    input_tokens        INTEGER NOT NULL DEFAULT 0,
+    output_tokens       INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
+    cost_usd            REAL,
+    occurred_at         TEXT NOT NULL
+);
+CREATE INDEX idx_usage_occurred ON usage_rolls(occurred_at);
+CREATE INDEX idx_usage_task ON usage_rolls(task_id);
 CREATE INDEX idx_events_type ON events(type);
 
 -- ---------- Workspaces ----------
@@ -166,7 +225,7 @@ CREATE TABLE knowledge_items (
     project_id   TEXT REFERENCES projects(id),
     path         TEXT NOT NULL,
     content_hash TEXT NOT NULL,
-    source       TEXT NOT NULL,             -- experience|user_answer|doc|research
+    source       TEXT NOT NULL,             -- experience|user_answer|doc|research (URL/path in body)
     confidence   REAL,
     scope        TEXT,                      -- applicability
     status       TEXT NOT NULL,             -- candidate|committed|conflicted|rejected
@@ -231,7 +290,7 @@ CREATE TABLE evolution_candidates (
 -- ---------- Learning queue ----------
 CREATE TABLE learning_jobs (
     id                TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,        -- extract_experience|detect_gaps|propose_knowledge|...
+    kind              TEXT NOT NULL,        -- extract_experience|detect_gaps|propose_knowledge|propose_skill|...
     priority          INTEGER NOT NULL DEFAULT 0,
     dedupe_key        TEXT,                 -- UNIQUE-ish to collapse duplicates
     input_refs        TEXT NOT NULL,        -- JSON refs to source entities
@@ -291,6 +350,10 @@ Event names follow `00-product.md` §6 (`task.*`, `session.*`, `workspace.*`, `k
 └── transcript/              # full executor event transcript (JSONL) + large tool outputs
 ```
 
+The user's repos are **not** copied into this tree. `selected-context.md` lists readable
+directory roots (launch cwd ∪ registered projects) and any `@` attachments as absolute
+paths; Claude Code is given those roots with `--add-dir` and reads them in place.
+
 Rules (from `00-product.md` §9): Face/Project memory is **not** written back through workspace
 temp files; workspaces are retained by default for audit; global skills/MCP stay
 visible while task-specific context is only additive; writes to the user's project
@@ -302,7 +365,7 @@ knowledge base into the workspace — inject only the minimal resolved context.
 - Versioned SQL files under `migrations/`, embedded into `methodus-store` and applied
   on process startup before the Engine serves any task.
 - Forward-only for MVP; each migration is idempotent-safe to re-check.
-- `methodus init` creates `~/.methodus/`, writes a default `config.yaml`, and runs
+- First TUI launch creates `~/.methodus/`, writes a default `config.yaml`, and runs
   migrations to create `state.db`.
 
 ## 7. Open questions

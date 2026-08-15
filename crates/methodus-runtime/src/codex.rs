@@ -265,6 +265,7 @@ mod tests {
             permission_mode: String::new(),
             allowed_tools: Vec::new(),
             sandbox: Some("workspace-write".to_string()),
+            extra_dirs: Vec::new(),
             model: None,
         }
     }

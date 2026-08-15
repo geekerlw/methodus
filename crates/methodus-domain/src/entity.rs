@@ -5,7 +5,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::status::{SessionStatus, TaskStatus};
+use crate::status::{
+    JobKind, JobStatus, KnowledgeStatus, QuestionStatus, SessionStatus, TaskStatus,
+};
 
 /// A user-submitted task that Methodus orchestrates through an executor.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -71,4 +73,59 @@ pub struct Approval {
     pub actor: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+}
+
+/// Indexed knowledge item. Body lives at `path` under Methodus home.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KnowledgeItem {
+    pub id: String,
+    pub face_id: Option<String>,
+    pub project_id: Option<String>,
+    pub path: String,
+    pub content_hash: String,
+    pub source: String, // experience|user_answer|doc|research
+    pub confidence: Option<f64>,
+    pub scope: Option<String>,
+    pub status: KnowledgeStatus,
+    pub conflict_of: Option<String>,
+    pub version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Proactive question raised by the curiosity loop.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Question {
+    pub id: String,
+    pub question: String,
+    pub reason: Option<String>,
+    pub task_id: Option<String>,
+    pub face_id: Option<String>,
+    pub importance: f64,
+    pub frequency: f64,
+    pub impact: f64,
+    pub uncertainty: f64,
+    pub value: f64,
+    pub status: QuestionStatus,
+    pub not_before: Option<DateTime<Utc>>,
+    pub answer: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Budgeted, retryable, cancelable learning-queue job.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LearningJob {
+    pub id: String,
+    pub kind: JobKind,
+    pub priority: i64,
+    pub dedupe_key: Option<String>,
+    pub input_refs: String, // JSON
+    pub status: JobStatus,
+    pub attempts: i64,
+    pub not_before: Option<DateTime<Utc>>,
+    pub budget: Option<String>,
+    pub requires_approval: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }

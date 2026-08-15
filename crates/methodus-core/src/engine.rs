@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -13,10 +13,13 @@ use methodus_domain::*;
 use methodus_runtime::{RuntimeAdapter, SpawnInput};
 use methodus_store::Store;
 
+use crate::config::UserConfig;
 use crate::error::CoreError;
+use crate::learning;
 use crate::lock::process_is_alive;
 use crate::policy;
 use crate::resolution::{self, Resolution};
+use crate::scheduler;
 use crate::workspace::WorkspaceBuilder;
 
 const MAX_AUTO_TURNS: u32 = 12;
@@ -25,6 +28,8 @@ pub struct Engine {
     store: Arc<Store>,
     adapters: HashMap<String, Arc<dyn RuntimeAdapter>>,
     home: PathBuf,
+    /// Directory Methodus was launched from. Source trees stay here; they are not copied.
+    launch_cwd: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +48,7 @@ impl Engine {
             store,
             adapters,
             home,
+            launch_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -55,6 +61,7 @@ impl Engine {
             store,
             adapters,
             home,
+            launch_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -65,12 +72,192 @@ impl Engine {
             .ok_or_else(|| CoreError::UnknownRuntime(runtime.to_string()))
     }
 
+    fn preferred_runtime(&self, requested: Option<&str>) -> String {
+        if let Some(name) = requested {
+            if self.adapters.contains_key(name) {
+                return name.to_string();
+            }
+        }
+        let cfg = UserConfig::load(&self.home);
+        if let Some(name) = cfg.default_runtime {
+            if self.adapters.contains_key(&name) {
+                return name;
+            }
+        }
+        for name in ["claude-code", "cursor", "codex"] {
+            if self.adapters.contains_key(name) {
+                return name.to_string();
+            }
+        }
+        self.adapters
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "claude-code".to_string())
+    }
+
     pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
 
-    pub fn home(&self) -> &std::path::Path {
+    pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    pub fn launch_cwd(&self) -> &Path {
+        &self.launch_cwd
+    }
+
+    /// Directories the executor may read in place (launch cwd ∪ registered projects).
+    pub fn context_roots(&self) -> Vec<(String, PathBuf)> {
+        crate::mentions::context_roots(&self.home, &self.launch_cwd)
+    }
+
+    /// Root directory for per-task executor sandboxes (Claude/Codex cwd).
+    pub fn workspace_root(&self) -> PathBuf {
+        UserConfig::load(&self.home).resolve_workspace_root(&self.home)
+    }
+
+    /// Drain due learning jobs (extract → detect → propose). Budgeted, no LLM.
+    pub fn tick_learning(&self) -> Result<usize, CoreError> {
+        scheduler::tick(&self.store, &self.home)
+    }
+
+    /// Promote the highest-value pending question to Asked when the user is idle.
+    /// No-op if a question is already Asked, or none clear the value floor.
+    pub fn ask_idle_question(&self) -> Result<Option<Question>, CoreError> {
+        learning::promote_idle_question(&self.store)
+    }
+
+    pub fn usage_summary(&self, today_only: bool) -> Result<UsageSummary, CoreError> {
+        let since = if today_only {
+            Utc::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .map(|d| d.and_utc())
+        } else {
+            None
+        };
+        Ok(self.store.usage_summary(since)?)
+    }
+
+    pub fn review_knowledge(&self, id: &str, commit: bool) -> Result<KnowledgeItem, CoreError> {
+        let mut item = self
+            .store
+            .get_knowledge(id)?
+            .ok_or_else(|| CoreError::KnowledgeNotFound(id.to_string()))?;
+        if commit && item.source == learning::SKILL_DRAFT_SOURCE {
+            match learning::install_skill_draft(&self.home, &item) {
+                Ok(live_path) => {
+                    item.path = live_path;
+                }
+                Err(e) => {
+                    if item.status == KnowledgeStatus::Candidate {
+                        item.status = item
+                            .status
+                            .checked_transition(KnowledgeStatus::Conflicted)?;
+                        item.updated_at = Utc::now();
+                        self.store.update_knowledge(&item)?;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let next = if commit {
+            KnowledgeStatus::Committed
+        } else {
+            KnowledgeStatus::Rejected
+        };
+        item.status = item.status.checked_transition(next)?;
+        item.updated_at = Utc::now();
+        self.store.update_knowledge(&item)?;
+        let ev = if commit {
+            "knowledge.committed"
+        } else {
+            "knowledge.rejected"
+        };
+        let _ = self.store.insert_event(
+            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
+            ev,
+            &Utc::now().to_rfc3339(),
+            None,
+            None,
+            &serde_json::json!({"knowledge_id": id, "kind": item.source}).to_string(),
+            None,
+        );
+        Ok(item)
+    }
+
+    /// Distill the current task into a candidate skill (`/learn`). Never writes a live skill.
+    pub fn learn_skill(
+        &self,
+        task_id: &str,
+        hint: Option<&str>,
+    ) -> Result<KnowledgeItem, CoreError> {
+        learning::propose_skill_from_task(&self.store, &self.home, task_id, hint)?
+            .ok_or_else(|| CoreError::Other("could not draft a skill from this task".into()))
+    }
+
+    pub fn answer_question(&self, id: &str, answer: &str) -> Result<Question, CoreError> {
+        let mut q = self
+            .store
+            .get_question(id)?
+            .ok_or_else(|| CoreError::QuestionNotFound(id.to_string()))?;
+        if q.status == QuestionStatus::Pending {
+            q.status = q.status.checked_transition(QuestionStatus::Asked)?;
+        }
+        q.status = q.status.checked_transition(QuestionStatus::Answered)?;
+        q.answer = Some(answer.to_string());
+        q.updated_at = Utc::now();
+        self.store.update_question(&q)?;
+        let _ = self.store.insert_event(
+            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
+            "question.answered",
+            &Utc::now().to_rfc3339(),
+            q.task_id.as_deref(),
+            None,
+            &serde_json::json!({"question_id": id}).to_string(),
+            None,
+        );
+        let refs = learning::JobRefs {
+            experience_id: None,
+            task_id: q.task_id.clone(),
+            face_id: q.face_id.clone(),
+            question_id: Some(q.id.clone()),
+            source: Some("user_answer".to_string()),
+        };
+        learning::enqueue_job(
+            &self.store,
+            JobKind::ProposeKnowledge,
+            &format!("propose:q:{}", q.id),
+            &refs,
+            20,
+        )?;
+        let _ = self.tick_learning()?;
+        Ok(q)
+    }
+
+    pub fn snooze_question(&self, id: &str) -> Result<Question, CoreError> {
+        let mut q = self
+            .store
+            .get_question(id)?
+            .ok_or_else(|| CoreError::QuestionNotFound(id.to_string()))?;
+        q.status = q.status.checked_transition(QuestionStatus::Snoozed)?;
+        q.not_before = Some(Utc::now() + learning::snooze_hours());
+        q.updated_at = Utc::now();
+        self.store.update_question(&q)?;
+        Ok(q)
+    }
+
+    pub fn dismiss_question(&self, id: &str) -> Result<Question, CoreError> {
+        let mut q = self
+            .store
+            .get_question(id)?
+            .ok_or_else(|| CoreError::QuestionNotFound(id.to_string()))?;
+        q.status = q.status.checked_transition(QuestionStatus::Dismissed)?;
+        q.updated_at = Utc::now();
+        self.store.update_question(&q)?;
+        Ok(q)
     }
 
     pub fn create_task(
@@ -87,13 +274,14 @@ impl Engine {
         })?;
         let now = Utc::now();
         let id_raw = Uuid::new_v4().to_string().replace('-', "");
+        let project_id = crate::project::focus_project(&self.home).map(|p| p.id);
         let task = Task {
             id: format!("task_{}", &id_raw[..12]),
             title: title.to_string(),
             request: request.to_string(),
-            project_id: None,
+            project_id,
             status: TaskStatus::Queued,
-            runtime: Some(runtime.unwrap_or("claude-code").to_string()),
+            runtime: Some(self.preferred_runtime(runtime)),
             workspace_id: None,
             resolution: Some(resolution.to_json()),
             version: 1,
@@ -106,6 +294,7 @@ impl Engine {
 
     /// Reconcile every non-terminal session against pid liveness + `claude agents --json`.
     pub async fn recover(&self) -> Result<Vec<RecoveredSession>, CoreError> {
+        let _ = scheduler::recover_jobs(&self.store)?;
         let sessions = self.store.list_non_terminal_sessions()?;
         let mut out = Vec::new();
         for session in sessions {
@@ -116,11 +305,128 @@ impl Engine {
         Ok(out)
     }
 
+    /// Cancel a task and interrupt any non-terminal sessions it owns.
+    pub fn cancel_task(&self, task_id: &str) -> Result<(), CoreError> {
+        let task = self
+            .store
+            .get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        if !task.status.can_transition_to(&TaskStatus::Cancelled) {
+            return Err(CoreError::TaskNotCancellable(
+                task_id.to_string(),
+                task.status.to_string(),
+            ));
+        }
+        for session in self.store.list_sessions_for_task(task_id)? {
+            self.interrupt_session(&session)?;
+        }
+        self.store
+            .update_task_status(task_id, TaskStatus::Cancelled)?;
+        Ok(())
+    }
+
+    /// Cancel one session and, if the parent task is still open, cancel it too.
+    pub fn cancel_session(&self, session_id: &str) -> Result<(), CoreError> {
+        let session = self
+            .store
+            .get_session(session_id)?
+            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
+        if session.status.is_terminal() {
+            return Err(CoreError::SessionNotCancellable(
+                session_id.to_string(),
+                session.status.to_string(),
+            ));
+        }
+        self.interrupt_session(&session)?;
+        if let Some(task) = self.store.get_task(&session.task_id)? {
+            if task.status.can_transition_to(&TaskStatus::Cancelled) {
+                self.store
+                    .update_task_status(&task.id, TaskStatus::Cancelled)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn interrupt_session(&self, session: &Session) -> Result<(), CoreError> {
+        if session.status.is_terminal() {
+            return Ok(());
+        }
+        if let Some(pid) = session.pid {
+            terminate_pid(pid);
+        }
+        let next = if session
+            .status
+            .can_transition_to(&SessionStatus::Interrupted)
+        {
+            SessionStatus::Interrupted
+        } else if session.status.can_transition_to(&SessionStatus::Failed) {
+            SessionStatus::Failed
+        } else {
+            return Ok(());
+        };
+        self.store.update_session_status(&session.id, next)?;
+        Ok(())
+    }
+
+    /// Persist a user chat line so transcripts reload as a conversation.
+    pub fn record_user_message(&self, task_id: &str, text: &str) -> Result<(), CoreError> {
+        let _ = self
+            .store
+            .get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        let payload = serde_json::to_string(&RuntimeEvent::UserText {
+            text: text.to_string(),
+        })
+        .unwrap_or_default();
+        self.store.insert_event(
+            &format!("ev_user_{}", Uuid::new_v4().to_string().replace('-', "")),
+            "user.message",
+            &Utc::now().to_rfc3339(),
+            Some(task_id),
+            None,
+            &payload,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Send a user turn: first run on queued tasks, follow-up `--resume` on reviewing ones.
+    pub async fn send_turn(
+        &self,
+        task_id: &str,
+        prompt: &str,
+    ) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(CoreError::EmptyMessage);
+        }
+        let task = self
+            .store
+            .get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        self.record_user_message(task_id, prompt)?;
+        let resume = matches!(
+            task.status,
+            TaskStatus::Reviewing | TaskStatus::WaitingUser | TaskStatus::Running
+        );
+        self.run_task_inner(task_id, resume, Some(prompt.to_string()))
+            .await
+    }
+
     /// Run a task: build workspace, spawn or resume executor, stream events, persist, save experience.
     pub async fn run_task(
         &self,
         task_id: &str,
         resume: bool,
+    ) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
+        self.run_task_inner(task_id, resume, None).await
+    }
+
+    async fn run_task_inner(
+        &self,
+        task_id: &str,
+        resume: bool,
+        follow_up: Option<String>,
     ) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
         let mut task = self
             .store
@@ -156,7 +462,10 @@ impl Engine {
 
         match task.status {
             TaskStatus::Queued => self.transition_task(&task, TaskStatus::Planning)?,
-            TaskStatus::Planning | TaskStatus::WaitingUser | TaskStatus::Running => {}
+            TaskStatus::Planning
+            | TaskStatus::WaitingUser
+            | TaskStatus::Running
+            | TaskStatus::Reviewing => {}
             other => {
                 return Err(CoreError::TaskNotRunnable(
                     task_id.to_string(),
@@ -166,15 +475,50 @@ impl Engine {
         }
 
         let resolution = resolution_from_task(&task, &self.home)?;
-        let ws_base = self.home.join("workspaces");
-        let context = resolution.to_context_markdown(&task.title, &task.request);
-        let ws_root = WorkspaceBuilder::build(&ws_base, task_id, &context)?;
+        let snippets = learning::select_committed_knowledge(
+            &self.store,
+            &self.home,
+            &resolution.face_id,
+            &task.request,
+        )?;
+        let mut context = resolution.to_context_markdown(&task.title, &task.request);
+        if let Some(ref pid) = task.project_id {
+            if let Some(proj) = crate::project::list_projects(&self.home)
+                .into_iter()
+                .find(|p| p.id == *pid)
+            {
+                context.push_str(&format!(
+                    "\n## Project\n\nRoot: `{}`\nWrites inside this tree are in-scope when the user asks.\n",
+                    proj.root.display()
+                ));
+            }
+        }
+        context.push_str(&learning::render_knowledge_context(&snippets));
+        let named_roots = self.context_roots();
+        context.push_str(&crate::mentions::render_readable_dirs(&named_roots));
+        let mention_source = follow_up.as_deref().unwrap_or(&task.request);
+        let mentions = crate::mentions::resolve_named(mention_source, &named_roots);
+        context.push_str(&crate::mentions::render_attached(&mentions));
+        let extra_dirs = crate::mentions::readable_dirs(&named_roots);
+        let ws_root = WorkspaceBuilder::build(&self.workspace_root(), task_id, &context)?;
+        let knowledge_files: Vec<(String, PathBuf)> = snippets
+            .iter()
+            .map(|s| (s.dest_name.clone(), s.src_path.clone()))
+            .collect();
+        WorkspaceBuilder::materialize_knowledge(&ws_root, &knowledge_files)?;
 
-        let face_dir = self.home.join("faces").join(&resolution.face_id);
-        if face_dir.join("face.yaml").exists() {
+        let face_yaml = if !resolution.face_dir.is_empty() {
+            PathBuf::from(&resolution.face_dir).join("face.yaml")
+        } else {
+            self.home
+                .join("faces")
+                .join(&resolution.face_id)
+                .join("face.yaml")
+        };
+        if face_yaml.is_file() {
             let dest = ws_root.join("face-context");
             fs::create_dir_all(&dest)?;
-            fs::copy(face_dir.join("face.yaml"), dest.join("face.yaml"))?;
+            fs::copy(&face_yaml, dest.join("face.yaml"))?;
         }
 
         let method_src = resolution.method.as_ref().map(|m| PathBuf::from(&m.path));
@@ -200,7 +544,7 @@ impl Engine {
             .get_task(task_id)?
             .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
         match task.status {
-            TaskStatus::Planning | TaskStatus::WaitingUser => {
+            TaskStatus::Planning | TaskStatus::WaitingUser | TaskStatus::Reviewing => {
                 self.transition_task(&task, TaskStatus::Running)?;
             }
             TaskStatus::Running => {}
@@ -219,7 +563,7 @@ impl Engine {
             runtime: task
                 .runtime
                 .clone()
-                .unwrap_or_else(|| "claude-code".to_string()),
+                .unwrap_or_else(|| self.preferred_runtime(None)),
             executor_sid: resume_sid.clone(),
             transport: "subprocess".to_string(),
             pid: None,
@@ -232,22 +576,39 @@ impl Engine {
         };
         self.store.insert_session(&session)?;
 
-        let spawn_input_prompt = if resume_sid.is_some() {
-            format!(
-                "The previous session was interrupted. Continue from where you left off.\n\n\
-                 Original request:\n{}",
-                task.request
-            )
-        } else {
-            task.request.clone()
+        let spawn_input_prompt = {
+            let body = if let Some(text) = follow_up {
+                text
+            } else if resume_sid.is_some() {
+                format!(
+                    "The previous session was interrupted. Continue from where you left off.\n\n\
+                     Original request:\n{}",
+                    task.request
+                )
+            } else {
+                task.request.clone()
+            };
+            if resume_sid.is_none() {
+                format!(
+                    "{body}\n\n\
+                     Follow `.methodus/selected-context.md`. \
+                     Load listed skills from `.claude/skills/` with the Skill tool, \
+                     or read each `SKILL.md` and follow it."
+                )
+            } else {
+                body
+            }
         };
 
         let runtime_name = task
             .runtime
             .clone()
-            .unwrap_or_else(|| "claude-code".to_string());
+            .unwrap_or_else(|| self.preferred_runtime(None));
         let adapter = self.adapter(&runtime_name)?;
-        let allowed_tools = Vec::new();
+        let allowed_tools = policy::baseline_allowed_tools();
+        let _ = self
+            .store
+            .set_session_allowed_tools(&session_id, &allowed_tools);
 
         self.launch_turns(LaunchTurns {
             adapter,
@@ -259,9 +620,10 @@ impl Engine {
             task_title: task.title.clone(),
             task_request: task.request.clone(),
             prompt: spawn_input_prompt,
-            executor_sid: resume_sid,
+            executor_sid: resume_sid.clone(),
             allowed_tools,
-            next_is_resume: resume,
+            next_is_resume: resume_sid.is_some(),
+            extra_dirs,
         })
     }
 
@@ -377,12 +739,14 @@ impl Engine {
             executor_sid: session.executor_sid.clone(),
             allowed_tools: allowed,
             next_is_resume: session.executor_sid.is_some(),
+            extra_dirs: crate::mentions::readable_dirs(&self.context_roots()),
         })
     }
 
     fn launch_turns(&self, launch: LaunchTurns) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
         let (caller_tx, caller_rx) = mpsc::channel(256);
-        let uses_manual = launch.adapter.uses_manual_permissions();
+        let permission_mode =
+            policy::PermissionMode::parse(UserConfig::load(&self.home).permission_mode.as_deref());
         let runner = TurnRunner {
             store: self.store.clone(),
             adapter: launch.adapter,
@@ -394,8 +758,9 @@ impl Engine {
             task_title: launch.task_title,
             task_request: launch.task_request,
             caller_tx,
-            uses_manual,
+            permission_mode,
             runtime: launch.runtime,
+            extra_dirs: launch.extra_dirs,
         };
         tokio::spawn(runner.run(
             launch.prompt,
@@ -451,6 +816,11 @@ impl Engine {
 
         if had_interrupted && latest_executor_sid.is_some() {
             return Err(CoreError::NeedsResume);
+        }
+
+        // A finished turn (reviewing) still has an executor thread to continue.
+        if matches!(task.status, TaskStatus::Reviewing) && latest_executor_sid.is_some() {
+            return Ok(latest_executor_sid);
         }
 
         Ok(None)
@@ -519,6 +889,16 @@ impl Engine {
     }
 }
 
+fn terminate_pid(pid: u32) {
+    if pid <= 1 || pid == std::process::id() || !process_is_alive(pid) {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
 fn resolution_from_task(task: &Task, home: &std::path::Path) -> Result<Resolution, CoreError> {
     if let Some(raw) = &task.resolution {
         if let Some(res) = Resolution::parse_json(raw) {
@@ -565,6 +945,7 @@ struct LaunchTurns {
     executor_sid: Option<String>,
     allowed_tools: Vec<String>,
     next_is_resume: bool,
+    extra_dirs: Vec<PathBuf>,
 }
 
 struct TurnRunner {
@@ -578,8 +959,9 @@ struct TurnRunner {
     task_title: String,
     task_request: String,
     caller_tx: mpsc::Sender<RuntimeEvent>,
-    uses_manual: bool,
+    permission_mode: policy::PermissionMode,
     runtime: String,
+    extra_dirs: Vec<PathBuf>,
 }
 
 struct TurnOutcome {
@@ -598,13 +980,9 @@ impl TurnRunner {
         mut next_is_resume: bool,
     ) {
         for _turn in 0..MAX_AUTO_TURNS {
-            let permission_mode = if self.uses_manual {
-                "manual".to_string()
-            } else {
-                "acceptEdits".to_string()
-            };
+            let permission_mode = self.permission_mode.as_str().to_string();
             let sandbox = if self.runtime == "codex" {
-                Some("workspace-write".to_string())
+                Some(self.permission_mode.codex_sandbox().to_string())
             } else {
                 None
             };
@@ -615,6 +993,7 @@ impl TurnRunner {
                 permission_mode,
                 allowed_tools: allowed_tools.clone(),
                 sandbox,
+                extra_dirs: self.extra_dirs.clone(),
                 model: None,
             };
 
@@ -670,6 +1049,7 @@ impl TurnRunner {
                 task_id: self.task_id.clone(),
                 session_id: self.session_id.clone(),
                 pid: handle.pid,
+                runtime: self.runtime.clone(),
             };
             let outcome = persist_turn(event_rx, ctx).await;
             if let Some(sid) = outcome.executor_sid.clone() {
@@ -793,13 +1173,6 @@ fn finish_task(runner: &TurnRunner, result_text: &str, is_error: bool) {
             let _ = runner
                 .store
                 .update_task_status(&runner.task_id, TaskStatus::Reviewing);
-            if let Ok(Some(task)) = runner.store.get_task(&runner.task_id) {
-                if task.status.can_transition_to(&TaskStatus::Completed) {
-                    let _ = runner
-                        .store
-                        .update_task_status(&runner.task_id, TaskStatus::Completed);
-                }
-            }
         }
     }
 
@@ -813,6 +1186,7 @@ struct RelayCtx {
     task_id: String,
     session_id: String,
     pid: Option<u32>,
+    runtime: String,
 }
 
 async fn persist_turn(mut event_rx: mpsc::Receiver<RuntimeEvent>, ctx: RelayCtx) -> TurnOutcome {
@@ -831,6 +1205,7 @@ async fn persist_turn(mut event_rx: mpsc::Receiver<RuntimeEvent>, ctx: RelayCtx)
         );
         let event_type = match &event {
             RuntimeEvent::SessionStarted { .. } => "session.started",
+            RuntimeEvent::UserText { .. } => "user.message",
             RuntimeEvent::AssistantText { .. } => "session.output",
             RuntimeEvent::Thinking { .. } => "session.thinking",
             RuntimeEvent::ToolCallStarted { .. } => "session.tool_start",
@@ -864,7 +1239,8 @@ async fn persist_turn(mut event_rx: mpsc::Receiver<RuntimeEvent>, ctx: RelayCtx)
                 is_error: err,
                 session_id,
                 permission_denials,
-                ..
+                cost_usd,
+                usage,
             } => {
                 result_text = text.clone();
                 is_error = *err;
@@ -873,6 +1249,13 @@ async fn persist_turn(mut event_rx: mpsc::Receiver<RuntimeEvent>, ctx: RelayCtx)
                     let _ = ctx.store.set_executor_sid(&ctx.session_id, sid);
                     executor_sid = Some(sid.clone());
                 }
+                let delta = UsageDelta::from_result(*cost_usd, usage.as_ref());
+                let _ = ctx.store.insert_usage(
+                    Some(&ctx.task_id),
+                    Some(&ctx.session_id),
+                    Some(&ctx.runtime),
+                    &delta,
+                );
             }
             _ => {}
         }
@@ -963,6 +1346,7 @@ fn save_experience_direct(
         updated_at: now,
     };
     runner.store.insert_experience(&exp)?;
+    let _ = learning::enqueue_extract(&runner.store, &exp);
     Ok(())
 }
 
@@ -1085,7 +1469,7 @@ mod tests {
         while rx.recv().await.is_some() {}
 
         let done = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.status, TaskStatus::Reviewing);
 
         let sessions = engine.store().list_sessions_for_task(&task.id).unwrap();
         assert_eq!(sessions.len(), 1);
@@ -1098,6 +1482,56 @@ mod tests {
         assert!(abs.exists(), "experience file missing: {}", abs.display());
         let body = fs::read_to_string(&abs).unwrap();
         assert!(body.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn run_task_records_executor_usage() {
+        let events = vec![
+            RuntimeEvent::SessionStarted {
+                session_id: "exec-sid-1".to_string(),
+            },
+            RuntimeEvent::Result {
+                is_error: false,
+                text: "done".to_string(),
+                cost_usd: Some(0.04),
+                usage: Some(serde_json::json!({"input_tokens": 120, "output_tokens": 30})),
+                session_id: Some("exec-sid-1".to_string()),
+                permission_denials: Vec::new(),
+            },
+        ];
+        let (engine, _dir) = engine_with(events);
+        let task = engine.create_task("goal", "goal", None, None).unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        let all = engine.usage_summary(false).unwrap();
+        assert_eq!(all.input_tokens, 120);
+        assert_eq!(all.output_tokens, 30);
+        assert!((all.cost_usd - 0.04).abs() < 1e-9);
+        assert_eq!(all.turns, 1);
+        let task_u = engine.store().usage_for_task(&task.id).unwrap();
+        assert_eq!(task_u.input_tokens, 120);
+    }
+
+    #[tokio::test]
+    async fn send_turn_resumes_after_reviewing() {
+        let (engine, _dir) =
+            engine_with_turns(vec![vec![ok_result("first")], vec![ok_result("second")]]);
+        let task = engine.create_task("goal", "goal", None, None).unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+
+        let mut rx = engine
+            .send_turn(&task.id, "change it to methodus")
+            .await
+            .unwrap();
+        while rx.recv().await.is_some() {}
+
+        let done = engine.store().get_task(&task.id).unwrap().unwrap();
+        assert_eq!(done.status, TaskStatus::Reviewing);
+        let sessions = engine.store().list_sessions_for_task(&task.id).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let events = engine.store().list_events(Some(&task.id), 80).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "user.message"));
     }
 
     #[tokio::test]
@@ -1144,6 +1578,123 @@ mod tests {
             .join(&task.id)
             .join(".methodus/method.yaml")
             .is_file());
+    }
+
+    #[tokio::test]
+    async fn run_task_injects_committed_face_knowledge() {
+        let (engine, dir) = engine_with(vec![ok_result("done")]);
+        let now = Utc::now();
+        let rel = "faces/general/knowledge/latch.md";
+        fs::create_dir_all(dir.path().join("faces/general/knowledge")).unwrap();
+        fs::write(
+            dir.path().join(rel),
+            "# Latch protocol\n\nThe latch uses gpio 4.\n",
+        )
+        .unwrap();
+        engine
+            .store()
+            .insert_knowledge(&KnowledgeItem {
+                id: "know_latch".into(),
+                face_id: Some("general".into()),
+                project_id: None,
+                path: rel.into(),
+                content_hash: "h".into(),
+                source: "experience".into(),
+                confidence: Some(0.8),
+                scope: None,
+                status: KnowledgeStatus::Committed,
+                conflict_of: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let task = engine
+            .create_task("debug latch", "debug the latch gpio", None, None)
+            .unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+
+        let ctx = fs::read_to_string(
+            dir.path()
+                .join("workspaces")
+                .join(&task.id)
+                .join(".methodus/selected-context.md"),
+        )
+        .unwrap();
+        assert!(ctx.contains("gpio 4"), "context missing knowledge: {ctx}");
+        assert!(ctx.contains("Face knowledge (committed)"));
+        assert!(dir
+            .path()
+            .join("workspaces")
+            .join(&task.id)
+            .join("face-context/knowledge/latch.md")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn run_task_injects_pack_knowledge() {
+        let (engine, dir) = engine_with(vec![ok_result("done")]);
+        let pack = dir.path().join("team-pack");
+        fs::create_dir_all(pack.join("knowledge")).unwrap();
+        fs::write(pack.join("pack.yaml"), "id: team-x\nname: Team X\n").unwrap();
+        fs::write(
+            pack.join("knowledge/latch.md"),
+            "# Latch protocol\n\nThe latch uses gpio 4.\n",
+        )
+        .unwrap();
+        crate::pack::add_pack(dir.path(), &pack).unwrap();
+
+        let task = engine
+            .create_task("debug latch", "debug the latch gpio", None, None)
+            .unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+
+        let ctx = fs::read_to_string(
+            dir.path()
+                .join("workspaces")
+                .join(&task.id)
+                .join(".methodus/selected-context.md"),
+        )
+        .unwrap();
+        assert!(ctx.contains("gpio 4"), "missing pack knowledge: {ctx}");
+        assert!(ctx.contains("team:team-x"));
+        assert!(dir
+            .path()
+            .join("workspaces")
+            .join(&task.id)
+            .join("face-context/knowledge/latch.md")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn workspace_root_honors_config_yaml() {
+        let events = vec![ok_result("done")];
+        let (engine, dir) = engine_with(events);
+        drop(engine);
+        let runs = dir.path().join("custom-runs");
+        fs::write(
+            dir.path().join("config.yaml"),
+            format!("workspace_root: {}\n", runs.display()),
+        )
+        .unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("state.db")).unwrap());
+        let adapter = Arc::new(MockAdapter {
+            turns: Mutex::new(vec![vec![ok_result("done")]].into()),
+            live: vec![],
+        });
+        let engine = Engine::new(store, adapter, dir.path().to_path_buf());
+        assert_eq!(engine.workspace_root(), runs);
+        let task = engine.create_task("g", "g", None, None).unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        assert!(runs
+            .join(&task.id)
+            .join(".methodus/selected-context.md")
+            .is_file());
+        assert!(!dir.path().join("workspaces").join(&task.id).exists());
     }
 
     #[tokio::test]
@@ -1263,7 +1814,7 @@ mod tests {
         assert_eq!(newest.executor_sid.as_deref(), Some("exec-sid-1"));
         assert_eq!(newest.status, SessionStatus::Exited);
         let done = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(done.status, TaskStatus::Reviewing);
     }
 
     #[tokio::test]
@@ -1307,7 +1858,7 @@ mod tests {
             .unwrap();
         while rx.recv().await.is_some() {}
         let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.status, TaskStatus::Reviewing);
         let appr = engine.store().get_approval(&appr_id).unwrap().unwrap();
         assert_eq!(appr.decision.as_deref(), Some("once"));
     }
@@ -1362,11 +1913,174 @@ mod tests {
         let mut rx = engine.run_task(&task.id, false).await.unwrap();
         while rx.recv().await.is_some() {}
         let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.status, TaskStatus::Reviewing);
         assert!(engine
             .store()
             .list_pending_approvals(Some(&task.id))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn cancel_queued_task() {
+        let (engine, _dir) = engine_with(vec![]);
+        let task = engine.create_task("g", "g", None, None).unwrap();
+        engine.cancel_task(&task.id).unwrap();
+        let task = engine.store().get_task(&task.id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert!(engine.cancel_task(&task.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn task_complete_enqueues_learning_jobs() {
+        let (engine, _dir) = engine_with(vec![ok_result("unknown: latch protocol")]);
+        let task = engine.create_task("g", "g", None, None).unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        let jobs = engine.store().list_jobs().unwrap();
+        assert!(jobs
+            .iter()
+            .any(|j| j.kind == JobKind::ExtractExperience && j.status == JobStatus::Queued));
+    }
+
+    #[tokio::test]
+    async fn learning_repeated_unknown_question_answer_and_conflict() {
+        let (engine, dir) = engine_with_turns(vec![
+            vec![ok_result("unknown: latch protocol\nuse gpio 4")],
+            vec![ok_result("unknown: latch protocol\nuse gpio 7")],
+        ]);
+        fs::create_dir_all(dir.path().join("faces/general/knowledge")).unwrap();
+
+        let t1 = engine.create_task("one", "one", None, None).unwrap();
+        let mut rx = engine.run_task(&t1.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        engine.tick_learning().unwrap();
+
+        let qs = engine.store().list_questions(None).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].frequency, 1.0);
+        let cands = engine
+            .store()
+            .list_knowledge(Some(KnowledgeStatus::Candidate))
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.source != crate::learning::SKILL_DRAFT_SOURCE)
+            .collect::<Vec<_>>();
+        assert!(!cands.is_empty());
+        let committed = engine.review_knowledge(&cands[0].id, true).unwrap();
+        assert_eq!(committed.status, KnowledgeStatus::Committed);
+        let committed_body = fs::read_to_string(engine.home().join(&committed.path)).unwrap();
+        assert!(committed_body.contains("gpio 4"));
+
+        let t2 = engine.create_task("two", "two", None, None).unwrap();
+        let mut rx = engine.run_task(&t2.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        engine.tick_learning().unwrap();
+
+        let qs = engine.store().list_questions(None).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert!(qs[0].frequency >= 2.0);
+        let conflicts = engine
+            .store()
+            .list_knowledge(Some(KnowledgeStatus::Conflicted))
+            .unwrap();
+        assert!(!conflicts.is_empty());
+        let still = fs::read_to_string(engine.home().join(&committed.path)).unwrap();
+        assert!(still.contains("gpio 4"));
+        assert!(!still.contains("gpio 7"));
+
+        let answered = engine
+            .answer_question(&qs[0].id, "the latch uses 3.3V pull-up")
+            .unwrap();
+        assert_eq!(answered.status, QuestionStatus::Answered);
+        let from_answer = engine
+            .store()
+            .list_knowledge(None)
+            .unwrap()
+            .into_iter()
+            .find(|k| k.source == "user_answer")
+            .expect("candidate from answer");
+        assert_eq!(from_answer.status, KnowledgeStatus::Candidate);
+    }
+
+    fn tool_start(name: &str) -> RuntimeEvent {
+        RuntimeEvent::ToolCallStarted {
+            id: name.to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn learn_skill_then_review_installs_live_skill() {
+        let (engine, _dir) = engine_with(vec![
+            tool_start("Bash"),
+            tool_start("Read"),
+            tool_start("Grep"),
+            ok_result("sampled"),
+        ]);
+        let task = engine
+            .create_task("sample cpu", "sample cpu of nginx", None, None)
+            .unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+
+        engine.tick_learning().unwrap();
+        let auto_drafts: Vec<_> = engine
+            .store()
+            .list_knowledge(Some(KnowledgeStatus::Candidate))
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.source == crate::learning::SKILL_DRAFT_SOURCE)
+            .collect();
+        assert!(
+            !auto_drafts.is_empty(),
+            "expected propose_skill draft after 3 tool calls"
+        );
+
+        let explicit = engine.learn_skill(&task.id, Some("cpu-sample")).unwrap();
+        assert_eq!(explicit.source, crate::learning::SKILL_DRAFT_SOURCE);
+        assert!(explicit.path.contains(".candidates"));
+
+        let committed = engine.review_knowledge(&explicit.id, true).unwrap();
+        assert_eq!(committed.status, KnowledgeStatus::Committed);
+        assert!(committed.path.starts_with("skills/"));
+        assert!(!committed.path.contains(".candidates"));
+        assert!(engine.home().join(&committed.path).exists());
+        let catalog = crate::resolution::scan_skills(engine.home());
+        assert!(catalog.iter().any(|s| s.name.contains("cpu-sample")));
+
+        let again = engine.learn_skill(&task.id, Some("cpu-sample")).unwrap();
+        assert_eq!(again.status, KnowledgeStatus::Conflicted);
+        assert!(engine.review_knowledge(&again.id, true).is_err());
+        let still = engine.store().get_knowledge(&again.id).unwrap().unwrap();
+        assert_eq!(still.status, KnowledgeStatus::Conflicted);
+    }
+
+    #[test]
+    fn recover_requeues_running_learning_job() {
+        let (engine, _dir) = engine_with(vec![]);
+        let now = Utc::now();
+        engine
+            .store()
+            .enqueue_job(&LearningJob {
+                id: "job_stuck".to_string(),
+                kind: JobKind::DetectGaps,
+                priority: 1,
+                dedupe_key: Some("detect:x".to_string()),
+                input_refs: "{}".to_string(),
+                status: JobStatus::Running,
+                attempts: 1,
+                not_before: None,
+                budget: None,
+                requires_approval: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let n = crate::scheduler::recover_jobs(engine.store()).unwrap();
+        assert_eq!(n, 1);
+        let job = engine.store().get_job("job_stuck").unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Queued);
     }
 }

@@ -24,6 +24,9 @@ pub struct DiscoveredSkill {
 pub fn scan_skills(methodus_home: &Path) -> Vec<DiscoveredSkill> {
     let mut out = Vec::new();
     collect_skill_dir(&mut out, &methodus_home.join("skills"), "builtin");
+    for layer in crate::pack::overlay_roots(methodus_home) {
+        collect_skill_dir(&mut out, &layer.root.join("skills"), &layer.source);
+    }
     out
 }
 
@@ -32,6 +35,10 @@ fn collect_skill_dir(out: &mut Vec<DiscoveredSkill>, dir: &Path, source: &str) {
         return;
     };
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
         let skill_md = entry.path().join("SKILL.md");
         if !skill_md.is_file() {
             continue;
@@ -133,6 +140,17 @@ mod tests {
         assert_eq!(catalog[0].name, "tcp-debug");
         assert_eq!(catalog[0].source, "builtin");
         assert!(catalog[0].description.contains("builtin"));
+    }
+
+    #[test]
+    fn skips_hidden_candidate_dir() {
+        let dir = tempdir().unwrap();
+        let methodus = dir.path().join("mh");
+        write_skill(&methodus.join("skills"), "live", "ok");
+        write_skill(&methodus.join("skills").join(".candidates"), "draft", "no");
+        let catalog = scan_skills(&methodus);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "live");
     }
 
     #[test]

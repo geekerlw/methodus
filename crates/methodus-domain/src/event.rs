@@ -9,6 +9,10 @@ pub enum RuntimeEvent {
     SessionStarted {
         session_id: String,
     },
+    /// Injected by Methodus when the user sends a chat turn (not from adapters).
+    UserText {
+        text: String,
+    },
     AssistantText {
         text: String,
     },

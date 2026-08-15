@@ -1,5 +1,7 @@
+pub mod learning;
 pub mod migration;
 pub mod store;
+pub mod usage;
 
 pub use store::{EventRecord, Store};
 
