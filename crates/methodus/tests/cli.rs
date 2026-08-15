@@ -113,3 +113,11 @@ fn events_tail_after_init_is_empty() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn tui_help_lists_pages() {
+    let out = methodus().args(["tui", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.to_lowercase().contains("tui"));
+}

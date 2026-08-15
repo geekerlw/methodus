@@ -233,6 +233,34 @@ pub fn resolve(opts: ResolveOpts<'_>) -> Result<Resolution, CoreError> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct FaceSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Faces on disk under `~/.methodus/faces/*/face.yaml` (builtin general if none).
+pub fn list_faces(home: &Path) -> Vec<FaceSummary> {
+    let faces = load_faces(home);
+    if faces.is_empty() {
+        let face = builtin_face();
+        return vec![FaceSummary {
+            id: face.id,
+            name: face.name,
+            description: face.description,
+        }];
+    }
+    faces
+        .into_iter()
+        .map(|face| FaceSummary {
+            id: face.id,
+            name: face.name,
+            description: face.description,
+        })
+        .collect()
+}
+
 /// Pick a single Face. `--face` wins; otherwise tag-match or the `general` seed.
 pub fn resolve_face(home: &Path, requested: Option<&str>) -> Result<Resolution, CoreError> {
     resolve(ResolveOpts {

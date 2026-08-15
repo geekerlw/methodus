@@ -11,6 +11,8 @@ use methodus_domain::{ApprovalDecision, RuntimeEvent};
 use methodus_runtime::{ClaudeCodeAdapter, CodexAdapter, RuntimeAdapter};
 use methodus_store::Store;
 
+mod tui;
+
 const GENERAL_FACE_YAML: &str = include_str!("../../../resources/faces/general/face.yaml");
 const GENERAL_METHOD_YAML: &str = include_str!("../../../resources/methods/general-software.yaml");
 const WORKSPACE_SKILL_MD: &str =
@@ -21,7 +23,7 @@ const DEFAULT_CONFIG: &str = include_str!("../../../resources/config.yaml");
 #[command(name = "methodus", about = "Persistent Personal Expert System")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -66,6 +68,8 @@ enum Commands {
         #[command(subcommand)]
         action: ExperienceAction,
     },
+    /// Interactive TUI (default if no subcommand is given)
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -133,7 +137,9 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match cli.command {
+    let command = cli.command.unwrap_or(Commands::Tui);
+    match command {
+        Commands::Tui => run_tui().await?,
         Commands::Init => run_init()?,
         Commands::Task { action } => match action {
             TaskAction::Create {
@@ -390,6 +396,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     Ok(())
+}
+
+async fn run_tui() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let home = methodus_home()?;
+    let lock = InstanceLock::try_acquire(&home)?;
+    let engine = build_engine(&home)?;
+    let recovered = engine.recover().await?;
+    tui::run(engine, lock, recovered).await
 }
 
 /// Pretty-print a runtime event to the terminal with color coding.

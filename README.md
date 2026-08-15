@@ -14,13 +14,12 @@ executor (Claude Code, Codex, or Cursor) acts as the hands.
 
 ## Status
 
-**M0–M2 complete; M3 (TUI) not started.** `methodus init` / `task create` / `run` /
-`recover` / `approve` / `events tail` drive Claude Code (manual permission loop) or
-Codex (`--runtime codex`) in-process. Task create resolves a Face + Method + Skills
-from `resources/` and `~/.methodus/` and surfaces low-confidence choices. Skills are
-Methodus-owned only; executor user dirs (`~/.claude`, `~/.cursor`) are not scanned.
+**M0–M3 in progress.** `methodus` / `methodus tui` is the daily-driver UI (same
+process as the Engine). CLI still covers `init` / `task create` / `run` /
+`recover` / `approve` / `events tail` for scripting. Skills stay Methodus-owned
+(`~/.methodus/skills`); executor user dirs are not scanned.
 
-Not yet: TUI, learning loop.
+Not yet: learning loop.
 
 - Product & design: [`docs/design/`](./docs/design/) — the product contract
   ([`00-product.md`](./docs/design/00-product.md): the *what & why*) plus the technical

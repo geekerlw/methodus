@@ -11,4 +11,4 @@ pub mod workspace;
 pub use engine::{Engine, RecoveredSession};
 pub use error::CoreError;
 pub use lock::InstanceLock;
-pub use resolution::Resolution;
+pub use resolution::{list_faces, FaceSummary, Resolution};
