@@ -13,7 +13,15 @@ methodus-runtime = { path = "../methodus-runtime" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+libc.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }

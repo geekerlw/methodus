@@ -14,8 +14,13 @@ executor (Claude Code, Codex, or Cursor) acts as the hands.
 
 ## Status
 
-**Pre-implementation.** This repository currently contains the product reference and
-technical design only. The runtime has not been built yet.
+**M0–M2 complete; M3 (TUI) not started.** `methodus init` / `task create` / `run` /
+`recover` / `approve` / `events tail` drive Claude Code (manual permission loop) or
+Codex (`--runtime codex`) in-process. Task create resolves a Face + Method + Skills
+from `resources/` and `~/.methodus/` and surfaces low-confidence choices. Skills are
+Methodus-owned only; executor user dirs (`~/.claude`, `~/.cursor`) are not scanned.
+
+Not yet: TUI, learning loop.
 
 - Product & design: [`docs/design/`](./docs/design/) — the product contract
   ([`00-product.md`](./docs/design/00-product.md): the *what & why*) plus the technical

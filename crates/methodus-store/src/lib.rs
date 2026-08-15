@@ -1,7 +1,7 @@
 pub mod migration;
 pub mod store;
 
-pub use store::Store;
+pub use store::{EventRecord, Store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

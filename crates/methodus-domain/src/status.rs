@@ -4,8 +4,11 @@
 //! `docs/design/03-data-model.md` §4.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::DomainError;
 
 // ─── TaskStatus ──────────────────────────────────────────────────────────────
 
@@ -53,6 +56,44 @@ impl TaskStatus {
     /// Whether a transition from `self` to `next` is valid.
     pub fn can_transition_to(&self, next: &Self) -> bool {
         self.transitions().contains(next)
+    }
+
+    /// Transition to `next`, or return an error if the edge is illegal.
+    pub fn checked_transition(&self, next: Self) -> Result<Self, DomainError> {
+        if self.can_transition_to(&next) {
+            Ok(next)
+        } else {
+            Err(DomainError::InvalidTransition {
+                entity: "task",
+                from: self.to_string(),
+                to: next.to_string(),
+            })
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.transitions().is_empty()
+    }
+}
+
+impl FromStr for TaskStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "queued" => Ok(Self::Queued),
+            "planning" => Ok(Self::Planning),
+            "running" => Ok(Self::Running),
+            "waiting_user" => Ok(Self::WaitingUser),
+            "reviewing" => Ok(Self::Reviewing),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(DomainError::InvalidStatus {
+                entity: "task",
+                value: other.to_string(),
+            }),
+        }
     }
 }
 
@@ -114,6 +155,43 @@ impl SessionStatus {
     /// Whether a transition from `self` to `next` is valid.
     pub fn can_transition_to(&self, next: &Self) -> bool {
         self.transitions().contains(next)
+    }
+
+    /// Transition to `next`, or return an error if the edge is illegal.
+    pub fn checked_transition(&self, next: Self) -> Result<Self, DomainError> {
+        if self.can_transition_to(&next) {
+            Ok(next)
+        } else {
+            Err(DomainError::InvalidTransition {
+                entity: "session",
+                from: self.to_string(),
+                to: next.to_string(),
+            })
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.transitions().is_empty()
+    }
+}
+
+impl FromStr for SessionStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "spawning" => Ok(Self::Spawning),
+            "running" => Ok(Self::Running),
+            "waiting_user" => Ok(Self::WaitingUser),
+            "paused" => Ok(Self::Paused),
+            "exited" => Ok(Self::Exited),
+            "interrupted" => Ok(Self::Interrupted),
+            "failed" => Ok(Self::Failed),
+            other => Err(DomainError::InvalidStatus {
+                entity: "session",
+                value: other.to_string(),
+            }),
+        }
     }
 }
 
@@ -309,9 +387,18 @@ mod tests {
     }
 
     #[test]
+    fn task_checked_transition_rejects_skip() {
+        let err = TaskStatus::Queued
+            .checked_transition(TaskStatus::Running)
+            .unwrap_err();
+        assert!(matches!(err, DomainError::InvalidTransition { .. }));
+    }
+
+    #[test]
     fn task_completed_is_terminal() {
         assert!(!TaskStatus::Completed.can_transition_to(&TaskStatus::Running));
         assert!(TaskStatus::Completed.transitions().is_empty());
+        assert!(TaskStatus::Completed.is_terminal());
     }
 
     #[test]

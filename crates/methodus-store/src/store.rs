@@ -2,9 +2,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
-use methodus_domain::{Experience, Session, SessionStatus, Task, TaskStatus};
+use methodus_domain::{Approval, Experience, Session, SessionStatus, Task, TaskStatus};
 
 use crate::migration::run_migrations;
 use crate::StoreError;
@@ -158,6 +158,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_task_workspace(&self, id: &str, workspace_id: &str) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE tasks SET workspace_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![workspace_id, now, id],
+        )?;
+        Ok(())
+    }
+
     // ─── Session CRUD ────────────────────────────────────────────────────
 
     pub fn insert_session(&self, session: &Session) -> Result<(), StoreError> {
@@ -255,20 +268,117 @@ impl Store {
         Ok(sessions)
     }
 
-    pub fn update_session_status(
-        &self,
-        id: &str,
-        status: SessionStatus,
-        executor_sid: Option<&str>,
-    ) -> Result<(), StoreError> {
+    pub fn list_sessions_for_task(&self, task_id: &str) -> Result<Vec<Session>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, runtime, executor_sid, transport, pid, cwd, status, last_turn, started_at, ended_at, updated_at
+             FROM sessions WHERE task_id = ?1 ORDER BY started_at DESC",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            Ok(SessionRow {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                runtime: row.get(2)?,
+                executor_sid: row.get(3)?,
+                transport: row.get(4)?,
+                pid: row.get(5)?,
+                cwd: row.get(6)?,
+                status: row.get(7)?,
+                last_turn: row.get(8)?,
+                started_at: row.get(9)?,
+                ended_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        })?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            let r = row?;
+            sessions.push(session_from_row(r)?);
+        }
+        Ok(sessions)
+    }
+
+    pub fn list_non_terminal_sessions(&self) -> Result<Vec<Session>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, runtime, executor_sid, transport, pid, cwd, status, last_turn, started_at, ended_at, updated_at
+             FROM sessions WHERE status IN ('spawning', 'running', 'waiting_user', 'paused')
+             ORDER BY started_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SessionRow {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                runtime: row.get(2)?,
+                executor_sid: row.get(3)?,
+                transport: row.get(4)?,
+                pid: row.get(5)?,
+                cwd: row.get(6)?,
+                status: row.get(7)?,
+                last_turn: row.get(8)?,
+                started_at: row.get(9)?,
+                ended_at: row.get(10)?,
+                updated_at: row.get(11)?,
+            })
+        })?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            let r = row?;
+            sessions.push(session_from_row(r)?);
+        }
+        Ok(sessions)
+    }
+
+    pub fn update_session_status(&self, id: &str, status: SessionStatus) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let now = Utc::now().to_rfc3339();
+        if status.is_terminal() {
+            conn.execute(
+                "UPDATE sessions SET status = ?1, ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?3",
+                params![status.to_string(), now, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status.to_string(), now, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn set_session_pid(&self, id: &str, pid: Option<u32>) -> Result<(), StoreError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE sessions SET status = ?1, executor_sid = COALESCE(?2, executor_sid), updated_at = ?3 WHERE id = ?4",
-            params![status.to_string(), executor_sid, now, id],
+            "UPDATE sessions SET pid = ?1, updated_at = ?2 WHERE id = ?3",
+            params![pid.map(|p| p as i64), now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_executor_sid(&self, id: &str, executor_sid: &str) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE sessions SET executor_sid = ?1, updated_at = ?2 WHERE id = ?3",
+            params![executor_sid, now, id],
         )?;
         Ok(())
     }
@@ -291,7 +401,7 @@ impl Store {
             .lock()
             .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
         conn.execute(
-            "INSERT INTO events (id, type, occurred_at, task_id, session_id, payload, seq)
+            "INSERT OR IGNORE INTO events (id, type, occurred_at, task_id, session_id, payload, seq)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id,
@@ -306,6 +416,164 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_events(
+        &self,
+        task_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let limit_i = limit as i64;
+        let mut rows_out = Vec::new();
+        if let Some(tid) = task_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, type, occurred_at, task_id, session_id, payload, seq
+                 FROM events WHERE task_id = ?1
+                 ORDER BY occurred_at DESC, id DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![tid, limit_i], event_record_from_row)?;
+            for row in rows {
+                rows_out.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, type, occurred_at, task_id, session_id, payload, seq
+                 FROM events ORDER BY occurred_at DESC, id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit_i], event_record_from_row)?;
+            for row in rows {
+                rows_out.push(row?);
+            }
+        }
+        rows_out.reverse();
+        Ok(rows_out)
+    }
+
+    pub fn get_session_allowed_tools(&self, session_id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let raw: Option<Option<String>> = conn
+            .query_row(
+                "SELECT allowed_tools FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(parse_allowed_tools(raw.flatten()))
+    }
+
+    pub fn set_session_allowed_tools(
+        &self,
+        session_id: &str,
+        tools: &[String],
+    ) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let now = Utc::now().to_rfc3339();
+        let json = serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "UPDATE sessions SET allowed_tools = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_approval(&self, approval: &Approval) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        conn.execute(
+            "INSERT INTO approvals (id, session_id, task_id, subject, tool_name, tool_use_id, tool_input, decision, actor, requested_at, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                approval.id,
+                approval.session_id,
+                approval.task_id,
+                approval.subject,
+                approval.tool_name,
+                approval.tool_use_id,
+                approval.tool_input,
+                approval.decision,
+                approval.actor,
+                approval.requested_at.to_rfc3339(),
+                approval.resolved_at.map(|d| d.to_rfc3339()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_approval(&self, id: &str) -> Result<Option<Approval>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, task_id, subject, tool_name, tool_use_id, tool_input, decision, actor, requested_at, resolved_at
+             FROM approvals WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], approval_from_query_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_pending_approvals(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<Vec<Approval>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let mut out = Vec::new();
+        if let Some(tid) = task_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, task_id, subject, tool_name, tool_use_id, tool_input, decision, actor, requested_at, resolved_at
+                 FROM approvals WHERE decision IS NULL AND task_id = ?1 ORDER BY requested_at ASC",
+            )?;
+            let rows = stmt.query_map(params![tid], approval_from_query_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, task_id, subject, tool_name, tool_use_id, tool_input, decision, actor, requested_at, resolved_at
+                 FROM approvals WHERE decision IS NULL ORDER BY requested_at ASC",
+            )?;
+            let rows = stmt.query_map([], approval_from_query_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn resolve_approval(
+        &self,
+        id: &str,
+        decision: &str,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE approvals SET decision = ?1, actor = ?2, resolved_at = ?3 WHERE id = ?4",
+            params![decision, actor, now, id],
+        )?;
+        Ok(())
+    }
+
     // ─── Experience CRUD ─────────────────────────────────────────────────
 
     pub fn insert_experience(&self, exp: &Experience) -> Result<(), StoreError> {
@@ -314,15 +582,18 @@ impl Store {
             .lock()
             .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
         conn.execute(
-            "INSERT INTO experiences (id, task_id, face_id, outcome, summary, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO experiences (id, task_id, face_id, path, content_hash, outcome, summary, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 exp.id,
                 exp.task_id,
                 exp.face_id,
+                exp.path,
+                exp.content_hash,
                 exp.outcome,
                 exp.summary,
                 exp.created_at.to_rfc3339(),
+                exp.updated_at.to_rfc3339(),
             ],
         )?;
         Ok(())
@@ -334,7 +605,7 @@ impl Store {
             .lock()
             .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, face_id, outcome, summary, created_at
+            "SELECT id, task_id, face_id, path, content_hash, outcome, summary, created_at, updated_at
              FROM experiences ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -342,9 +613,12 @@ impl Store {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
                 face_id: row.get(2)?,
-                outcome: row.get(3)?,
-                summary: row.get(4)?,
-                created_at: row.get(5)?,
+                path: row.get(3)?,
+                content_hash: row.get(4)?,
+                outcome: row.get(5)?,
+                summary: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })?;
 
@@ -371,12 +645,80 @@ impl Store {
             .lock()
             .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
         conn.execute(
-            "INSERT INTO workspaces (id, task_id, root_path, status, created_at, updated_at)
+            "INSERT OR IGNORE INTO workspaces (id, task_id, root_path, status, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
             params![id, task_id, root_path, status, created_at],
         )?;
         Ok(())
     }
+}
+
+/// Append-only event log row (lifecycle index; payload is JSON).
+#[derive(Debug, Clone)]
+pub struct EventRecord {
+    pub id: String,
+    pub event_type: String,
+    pub occurred_at: String,
+    pub task_id: Option<String>,
+    pub session_id: Option<String>,
+    pub payload: String,
+    pub seq: Option<i64>,
+}
+
+fn event_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    Ok(EventRecord {
+        id: row.get(0)?,
+        event_type: row.get(1)?,
+        occurred_at: row.get(2)?,
+        task_id: row.get(3)?,
+        session_id: row.get(4)?,
+        payload: row.get(5)?,
+        seq: row.get(6)?,
+    })
+}
+
+fn parse_allowed_tools(raw: Option<String>) -> Vec<String> {
+    let Some(s) = raw else {
+        return Vec::new();
+    };
+    serde_json::from_str(&s).unwrap_or_default()
+}
+
+fn approval_from_query_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
+    let requested_raw: String = row.get(9)?;
+    let resolved_raw: Option<String> = row.get(10)?;
+    let requested_at = DateTime::parse_from_rfc3339(&requested_raw)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+    let resolved_at = match resolved_raw {
+        Some(s) if !s.is_empty() => Some(
+            DateTime::parse_from_rfc3339(&s)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+        ),
+        _ => None,
+    };
+    Ok(Approval {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        task_id: row.get(2)?,
+        subject: row.get(3)?,
+        tool_name: row.get(4)?,
+        tool_use_id: row.get(5)?,
+        tool_input: row.get(6)?,
+        decision: row.get(7)?,
+        actor: row.get(8)?,
+        requested_at,
+        resolved_at,
+    })
 }
 
 // ─── Internal row types and conversion helpers ───────────────────────────────
@@ -402,15 +744,13 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, StoreError> {
 }
 
 fn parse_task_status(s: &str) -> Result<TaskStatus, StoreError> {
-    let status: TaskStatus = serde_json::from_value(serde_json::Value::String(s.to_owned()))
-        .map_err(|e| StoreError::Migration(format!("invalid task status '{}': {}", s, e)))?;
-    Ok(status)
+    s.parse::<TaskStatus>()
+        .map_err(|e| StoreError::Migration(e.to_string()))
 }
 
 fn parse_session_status(s: &str) -> Result<SessionStatus, StoreError> {
-    let status: SessionStatus = serde_json::from_value(serde_json::Value::String(s.to_owned()))
-        .map_err(|e| StoreError::Migration(format!("invalid session status '{}': {}", s, e)))?;
-    Ok(status)
+    s.parse::<SessionStatus>()
+        .map_err(|e| StoreError::Migration(e.to_string()))
 }
 
 fn task_from_row(r: TaskRow) -> Result<Task, StoreError> {
@@ -467,21 +807,32 @@ fn session_from_row(r: SessionRow) -> Result<Session, StoreError> {
 
 struct ExperienceRow {
     id: String,
-    task_id: String,
+    task_id: Option<String>,
     face_id: Option<String>,
+    path: String,
+    content_hash: String,
     outcome: Option<String>,
     summary: Option<String>,
     created_at: String,
+    updated_at: Option<String>,
 }
 
 fn experience_from_row(r: ExperienceRow) -> Result<Experience, StoreError> {
+    let created_at = parse_datetime(&r.created_at)?;
+    let updated_at = match r.updated_at {
+        Some(ref s) if !s.is_empty() => parse_datetime(s)?,
+        _ => created_at,
+    };
     Ok(Experience {
         id: r.id,
-        task_id: r.task_id,
+        task_id: r.task_id.unwrap_or_default(),
         face_id: r.face_id,
+        path: r.path,
+        content_hash: r.content_hash,
         outcome: r.outcome,
         summary: r.summary,
-        created_at: parse_datetime(&r.created_at)?,
+        created_at,
+        updated_at,
     })
 }
 
@@ -647,8 +998,9 @@ mod tests {
         assert_eq!(fetched.pid, Some(12345));
 
         store
-            .update_session_status("s-001", SessionStatus::Running, Some("exec-123"))
+            .update_session_status("s-001", SessionStatus::Running)
             .unwrap();
+        store.set_executor_sid("s-001", "exec-123").unwrap();
         let fetched = store.get_session("s-001").unwrap().unwrap();
         assert_eq!(fetched.status, SessionStatus::Running);
         assert_eq!(fetched.executor_sid, Some("exec-123".to_string()));
@@ -697,9 +1049,12 @@ mod tests {
             id: "exp-001".to_string(),
             task_id: "t-001".to_string(),
             face_id: Some("rust-expert".to_string()),
+            path: "faces/rust-expert/experiences/exp-001.md".to_string(),
+            content_hash: "abc123".to_string(),
             outcome: Some("success".to_string()),
             summary: Some("Completed without issues".to_string()),
             created_at: now,
+            updated_at: now,
         };
 
         store.insert_experience(&exp).unwrap();
@@ -708,6 +1063,26 @@ mod tests {
         assert_eq!(experiences.len(), 1);
         assert_eq!(experiences[0].id, "exp-001");
         assert_eq!(experiences[0].outcome, Some("success".to_string()));
+        assert_eq!(
+            experiences[0].path,
+            "faces/rust-expert/experiences/exp-001.md"
+        );
+    }
+
+    #[test]
+    fn test_v3_experience_columns() {
+        let store = Store::open_memory().expect("open_memory should succeed");
+        let count: i64 = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('experiences') WHERE name='path'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .expect("query should succeed");
+        assert_eq!(count, 1, "experiences.path should exist after v3");
     }
 
     #[test]
@@ -730,5 +1105,166 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_list_non_terminal_sessions() {
+        let store = Store::open_memory().unwrap();
+        let now = Utc::now();
+        let task = Task {
+            id: "t-001".to_string(),
+            title: "Test".to_string(),
+            request: "Test".to_string(),
+            project_id: None,
+            status: TaskStatus::Running,
+            runtime: None,
+            workspace_id: None,
+            resolution: None,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_task(&task).unwrap();
+
+        let live = Session {
+            id: "s-live".to_string(),
+            task_id: "t-001".to_string(),
+            runtime: "claude-code".to_string(),
+            executor_sid: Some("exec-1".to_string()),
+            transport: "subprocess".to_string(),
+            pid: Some(1),
+            cwd: "/tmp".to_string(),
+            status: SessionStatus::Running,
+            last_turn: None,
+            started_at: now,
+            ended_at: None,
+            updated_at: now,
+        };
+        let dead = Session {
+            id: "s-dead".to_string(),
+            task_id: "t-001".to_string(),
+            runtime: "claude-code".to_string(),
+            executor_sid: Some("exec-2".to_string()),
+            transport: "subprocess".to_string(),
+            pid: None,
+            cwd: "/tmp".to_string(),
+            status: SessionStatus::Exited,
+            last_turn: None,
+            started_at: now,
+            ended_at: Some(now),
+            updated_at: now,
+        };
+        store.insert_session(&live).unwrap();
+        store.insert_session(&dead).unwrap();
+
+        let active = store.list_non_terminal_sessions().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "s-live");
+
+        let for_task = store.list_sessions_for_task("t-001").unwrap();
+        assert_eq!(for_task.len(), 2);
+    }
+
+    #[test]
+    fn test_events_idempotent_and_list() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert_event(
+                "e-1",
+                "session.output",
+                "2024-01-01T00:00:00+00:00",
+                Some("t-1"),
+                None,
+                "{}",
+                Some(1),
+            )
+            .unwrap();
+        store
+            .insert_event(
+                "e-1",
+                "session.output",
+                "2024-01-01T00:00:00+00:00",
+                Some("t-1"),
+                None,
+                "{}",
+                Some(1),
+            )
+            .unwrap();
+        let events = store.list_events(Some("t-1"), 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "session.output");
+    }
+
+    #[test]
+    fn test_approval_pending_and_resolve() {
+        let store = Store::open_memory().unwrap();
+        let now = Utc::now();
+        let appr = Approval {
+            id: "appr-1".to_string(),
+            session_id: "s-1".to_string(),
+            task_id: "t-1".to_string(),
+            subject: "Write /tmp/x".to_string(),
+            tool_name: "Write".to_string(),
+            tool_use_id: Some("tu1".to_string()),
+            tool_input: r#"{"path":"/tmp/x"}"#.to_string(),
+            decision: None,
+            actor: None,
+            requested_at: now,
+            resolved_at: None,
+        };
+        store.insert_approval(&appr).unwrap();
+        assert_eq!(store.list_pending_approvals(Some("t-1")).unwrap().len(), 1);
+        store.resolve_approval("appr-1", "once", "user").unwrap();
+        assert!(store
+            .list_pending_approvals(Some("t-1"))
+            .unwrap()
+            .is_empty());
+        let got = store.get_approval("appr-1").unwrap().unwrap();
+        assert_eq!(got.decision.as_deref(), Some("once"));
+    }
+
+    #[test]
+    fn test_session_allowed_tools() {
+        let store = Store::open_memory().unwrap();
+        let now = Utc::now();
+        store
+            .insert_task(&Task {
+                id: "t-001".to_string(),
+                title: "t".to_string(),
+                request: "t".to_string(),
+                project_id: None,
+                status: TaskStatus::Running,
+                runtime: None,
+                workspace_id: None,
+                resolution: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store
+            .insert_session(&Session {
+                id: "s-001".to_string(),
+                task_id: "t-001".to_string(),
+                runtime: "claude-code".to_string(),
+                executor_sid: None,
+                transport: "subprocess".to_string(),
+                pid: None,
+                cwd: "/tmp".to_string(),
+                status: SessionStatus::Running,
+                last_turn: None,
+                started_at: now,
+                ended_at: None,
+                updated_at: now,
+            })
+            .unwrap();
+        assert!(store.get_session_allowed_tools("s-001").unwrap().is_empty());
+        store
+            .set_session_allowed_tools("s-001", &["Read".into(), "Write".into()])
+            .unwrap();
+        assert_eq!(
+            store.get_session_allowed_tools("s-001").unwrap(),
+            vec!["Read".to_string(), "Write".to_string()]
+        );
     }
 }

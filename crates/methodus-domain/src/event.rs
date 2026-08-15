@@ -33,8 +33,27 @@ pub enum RuntimeEvent {
         text: String,
         cost_usd: Option<f64>,
         usage: Option<serde_json::Value>,
+        /// Executor-issued session id when the native event carries one (recovery key).
+        session_id: Option<String>,
+        /// Claude `--permission-mode manual` denials (empty for other runtimes).
+        #[serde(default)]
+        permission_denials: Vec<PermissionDenial>,
+    },
+    ApprovalRequested {
+        id: String,
+        tool_name: String,
+        input: serde_json::Value,
     },
     Error {
         message: String,
     },
+}
+
+/// One blocked tool call from an executor permission layer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PermissionDenial {
+    pub tool_name: String,
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub tool_input: serde_json::Value,
 }

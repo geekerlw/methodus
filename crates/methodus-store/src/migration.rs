@@ -26,6 +26,18 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         mark_applied(conn, 2)?;
     }
 
+    // V3: experience file index (path + content_hash) per 03-data-model.md
+    if !is_applied(conn, 3)? {
+        apply_v3(conn)?;
+        mark_applied(conn, 3)?;
+    }
+
+    // V4: approvals + session allow-list for the M2 permission loop
+    if !is_applied(conn, 4)? {
+        apply_v4(conn)?;
+        mark_applied(conn, 4)?;
+    }
+
     Ok(())
 }
 
@@ -115,13 +127,49 @@ fn apply_v2(conn: &Connection) -> Result<(), StoreError> {
 
         -- Experiences
         CREATE TABLE experiences (
-            id          TEXT PRIMARY KEY,
-            task_id     TEXT,
-            face_id     TEXT,
-            outcome     TEXT,
-            summary     TEXT,
-            created_at  TEXT NOT NULL
+            id           TEXT PRIMARY KEY,
+            task_id      TEXT,
+            face_id      TEXT,
+            outcome      TEXT,
+            summary      TEXT,
+            created_at   TEXT NOT NULL
         );
+        ",
+    )?;
+    Ok(())
+}
+
+fn apply_v3(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "
+        ALTER TABLE experiences ADD COLUMN path TEXT NOT NULL DEFAULT '';
+        ALTER TABLE experiences ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
+        ALTER TABLE experiences ADD COLUMN updated_at TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+fn apply_v4(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "
+        ALTER TABLE sessions ADD COLUMN allowed_tools TEXT;
+
+        CREATE TABLE approvals (
+            id           TEXT PRIMARY KEY,
+            session_id   TEXT,
+            task_id      TEXT,
+            subject      TEXT NOT NULL,
+            tool_name    TEXT NOT NULL,
+            tool_use_id  TEXT,
+            tool_input   TEXT NOT NULL,
+            decision     TEXT,
+            actor        TEXT,
+            requested_at TEXT NOT NULL,
+            resolved_at  TEXT
+        );
+        CREATE INDEX idx_approvals_session ON approvals(session_id);
+        CREATE INDEX idx_approvals_task ON approvals(task_id);
         ",
     )?;
     Ok(())

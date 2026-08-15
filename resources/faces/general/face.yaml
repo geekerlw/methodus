@@ -1,0 +1,10 @@
+id: general
+name: General
+description: Default face used when no domain expert is specified. Suitable for general software tasks.
+intent_tags:
+  - general
+  - default
+methods:
+  - general-software
+skills:
+  - workspace-hygiene

@@ -1,0 +1,3 @@
+# Methodus user config
+default_runtime: claude-code
+permission_mode: acceptEdits
