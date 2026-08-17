@@ -3,6 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use methodus_core::PermissionMode;
 
@@ -667,13 +668,28 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
 }
 
+/// Fit `input` into `width` terminal columns; return shown text and cursor column
+/// after the `"> "` prefix. CJK / fullwidth chars count as 2 columns.
 fn visible_input(input: &str, width: usize) -> (String, u16) {
-    let chars: Vec<char> = input.chars().collect();
-    if chars.len() <= width {
-        return (input.to_string(), 2 + chars.len() as u16);
+    let total = UnicodeWidthStr::width(input);
+    if total <= width {
+        return (input.to_string(), 2 + total as u16);
     }
-    let shown: String = chars[chars.len() - width..].iter().collect();
-    (shown, 2 + width as u16)
+    let mut cols = 0usize;
+    let mut start = input.len();
+    for (i, ch) in input.char_indices().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cols + w > width {
+            break;
+        }
+        cols += w;
+        start = i;
+    }
+    (input[start..].to_string(), 2 + cols as u16)
+}
+
+fn display_cols(s: &str) -> u16 {
+    UnicodeWidthStr::width(s) as u16
 }
 
 fn draw_faces(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -1064,7 +1080,7 @@ fn draw_prompt_modal(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ),
         popup,
     );
-    let cursor_x = popup.x + 1 + app.input.len() as u16;
+    let cursor_x = popup.x + 1 + display_cols(&app.input);
     let cursor_y = popup.y + 2;
     if cursor_x < popup.x.saturating_add(popup.width.saturating_sub(1)) {
         frame.set_cursor_position(Position {
@@ -1095,7 +1111,7 @@ fn draw_answer_modal(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ),
         popup,
     );
-    let cursor_x = popup.x + 1 + app.input.len() as u16;
+    let cursor_x = popup.x + 1 + display_cols(&app.input);
     let cursor_y = popup.y + 2;
     if cursor_x < popup.x.saturating_add(popup.width.saturating_sub(1)) {
         frame.set_cursor_position(Position {
@@ -1243,5 +1259,36 @@ mod tests {
         );
         let compact: Vec<String> = splash_lines(&theme, false).iter().map(line_text).collect();
         assert!(compact.iter().any(|t| t.contains(WORDMARK)));
+    }
+
+    #[test]
+    fn visible_input_cursor_uses_display_width() {
+        let (shown, col) = visible_input("hi", 20);
+        assert_eq!(shown, "hi");
+        assert_eq!(col, 4); // "> " + 2
+
+        let (shown, col) = visible_input("你好", 20);
+        assert_eq!(shown, "你好");
+        assert_eq!(col, 6); // "> " + 2+2
+
+        let (shown, col) = visible_input("ab你好cd", 20);
+        assert_eq!(shown, "ab你好cd");
+        assert_eq!(col, 2 + 2 + 4 + 2);
+
+        // Truncate from the left by columns, not char count.
+        let (shown, col) = visible_input("一二三四五", 6);
+        assert_eq!(shown, "三四五");
+        assert_eq!(col, 2 + 6);
+
+        let (shown, col) = visible_input("一二三四五", 5);
+        assert_eq!(shown, "四五");
+        assert_eq!(col, 2 + 4);
+    }
+
+    #[test]
+    fn display_cols_counts_cjk_as_two() {
+        assert_eq!(display_cols("a"), 1);
+        assert_eq!(display_cols("中"), 2);
+        assert_eq!(display_cols("a中b"), 4);
     }
 }

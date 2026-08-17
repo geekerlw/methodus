@@ -23,6 +23,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 serde_json.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"
