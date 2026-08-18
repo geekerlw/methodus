@@ -15,7 +15,7 @@ the delivery shell. Keep the process open in `tmux` for daily use.
 
 ## Source of truth (read before writing code)
 
-All documentation lives in [`docs/design/`](./docs/design/):
+All documentation lives in [`docs/`](./docs/):
 
 1. `00-product.md` — the **product contract** (*what & why*): domain abstractions
    (Task, Face, Method, Skill, Knowledge, Experience, Question, Hypothesis,
@@ -27,11 +27,11 @@ All documentation lives in [`docs/design/`](./docs/design/):
    were empirically confirmed, not guessed.
 3. `02-architecture.md` — Rust stack, crate/module layout, the single-process
    runtime model (no daemon/client split), async model, crash recovery.
+   System diagram: `docs/architecture.svg`.
 4. `03-data-model.md` — SQLite schema DDL, file layout, source-of-truth rules.
 5. `04-roadmap.md` — implementation order and acceptance criteria per milestone.
 6. `05-tui.md` — agent TUI contract (ratatui chrome, overlays, Pi-aligned components).
-7. [`docs/legacy/`](./docs/legacy/) — the archived v1 prompt agent. Reference only;
-   do not extend it.
+7. `07-learning-vs-refine.md` — Learning loop vs Prime Agent `/refine`.
 
 `00-product.md` defines product intent; `01`–`05` define implementation. When they
 appear to disagree, `01`–`05` win for implementation detail and `00` wins for product
@@ -59,7 +59,7 @@ intent. If neither is clear, ask.
 
 ## Engineering conventions (once code exists)
 
-- Language: **Rust**, async on `tokio`. See `docs/design/02-architecture.md` for the
+- Language: **Rust**, async on `tokio`. See `docs/02-architecture.md` for the
   crate/module boundaries and dependency choices.
 - Define types, state-machine enums, SQLite schema, and the event model **before**
   wiring any LLM/executor integration.
@@ -73,7 +73,7 @@ intent. If neither is clear, ask.
 
 ## Runtime facts you can rely on (verified)
 
-These were confirmed empirically (see `docs/design/01-runtime-adapters.md`):
+These were confirmed empirically (see `docs/01-runtime-adapters.md`):
 
 - Claude Code: `claude --print --output-format stream-json --verbose`
   (needs `--verbose` with stream-json); `--session-id <uuid>` + `--resume <id>`

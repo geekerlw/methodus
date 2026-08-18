@@ -145,7 +145,13 @@ Inbox uses **progressive disclosure** so long skill/knowledge/experience bodies 
 4. After an action succeeds, detail closes back to the list (or session if inbox emptied).
 
 Skill drafts from completed tasks land in `/inbox` automatically; use the same detail
-composer to commit or reject.
+composer to commit or reject. Recurring tactics also land as:
+
+- **N** harness notes → `faces/<id>/notes/` (cheap Face memory; next task lists them under **Injected this turn** and copies to `face-context/knowledge/`). Hits increment on **injection**, not on commit; 3 injections can enqueue a skill draft.
+- **P** skill patches → append Procedure/Pitfalls onto an existing live skill (not a
+  parallel `.candidates/` tree)
+
+After a note is committed **3+ times** (hits), Methodus may enqueue a skill draft.
 
 **Face evolution (Evolution loop):** after **2+ committed** module-study knowledge
 entries on the same Face, Methodus proposes `face.yaml` updates (intent_tags, methods,
@@ -181,37 +187,22 @@ Rules:
 - Default/context faces persist in `~/.methodus/config.yaml` and apply to new tasks until
   changed.
 
-### Module expert study (`/study`)
+### Learn (`/learn`)
 
-Learning reads **user-specified sources**, not the task workspace. Outputs land in Methodus home; execution tasks load them later.
-
-```text
-/study <topic> @~/path/to/code https://doc.example.com/page
-  → executor reads those paths/URLs in place
-  → workspace is scratch/transcript only
-  → jobs: SynthesizeKnowledge → faces/…/knowledge (module_study)
-         AnalyzeKnowledgeGaps → mentor Questions
-         ProposeSkill → skills/.candidates/ draft
-         Experience file under faces/…/experiences/
-  → /inbox: commit knowledge + skill; idle: answer mentor questions
-```
-
-Ordinary tasks still inject committed knowledge into workspace at run time. Study tasks do not use project focus as the corpus.
-
-**Hypotheses (Curiosity loop):** when gap analysis finds under-evidenced claims, inbox shows **H**
-items. Promote → knowledge candidate; Validate → keep hypothesis; Reject → discard.
-
-### Project ingest (`/ingest`) and repo survey (`/survey`)
-
-Requires a **focus project** in `/setup`.
+User supplies **sources only** (`@` paths, URLs, optional topic hint). Methodus picks
+the pipeline and archive target; the user does not choose survey vs ingest vs study.
 
 ```text
-/ingest @~/docs/standard.pdf @~/specs/
-  → doc-ingest method → projects/{id}/knowledge/*.md (candidate)
-
-/survey
-  → repo-survey method → projects/{id}/knowledge/*.md from project root layout
+/learn                          # focus project repo → project notes (needs /setup focus)
+/learn @~/docs/standard.pdf     # documents → project knowledge (candidate)
+/learn nxm @~/src https://…     # code + web → Face knowledge + skill draft + mentor Qs
 ```
+
+After the executor run, background jobs propose knowledge; **`/inbox`** is where the user
+reviews and commits.
+
+Legacy Methods (`repo-survey`, `doc-ingest`, `module-expert-learning`) remain installed;
+`/learn` routes to them automatically.
 
 ### Workspace cleanup (`/cleanup`)
 
@@ -219,16 +210,9 @@ Requires a **focus project** in `/setup`.
 /cleanup [days]   # default 30 — remove workspace dirs for terminal tasks older than N days
 ```
 
-### System overlays (`/events`, `/jobs`)
-
-Audit and background work without leaving the chat surface:
-
-```text
-/events   → floating list of recent audit events (type + timestamp)
-/jobs     → learning queue; [c] cancels selected job, [r] refresh
-```
-
-These overlays share the same floating-picker pattern as Sessions / Faces / Inbox.
+Background learning (queue + audit event log) runs inside the Engine while the process
+is open. It is **not** exposed as TUI commands — users see outcomes in `/inbox`
+(candidate knowledge, questions, …) and status-line hints, not a jobs dashboard.
 
 ## 7. Acceptance (dogfood)
 

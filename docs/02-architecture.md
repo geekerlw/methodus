@@ -2,7 +2,8 @@
 
 Rust technology stack, crate/module layout, the **single-process** runtime model, the
 async model, and crash recovery. This document defines *how the code is organized*;
-the domain semantics come from [`00-product.md`](./00-product.md).
+the domain semantics come from [`00-product.md`](./00-product.md). The system diagram
+is [`architecture.svg`](./architecture.svg).
 
 ## 0. Process model decision: single always-on process (no daemon/client split)
 
@@ -117,7 +118,8 @@ methodus-core/src/
 ├── home.rs         # first-launch seed + health checks
 ├── events/         # event bus (in-proc broadcast) + append-only persistence hook
 ├── scheduler/      # job queue driver (event/threshold/idle triggers)
-├── learning/       # extract_experience, detect_gaps, propose_knowledge, propose_skill jobs
+├── learning.rs     # extract_experience, detect_gaps, propose_knowledge, propose_skill jobs
+├── refine.rs       # propose_refinement + budgeted LLM polish of note/patch drafts
 ├── curiosity/      # knowledge-gap → question valuation
 └── engine.rs       # top-level orchestrator tying the Execution Loop together;
                     # the binary constructs one Engine and the TUI observes it

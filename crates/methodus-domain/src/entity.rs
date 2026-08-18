@@ -1,6 +1,6 @@
 //! Core domain entity structs for Methodus.
 //!
-//! These map directly to the SQLite schema in `docs/design/03-data-model.md` §3.
+//! These map directly to the SQLite schema in `docs/03-data-model.md` §3.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

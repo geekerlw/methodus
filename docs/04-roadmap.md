@@ -98,8 +98,8 @@ Thicken the spine into a dependable system and prove executor-agnosticism.
   proving the `RuntimeAdapter` trait holds across executors.
 - Resolver reads real seed Faces/Methods/Skills from `resources/` + `~/.methodus/`;
   records rationale + confidence; low-confidence choices surfaced to the user.
-- Reuse v1 skill-discovery scan logic (see `../legacy/README.md`) for the Skill
-  scanner.
+- Skill scanner covers Methodus-owned dirs (`~/.methodus/skills`, pack/project
+  overlays). Executor user dirs are not scanned.
 
 **Acceptance:** a task requiring a risky action pauses in `waiting_user` with a clear
 scope; approve → continues, deny → safe return, both logged. The same task type runs
@@ -132,7 +132,7 @@ do not wipe the conversation underneath.
 Only now, and only with a real Experience corpus from dogfooding.
 
 **Scope (the Learning + Curiosity loops, `00-product.md` §4.2–4.3):** Learning Queue + scheduler (event/threshold/idle);
-`extract_experience` → `detect_gaps` → `propose_knowledge` / `propose_skill`; Question state machine +
+`extract_experience` → `detect_gaps` → `propose_knowledge` / `propose_refinement` / `propose_skill`; Question state machine +
 valuation; candidate Knowledge with conflict detection; Candidate Skills land in
 `skills/.candidates/` and promote only on Review commit; TUI `/inbox` overlay.
 Team **packs** as Methodus-format folders: register paths in `packs.yaml`,

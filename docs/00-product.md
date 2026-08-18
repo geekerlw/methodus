@@ -145,7 +145,7 @@ Skill source priority: (1) user-specified, (2) current project, (3) user global 
 dir, (4) Methodus built-in, (5) approved auto-generated. Default to read-only symlink
 or controlled materialization; any write into the global skill dir requires human
 approval. After a non-trivial task (several tool calls, structured result, or a
-`/study` run), Methodus may draft a Candidate Skill for Review — it never silently
+`/learn` run), Methodus may draft a Candidate Skill for Review — it never silently
 installs a live skill the way some agent runtimes do.
 
 ### 3.6 Knowledge
@@ -284,7 +284,8 @@ session.status_changed  session.permission_requested  session.question_requested
 session.exited
 
 experience.created  learning.job_queued  learning.job_started
-learning.candidate_created  knowledge.committed  knowledge.conflict_detected
+learning.candidate_created  learning.refine_llm  learning.injected  learning.injection_missed
+knowledge.committed  knowledge.conflict_detected
 hypothesis.created  hypothesis.validated
 question.created  question.asked  question.answered
 evolution.proposed  evolution.approved  evolution.rejected
@@ -299,12 +300,18 @@ time or user idle). A queue job carries at least: `kind`, `priority`, `dedupe_ke
 `input_refs`, `status`, `attempts`, `not_before`, `budget`, `requires_approval`.
 
 MVP learning jobs: `extract_experience`, `detect_gaps`, `propose_knowledge`,
-`propose_skill` (never auto-overwrites existing entries). Skill drafts are written
-to `skills/.candidates/<name>/SKILL.md` and promote to `skills/<name>/` only after
-Review commit (or `methodus knowledge review <id> --decision commit`). The learning
-scheduler enqueues `propose_skill` when a task is skill-worthy (tool-call count,
-result shape) or after module-expert `/study`. Deferred: auto-research, Method
-synthesis, cross-Face debate.
+`propose_skill`, `propose_refinement` (never auto-overwrites existing entries).
+Skill drafts go to `skills/.candidates/`; skill **patches** append to a live skill;
+harness **notes** go to `faces/<id>/notes/`. All three promote only after Review
+commit. The scheduler enqueues `propose_refinement` after detect (trajectory → at most one
+note **or** skill patch **or** skill draft). Execution tasks that already distilled one of
+those do not also mint `propose_knowledge` (ingest/survey `/learn` still do).
+`propose_skill` also runs after a committed note is **injected** ≥ 3 times, and from
+`/learn` module-study. A gap that still appears after injection lowers confidence and
+opens a mentor question. A separate budgeted `tick_refine_llm` (default 8/day,
+`refine_llm: false` to disable) may rewrite a note/patch candidate in plan mode; apply stays
+inbox-gated. Failed polish keeps the rules draft. Deferred: auto-research, Method synthesis,
+cross-Face debate.
 All jobs are pausable, retryable, cancelable, and recoverable after a restart.
 
 ## 8. CLI / TUI surface
@@ -320,6 +327,11 @@ permission/knowledge choice, answer a question, or run a slash command. Faces, S
 Inbox, and the task list are not pages — they are overlays opened with `/face`,
 `/setup`, `/inbox`, and `/session` (Tab). `1`–`4` are pick options, not page switches.
 Esc closes an overlay, then cancels pick/ask. Empty-input `[` `]` cycles conversations.
+
+The **Learning loop** (background queue + SQLite event log) is internal infrastructure.
+Users do not browse jobs or audit events in the TUI — outcomes surface through
+`/inbox` (candidate knowledge, questions, …) and idle composer `ask`, not an
+operations dashboard.
 
 Setup (`/setup`) is where the user:
 

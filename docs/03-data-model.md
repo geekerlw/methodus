@@ -32,7 +32,8 @@ triggers a re-index (never a silent overwrite of the file).
 │       ├── face.yaml
 │       ├── knowledge/*.md
 │       ├── experiences/*.md
-│       └── hypotheses/*.md
+│       ├── hypotheses/*.md
+│       └── notes/*.md          # harness notes (cheap Face memory; promote to skill at 3 hits)
 ├── methods/                    # <method>.yaml (procedure definitions)
 ├── skills/                     # global Methodus-owned skills (SKILL.md packages)
 ├── packs.yaml                  # registered team packs + focus (paths only)
@@ -290,7 +291,7 @@ CREATE TABLE evolution_candidates (
 -- ---------- Learning queue ----------
 CREATE TABLE learning_jobs (
     id                TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,        -- extract_experience|detect_gaps|propose_knowledge|propose_skill|...
+    kind              TEXT NOT NULL,        -- extract_experience|detect_gaps|propose_knowledge|propose_skill|propose_refinement|...
     priority          INTEGER NOT NULL DEFAULT 0,
     dedupe_key        TEXT,                 -- UNIQUE-ish to collapse duplicates
     input_refs        TEXT NOT NULL,        -- JSON refs to source entities
@@ -376,5 +377,6 @@ knowledge base into the workspace — inject only the minimal resolved context.
 2. **Event payload size** — cap inline `payload` JSON size; spill large tool outputs
    to `transcript/` files and store only a pointer + summary. Define the threshold
    (proposed: 40 KB, matching Cursor's `fileOutputThresholdBytes`).
-3. **experience.json import** — provide a one-shot importer for v1
-   `workflow_patterns` (see `../legacy/README.md`) into `experiences`.
+3. **Historical import** — whether to offer a one-shot importer for old
+   `workflow_patterns` JSON into `experiences`. Defer until someone actually has
+   that file.
