@@ -24,6 +24,17 @@ use crate::workspace::WorkspaceBuilder;
 
 const MAX_AUTO_TURNS: u32 = 12;
 
+/// User decision on a candidate / conflicted knowledge or skill draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeReviewAction {
+    /// Promote to committed (install skill when path is free).
+    Commit,
+    /// Discard the candidate.
+    Reject,
+    /// Overwrite an existing live skill (conflicted drafts only).
+    ReplaceExisting,
+}
+
 pub struct Engine {
     store: Arc<Store>,
     adapters: HashMap<String, Arc<dyn RuntimeAdapter>>,
@@ -123,6 +134,18 @@ impl Engine {
         scheduler::tick(&self.store, &self.home)
     }
 
+    pub fn list_learning_jobs(&self) -> Result<Vec<methodus_domain::LearningJob>, CoreError> {
+        Ok(self.store.list_jobs()?)
+    }
+
+    pub fn cancel_learning_job(&self, id: &str) -> Result<bool, CoreError> {
+        Ok(self.store.cancel_learning_job(id)?)
+    }
+
+    pub fn list_recent_events(&self, limit: usize) -> Result<Vec<methodus_store::EventRecord>, CoreError> {
+        Ok(self.store.list_events(None, limit)?)
+    }
+
     /// Promote the highest-value pending question to Asked when the user is idle.
     /// No-op if a question is already Asked, or none clear the value floor.
     pub fn ask_idle_question(&self) -> Result<Option<Question>, CoreError> {
@@ -141,13 +164,17 @@ impl Engine {
         Ok(self.store.usage_summary(since)?)
     }
 
-    pub fn review_knowledge(&self, id: &str, commit: bool) -> Result<KnowledgeItem, CoreError> {
+    pub fn review_knowledge(
+        &self,
+        id: &str,
+        action: KnowledgeReviewAction,
+    ) -> Result<KnowledgeItem, CoreError> {
         let mut item = self
             .store
             .get_knowledge(id)?
             .ok_or_else(|| CoreError::KnowledgeNotFound(id.to_string()))?;
-        if commit && item.source == learning::SKILL_DRAFT_SOURCE {
-            match learning::install_skill_draft(&self.home, &item) {
+        if action == KnowledgeReviewAction::Commit && item.source == learning::SKILL_DRAFT_SOURCE {
+            match learning::install_skill_draft(&self.home, &item, false) {
                 Ok(live_path) => {
                     item.path = live_path;
                 }
@@ -163,18 +190,28 @@ impl Engine {
                 }
             }
         }
-        let next = if commit {
-            KnowledgeStatus::Committed
-        } else {
-            KnowledgeStatus::Rejected
+        if action == KnowledgeReviewAction::ReplaceExisting {
+            if item.source != learning::SKILL_DRAFT_SOURCE {
+                return Err(CoreError::Other(
+                    "replace only applies to skill drafts".into(),
+                ));
+            }
+            item.path = learning::install_skill_draft(&self.home, &item, true)?;
+        }
+        let next = match action {
+            KnowledgeReviewAction::Commit | KnowledgeReviewAction::ReplaceExisting => {
+                KnowledgeStatus::Committed
+            }
+            KnowledgeReviewAction::Reject => KnowledgeStatus::Rejected,
         };
+        let committed = next == KnowledgeStatus::Committed;
         item.status = item.status.checked_transition(next)?;
         item.updated_at = Utc::now();
         self.store.update_knowledge(&item)?;
-        let ev = if commit {
-            "knowledge.committed"
-        } else {
-            "knowledge.rejected"
+        let ev = match action {
+            KnowledgeReviewAction::Reject => "knowledge.rejected",
+            KnowledgeReviewAction::ReplaceExisting => "knowledge.replaced",
+            KnowledgeReviewAction::Commit => "knowledge.committed",
         };
         let _ = self.store.insert_event(
             &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -185,17 +222,42 @@ impl Engine {
             &serde_json::json!({"knowledge_id": id, "kind": item.source}).to_string(),
             None,
         );
+        if committed {
+            if item.source == learning::SKILL_DRAFT_SOURCE {
+                if let (Some(fid), Some(skill)) = (
+                    item.face_id.as_deref(),
+                    crate::evolution::skill_name_from_path(&item.path),
+                ) {
+                    let _ = crate::evolution::maybe_propose_skill_evolution(
+                        &self.store,
+                        &self.home,
+                        fid,
+                        &skill,
+                    );
+                }
+            }
+            if item.source == learning::MODULE_STUDY_SOURCE {
+                if let Some(fid) = item.face_id.as_deref() {
+                    let _ = crate::evolution::maybe_propose_face_evolution(
+                        &self.store,
+                        &self.home,
+                        fid,
+                    );
+                }
+            }
+            if let Some(fid) = item.face_id.as_deref() {
+                let _ = crate::evolution::maybe_propose_method_evolution(
+                    &self.store,
+                    &self.home,
+                    fid,
+                );
+            }
+        }
         Ok(item)
     }
 
-    /// Distill the current task into a candidate skill (`/learn`). Never writes a live skill.
-    pub fn learn_skill(
-        &self,
-        task_id: &str,
-        hint: Option<&str>,
-    ) -> Result<KnowledgeItem, CoreError> {
-        learning::propose_skill_from_task(&self.store, &self.home, task_id, hint)?
-            .ok_or_else(|| CoreError::Other("could not draft a skill from this task".into()))
+    pub fn review_evolution(&self, id: &str, approve: bool) -> Result<EvolutionCandidate, CoreError> {
+        crate::evolution::review_evolution(&self.store, &self.home, id, approve)
     }
 
     pub fn answer_question(&self, id: &str, answer: &str) -> Result<Question, CoreError> {
@@ -237,6 +299,34 @@ impl Engine {
         Ok(q)
     }
 
+    /// Human finished looking at a reviewing task (experience + candidates).
+    pub fn complete_review(&self, task_id: &str) -> Result<methodus_domain::Task, CoreError> {
+        let task = self
+            .store
+            .get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        if task.status != TaskStatus::Reviewing {
+            return Err(CoreError::Other(format!(
+                "task {task_id} is {} — only reviewing tasks can be marked done",
+                task.status
+            )));
+        }
+        self.store
+            .update_task_status(task_id, TaskStatus::Completed)?;
+        let _ = self.store.insert_event(
+            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
+            "task.completed",
+            &Utc::now().to_rfc3339(),
+            Some(task_id),
+            None,
+            &serde_json::json!({"task_id": task_id}).to_string(),
+            None,
+        );
+        self.store
+            .get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))
+    }
+
     pub fn snooze_question(&self, id: &str) -> Result<Question, CoreError> {
         let mut q = self
             .store
@@ -267,11 +357,23 @@ impl Engine {
         face: Option<&str>,
         runtime: Option<&str>,
     ) -> Result<Task, CoreError> {
+        let cfg = UserConfig::load(&self.home);
+        let ctx = cfg.context_faces.as_deref().unwrap_or(&[]);
         let resolution = resolution::resolve(resolution::ResolveOpts {
             methodus_home: &self.home,
             request,
             requested_face: face,
+            requested_context_faces: Some(ctx),
+            requested_method: None,
         })?;
+        if resolution.context_faces.len() >= 1 {
+            let _ = crate::multi_face::detect_cross_face_debates(
+                &self.store,
+                &self.home,
+                &resolution.all_face_ids(),
+                request,
+            )?;
+        }
         let now = Utc::now();
         let id_raw = Uuid::new_v4().to_string().replace('-', "");
         let project_id = crate::project::focus_project(&self.home).map(|p| p.id);
@@ -289,6 +391,232 @@ impl Engine {
             updated_at: now,
         };
         self.store.insert_task(&task)?;
+        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": title}).to_string());
+        Ok(task)
+    }
+
+    /// Ingest docs/standards into the focus project's knowledge corpus.
+    pub fn create_ingest_task(&self, sources: &[String]) -> Result<Task, CoreError> {
+        if sources.is_empty() {
+            return Err(CoreError::Other(
+                "/ingest needs sources — e.g. /ingest @~/docs/standard.pdf".into(),
+            ));
+        }
+        let project = crate::project::focus_project(&self.home)
+            .ok_or_else(|| CoreError::Other("set a focus project in /setup first".into()))?;
+        let sources_block = sources
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = format!(
+            "Document ingest for project `{}`\n\n\
+             ## Sources\n\n{sources_block}\n\n\
+             Read sources in place. Extract stable facts with citations. \
+             Output ## Knowledge subsections for review.",
+            project.id
+        );
+        self.create_method_task(
+            "doc ingest",
+            &request,
+            crate::ingest::DOC_INGEST_METHOD_ID,
+            Some(project.id.as_str()),
+            None,
+        )
+    }
+
+    /// Survey the focus project repository layout into project notes.
+    pub fn create_survey_task(&self) -> Result<Task, CoreError> {
+        let project = crate::project::focus_project(&self.home)
+            .ok_or_else(|| CoreError::Other("set a focus project in /setup first".into()))?;
+        let root = project.root.display();
+        let request = format!(
+            "Repository survey: project `{}`\n\n\
+             Survey `{root}` only. Map layout, modules, build entry points. \
+             Write ## Project Notes — do not dump into global Faces.",
+            project.id
+        );
+        self.create_method_task(
+            "repo survey",
+            &request,
+            crate::ingest::REPO_SURVEY_METHOD_ID,
+            Some(project.id.as_str()),
+            None,
+        )
+    }
+
+    fn create_method_task(
+        &self,
+        title: &str,
+        request: &str,
+        method_id: &str,
+        project_id: Option<&str>,
+        study_sources: Option<Vec<String>>,
+    ) -> Result<Task, CoreError> {
+        let mut resolution = resolution::resolve(resolution::ResolveOpts {
+            methodus_home: &self.home,
+            request,
+            requested_face: None,
+            requested_context_faces: None,
+            requested_method: Some(method_id),
+        })?;
+        if resolution.method.as_ref().is_none_or(|m| m.id != method_id) {
+            return Err(CoreError::Other(format!("method `{method_id}` not installed")));
+        }
+        if let Some(src) = study_sources {
+            resolution.study_sources = src;
+        }
+        let now = Utc::now();
+        let id_raw = Uuid::new_v4().to_string().replace('-', "");
+        let task = Task {
+            id: format!("task_{}", &id_raw[..12]),
+            title: title.to_string(),
+            request: request.to_string(),
+            project_id: project_id.map(str::to_string),
+            status: TaskStatus::Queued,
+            runtime: Some(self.preferred_runtime(None)),
+            workspace_id: None,
+            resolution: Some(resolution.to_json()),
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.insert_task(&task)?;
+        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": title}).to_string());
+        Ok(task)
+    }
+
+    pub fn review_hypothesis(
+        &self,
+        id: &str,
+        action: crate::hypothesis::HypothesisReviewAction,
+    ) -> Result<Hypothesis, CoreError> {
+        crate::hypothesis::review_hypothesis(&self.store, &self.home, id, action)
+    }
+
+    /// Remove workspace dirs for terminal tasks older than `max_age_days`.
+    pub fn cleanup_workspaces(&self, max_age_days: i64) -> Result<usize, CoreError> {
+        use std::time::SystemTime;
+        let cutoff = Utc::now() - chrono::Duration::days(max_age_days);
+        let mut removed = 0usize;
+        let ws_root = self.home.join("workspaces");
+        let Ok(entries) = fs::read_dir(&ws_root) else {
+            return Ok(0);
+        };
+        for entry in entries.flatten() {
+            let task_id = entry.file_name().to_string_lossy().into_owned();
+            let Ok(Some(task)) = self.store.get_task(&task_id) else {
+                continue;
+            };
+            if !task.status.is_terminal() {
+                continue;
+            }
+            if task.updated_at > cutoff {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+                removed += 1;
+                let _ = self.store.insert_event(
+                    &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
+                    "workspace.cleaned",
+                    &Utc::now().to_rfc3339(),
+                    Some(&task_id),
+                    None,
+                    &serde_json::json!({"path": path.display().to_string()}).to_string(),
+                    None,
+                );
+            }
+        }
+        let _ = SystemTime::now();
+        Ok(removed)
+    }
+
+    fn emit_simple(&self, event_type: &str, task_id: Option<&str>, payload: &str) {
+        let _ = self.store.insert_event(
+            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
+            event_type,
+            &Utc::now().to_rfc3339(),
+            task_id,
+            None,
+            payload,
+            None,
+        );
+    }
+
+    /// Start a module-expert study task from user-specified paths/URLs (not the task workspace).
+    pub fn create_study_task(
+        &self,
+        scope: &str,
+        sources: &[String],
+        face: Option<&str>,
+    ) -> Result<Task, CoreError> {
+        if sources.is_empty() {
+            return Err(CoreError::Other(
+                "study needs at least one path or URL — e.g. /study nxm @~/docs/nxm https://…"
+                    .into(),
+            ));
+        }
+        let scope = scope.trim();
+        let title = if scope.is_empty() {
+            sources[0].chars().take(72).collect::<String>()
+        } else if scope.chars().count() > 72 {
+            format!("{}…", scope.chars().take(71).collect::<String>())
+        } else {
+            scope.to_string()
+        };
+        let sources_block = sources
+            .iter()
+            .map(|s| format!("- {s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let topic = if scope.is_empty() {
+            title.clone()
+        } else {
+            scope.to_string()
+        };
+        let request = format!(
+            "Module expert study: {topic}\n\n\
+             ## Sources to read\n\n\
+             {sources_block}\n\n\
+             Read only the sources above (in place). Do not survey the task workspace. \
+             Synthesize structured knowledge and list open questions for your human mentor. \
+             Follow the module-expert-learning output format."
+        );
+        let face_id = crate::face_util::ensure_study_face(&self.home, scope, face)?;
+        let mut resolution = resolution::resolve(resolution::ResolveOpts {
+            methodus_home: &self.home,
+            request: &request,
+            requested_face: Some(&face_id),
+            requested_context_faces: None,
+            requested_method: Some(crate::curiosity::MODULE_EXPERT_METHOD_ID),
+        })?;
+        if resolution.method.as_ref().is_none_or(|m| {
+            m.id != crate::curiosity::MODULE_EXPERT_METHOD_ID
+        }) {
+            return Err(CoreError::Other(
+                "module-expert-learning method not installed — restart Methodus or check ~/.methodus/methods".into(),
+            ));
+        }
+        resolution.study_sources = sources.to_vec();
+        let now = Utc::now();
+        let id_raw = Uuid::new_v4().to_string().replace('-', "");
+        let task = Task {
+            id: format!("task_{}", &id_raw[..12]),
+            title,
+            request,
+            project_id: None,
+            status: TaskStatus::Queued,
+            runtime: Some(self.preferred_runtime(None)),
+            workspace_id: None,
+            resolution: Some(resolution.to_json()),
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.insert_task(&task)?;
+        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": task.title}).to_string());
         Ok(task)
     }
 
@@ -322,6 +650,28 @@ impl Engine {
         }
         self.store
             .update_task_status(task_id, TaskStatus::Cancelled)?;
+        Ok(())
+    }
+
+    /// Drop a terminal task from the list (failed / cancelled / completed).
+    pub fn delete_task(&self, task_id: &str) -> Result<(), CoreError> {
+        let task = self
+            .store
+            .get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        if !task.status.is_terminal() {
+            return Err(CoreError::TaskNotDeletable(
+                task_id.to_string(),
+                task.status.to_string(),
+            ));
+        }
+        let paths = self.store.delete_task(task_id)?;
+        for path in paths {
+            let p = PathBuf::from(&path);
+            if p.is_dir() {
+                let _ = fs::remove_dir_all(&p);
+            }
+        }
         Ok(())
     }
 
@@ -475,32 +825,50 @@ impl Engine {
         }
 
         let resolution = resolution_from_task(&task, &self.home)?;
-        let snippets = learning::select_committed_knowledge(
-            &self.store,
-            &self.home,
-            &resolution.face_id,
-            &task.request,
-        )?;
+        let is_study = !resolution.study_sources.is_empty();
+        let face_ids = resolution.all_face_ids();
+        let face_refs: Vec<&str> = face_ids.iter().map(String::as_str).collect();
+        let snippets = if is_study {
+            Vec::new()
+        } else {
+            learning::select_committed_knowledge_multi(
+                &self.store,
+                &self.home,
+                &face_refs,
+                &task.request,
+            )?
+        };
         let mut context = resolution.to_context_markdown(&task.title, &task.request);
-        if let Some(ref pid) = task.project_id {
-            if let Some(proj) = crate::project::list_projects(&self.home)
-                .into_iter()
-                .find(|p| p.id == *pid)
-            {
-                context.push_str(&format!(
-                    "\n## Project\n\nRoot: `{}`\nWrites inside this tree are in-scope when the user asks.\n",
-                    proj.root.display()
-                ));
+        if !is_study {
+            if let Some(ref pid) = task.project_id {
+                if let Some(proj) = crate::project::list_projects(&self.home)
+                    .into_iter()
+                    .find(|p| p.id == *pid)
+                {
+                    context.push_str(&format!(
+                        "\n## Project\n\nRoot: `{}`\nWrites inside this tree are in-scope when the user asks.\n",
+                        proj.root.display()
+                    ));
+                }
             }
+            context.push_str(&learning::render_knowledge_context(&snippets));
+        } else {
+            context.push_str(&crate::curiosity::render_study_sources(
+                &resolution.study_sources,
+            ));
         }
-        context.push_str(&learning::render_knowledge_context(&snippets));
-        let named_roots = self.context_roots();
+        let named_roots = if is_study {
+            crate::curiosity::study_named_roots(&self.home, &resolution.study_sources)?
+        } else {
+            self.context_roots()
+        };
         context.push_str(&crate::mentions::render_readable_dirs(&named_roots));
         let mention_source = follow_up.as_deref().unwrap_or(&task.request);
         let mentions = crate::mentions::resolve_named(mention_source, &named_roots);
         context.push_str(&crate::mentions::render_attached(&mentions));
         let extra_dirs = crate::mentions::readable_dirs(&named_roots);
         let ws_root = WorkspaceBuilder::build(&self.workspace_root(), task_id, &context)?;
+        WorkspaceBuilder::write_plan(&ws_root, &resolution.to_plan_markdown(&task.title))?;
         let knowledge_files: Vec<(String, PathBuf)> = snippets
             .iter()
             .map(|s| (s.dest_name.clone(), s.src_path.clone()))
@@ -516,9 +884,20 @@ impl Engine {
                 .join("face.yaml")
         };
         if face_yaml.is_file() {
-            let dest = ws_root.join("face-context");
+            let dest = ws_root.join("face-context").join(&resolution.face_id);
             fs::create_dir_all(&dest)?;
             fs::copy(&face_yaml, dest.join("face.yaml"))?;
+        }
+        for ctx in &resolution.context_faces {
+            if ctx.face_dir.is_empty() {
+                continue;
+            }
+            let ctx_yaml = PathBuf::from(&ctx.face_dir).join("face.yaml");
+            if ctx_yaml.is_file() {
+                let dest = ws_root.join("face-context").join(&ctx.id);
+                fs::create_dir_all(&dest)?;
+                let _ = fs::copy(&ctx_yaml, dest.join("face.yaml"));
+            }
         }
 
         let method_src = resolution.method.as_ref().map(|m| PathBuf::from(&m.path));
@@ -538,6 +917,11 @@ impl Engine {
             &Utc::now().to_rfc3339(),
         )?;
         self.store.update_task_workspace(task_id, &ws_id)?;
+        self.emit_simple(
+            "workspace.created",
+            Some(task_id),
+            &serde_json::json!({"workspace_id": ws_id, "path": ws_root.to_string_lossy()}).to_string(),
+        );
 
         task = self
             .store
@@ -605,7 +989,9 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| self.preferred_runtime(None));
         let adapter = self.adapter(&runtime_name)?;
-        let allowed_tools = policy::baseline_allowed_tools();
+        let permission_mode =
+            policy::PermissionMode::parse(UserConfig::load(&self.home).permission_mode.as_deref());
+        let allowed_tools = policy::spawn_allowed_tools(permission_mode);
         let _ = self
             .store
             .set_session_allowed_tools(&session_id, &allowed_tools);
@@ -617,6 +1003,7 @@ impl Engine {
             session_id,
             workspace: ws_root,
             face_id: Some(resolution.face_id),
+            method_id: resolution.method.as_ref().map(|m| m.id.clone()),
             task_title: task.title.clone(),
             task_request: task.request.clone(),
             prompt: spawn_input_prompt,
@@ -733,6 +1120,9 @@ impl Engine {
             face_id: resolution_from_task(&task, &self.home)
                 .ok()
                 .map(|r| r.face_id),
+            method_id: resolution_from_task(&task, &self.home)
+                .ok()
+                .and_then(|r| r.method.map(|m| m.id)),
             task_title: task.title.clone(),
             task_request: task.request.clone(),
             prompt,
@@ -755,6 +1145,7 @@ impl Engine {
             task_id: launch.task_id,
             session_id: launch.session_id,
             face_id: launch.face_id,
+            method_id: launch.method_id,
             task_title: launch.task_title,
             task_request: launch.task_request,
             caller_tx,
@@ -911,6 +1302,8 @@ fn resolution_from_task(task: &Task, home: &std::path::Path) -> Result<Resolutio
         methodus_home: home,
         request: &task.request,
         requested_face: None,
+        requested_context_faces: None,
+        requested_method: None,
     })
 }
 
@@ -939,6 +1332,7 @@ struct LaunchTurns {
     session_id: String,
     workspace: PathBuf,
     face_id: Option<String>,
+    method_id: Option<String>,
     task_title: String,
     task_request: String,
     prompt: String,
@@ -956,6 +1350,7 @@ struct TurnRunner {
     task_id: String,
     session_id: String,
     face_id: Option<String>,
+    method_id: Option<String>,
     task_title: String,
     task_request: String,
     caller_tx: mpsc::Sender<RuntimeEvent>,
@@ -1061,7 +1456,7 @@ impl TurnRunner {
                 return;
             }
 
-            let (auto, user) = policy::split_denials(&outcome.denials);
+            let (auto, user) = policy::split_denials(&outcome.denials, self.permission_mode);
             policy::grant_tools(&mut allowed_tools, auto.into_iter().map(|d| d.tool_name));
             let _ = self
                 .store
@@ -1177,6 +1572,7 @@ fn finish_task(runner: &TurnRunner, result_text: &str, is_error: bool) {
     }
 
     let _ = save_experience_direct(runner, result_text, is_error);
+    let _ = crate::scheduler::tick(&runner.store, &runner.home);
 }
 
 struct RelayCtx {
@@ -1289,6 +1685,17 @@ fn append_transcript(path: &std::path::Path, line: &str) -> Result<(), std::io::
     Ok(())
 }
 
+fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 fn save_experience_direct(
     runner: &TurnRunner,
     result_text: &str,
@@ -1308,10 +1715,13 @@ fn save_experience_direct(
     }
 
     let outcome = if is_error { "failed" } else { "success" };
-    let summary = if result_text.len() > 500 {
-        result_text[..500].to_string()
+    let summary = truncate_utf8_prefix(result_text, 500);
+    let mode_line = if runner.method_id.as_deref()
+        == Some(crate::curiosity::MODULE_EXPERT_METHOD_ID)
+    {
+        "         - mode: module_expert\n"
     } else {
-        result_text.to_string()
+        ""
     };
 
     let body = format!(
@@ -1319,6 +1729,7 @@ fn save_experience_direct(
          - task: `{task}`\n\
          - face: `{face}`\n\
          - outcome: {outcome}\n\
+{mode_line}\
          - created: {ts}\n\n\
          ## Request\n\n\
          {title}\n\n\
@@ -1330,6 +1741,7 @@ fn save_experience_direct(
         title = runner.task_title,
         request = runner.task_request,
         result = result_text,
+        mode_line = mode_line,
     );
     fs::write(&abs, &body)?;
     let hash = sha256_hex(body.as_bytes());
@@ -1337,7 +1749,7 @@ fn save_experience_direct(
     let exp = Experience {
         id: exp_id,
         task_id: runner.task_id.clone(),
-        face_id: Some(face),
+        face_id: Some(face.clone()),
         path: rel,
         content_hash: hash,
         outcome: Some(outcome.to_string()),
@@ -1346,6 +1758,15 @@ fn save_experience_direct(
         updated_at: now,
     };
     runner.store.insert_experience(&exp)?;
+    let _ = runner.store.insert_event(
+        &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "experience.created",
+        &now.to_rfc3339(),
+        Some(&runner.task_id),
+        None,
+        &serde_json::json!({"experience_id": exp.id, "face_id": face}).to_string(),
+        None,
+    );
     let _ = learning::enqueue_extract(&runner.store, &exp);
     Ok(())
 }
@@ -1358,6 +1779,14 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[test]
+    fn truncate_utf8_prefix_respects_char_boundary() {
+        let s = "中".repeat(200); // 600 bytes
+        let out = truncate_utf8_prefix(&s, 500);
+        assert!(out.len() <= 500);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
 
     struct MockAdapter {
         turns: Mutex<VecDeque<Vec<RuntimeEvent>>>,
@@ -1482,6 +1911,8 @@ mod tests {
         assert!(abs.exists(), "experience file missing: {}", abs.display());
         let body = fs::read_to_string(&abs).unwrap();
         assert!(body.contains("done"));
+        let closed = engine.complete_review(&task.id).unwrap();
+        assert_eq!(closed.status, TaskStatus::Completed);
     }
 
     #[tokio::test]
@@ -1818,33 +2249,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_denial_pauses_for_approval_then_approve_continues() {
+    async fn destructive_bash_denial_pauses_for_approval_then_approve_continues() {
         let deny = vec![
             RuntimeEvent::SessionStarted {
                 session_id: "exec-sid-1".to_string(),
             },
             RuntimeEvent::Result {
                 is_error: false,
-                text: "need write".to_string(),
+                text: "need rm".to_string(),
                 cost_usd: None,
                 usage: None,
                 session_id: Some("exec-sid-1".to_string()),
                 permission_denials: vec![PermissionDenial {
-                    tool_name: "Write".to_string(),
+                    tool_name: "Bash".to_string(),
                     tool_use_id: Some("tu1".to_string()),
-                    tool_input: serde_json::json!({"file_path": "/tmp/x"}),
+                    tool_input: serde_json::json!({"command": "rm -rf build/"}),
                 }],
             },
         ];
-        let (engine, _dir) = engine_with_turns(vec![deny, vec![ok_result("wrote it")]]);
+        let (engine, _dir) = engine_with_turns(vec![deny, vec![ok_result("ran it")]]);
         let task = engine
-            .create_task("write a file", "write a file", None, None)
+            .create_task("clean build", "clean build", None, None)
             .unwrap();
         let mut rx = engine.run_task(&task.id, false).await.unwrap();
         let mut saw_approval = None;
         while let Some(ev) = rx.recv().await {
             if let RuntimeEvent::ApprovalRequested { id, tool_name, .. } = ev {
-                assert_eq!(tool_name, "Write");
+                assert_eq!(tool_name, "Bash");
                 saw_approval = Some(id);
             }
         }
@@ -1895,6 +2326,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_allow_bash_git_does_not_pause() {
+        let first = vec![RuntimeEvent::Result {
+            is_error: false,
+            text: "need shell".to_string(),
+            cost_usd: None,
+            usage: None,
+            session_id: Some("exec-sid-1".to_string()),
+            permission_denials: vec![PermissionDenial {
+                tool_name: "Bash".to_string(),
+                tool_use_id: None,
+                tool_input: serde_json::json!({"command": "git status"}),
+            }],
+        }];
+        let (engine, _dir) = engine_with_turns(vec![first, vec![ok_result("ok")]]);
+        let task = engine.create_task("g", "g", None, None).unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        let task = engine.store().get_task(&task.id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Reviewing);
+        assert!(engine
+            .store()
+            .list_pending_approvals(Some(&task.id))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn auto_allow_read_does_not_pause() {
         let first = vec![RuntimeEvent::Result {
             is_error: false,
@@ -1929,6 +2387,8 @@ mod tests {
         let task = engine.store().get_task(&task.id).unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Cancelled);
         assert!(engine.cancel_task(&task.id).is_err());
+        engine.delete_task(&task.id).unwrap();
+        assert!(engine.store().get_task(&task.id).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1938,9 +2398,11 @@ mod tests {
         let mut rx = engine.run_task(&task.id, false).await.unwrap();
         while rx.recv().await.is_some() {}
         let jobs = engine.store().list_jobs().unwrap();
-        assert!(jobs
-            .iter()
-            .any(|j| j.kind == JobKind::ExtractExperience && j.status == JobStatus::Queued));
+        assert!(jobs.iter().any(|j| j.kind == JobKind::ExtractExperience));
+        assert!(
+            jobs.iter().any(|j| j.status == JobStatus::Done),
+            "finish_task should drain extract/detect/propose: {jobs:?}"
+        );
     }
 
     #[tokio::test]
@@ -1967,7 +2429,9 @@ mod tests {
             .filter(|k| k.source != crate::learning::SKILL_DRAFT_SOURCE)
             .collect::<Vec<_>>();
         assert!(!cands.is_empty());
-        let committed = engine.review_knowledge(&cands[0].id, true).unwrap();
+        let committed = engine
+            .review_knowledge(&cands[0].id, KnowledgeReviewAction::Commit)
+            .unwrap();
         assert_eq!(committed.status, KnowledgeStatus::Committed);
         let committed_body = fs::read_to_string(engine.home().join(&committed.path)).unwrap();
         assert!(committed_body.contains("gpio 4"));
@@ -2012,7 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn learn_skill_then_review_installs_live_skill() {
+    async fn auto_skill_draft_then_review_installs_live_skill() {
         let (engine, _dir) = engine_with(vec![
             tool_start("Bash"),
             tool_start("Read"),
@@ -2038,23 +2502,41 @@ mod tests {
             "expected propose_skill draft after 3 tool calls"
         );
 
-        let explicit = engine.learn_skill(&task.id, Some("cpu-sample")).unwrap();
-        assert_eq!(explicit.source, crate::learning::SKILL_DRAFT_SOURCE);
-        assert!(explicit.path.contains(".candidates"));
+        let draft = auto_drafts.into_iter().next().unwrap();
+        assert_eq!(draft.source, crate::learning::SKILL_DRAFT_SOURCE);
+        assert!(draft.path.contains(".candidates"));
 
-        let committed = engine.review_knowledge(&explicit.id, true).unwrap();
+        let committed = engine
+            .review_knowledge(&draft.id, KnowledgeReviewAction::Commit)
+            .unwrap();
         assert_eq!(committed.status, KnowledgeStatus::Committed);
         assert!(committed.path.starts_with("skills/"));
         assert!(!committed.path.contains(".candidates"));
         assert!(engine.home().join(&committed.path).exists());
         let catalog = crate::resolution::scan_skills(engine.home());
-        assert!(catalog.iter().any(|s| s.name.contains("cpu-sample")));
+        assert!(catalog.iter().any(|s| s.name.contains("sample")));
 
-        let again = engine.learn_skill(&task.id, Some("cpu-sample")).unwrap();
+        // Second draft for the same slug → conflict; replace promotes the new candidate.
+        let again = crate::learning::propose_skill_from_task(
+            engine.store(),
+            engine.home(),
+            &task.id,
+            None,
+        )
+        .unwrap()
+        .expect("second draft");
         assert_eq!(again.status, KnowledgeStatus::Conflicted);
-        assert!(engine.review_knowledge(&again.id, true).is_err());
+        assert!(engine
+            .review_knowledge(&again.id, KnowledgeReviewAction::Commit)
+            .is_err());
+        let replaced = engine
+            .review_knowledge(&again.id, KnowledgeReviewAction::ReplaceExisting)
+            .unwrap();
+        assert_eq!(replaced.status, KnowledgeStatus::Committed);
+        assert!(replaced.path.starts_with("skills/"));
+        assert!(engine.home().join(&replaced.path).exists());
         let still = engine.store().get_knowledge(&again.id).unwrap().unwrap();
-        assert_eq!(still.status, KnowledgeStatus::Conflicted);
+        assert_eq!(still.status, KnowledgeStatus::Committed);
     }
 
     #[test]

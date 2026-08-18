@@ -35,6 +35,11 @@ impl WorkspaceBuilder {
         Ok(ws_root)
     }
 
+    /// Write execution plan from resolved method steps and Faces.
+    pub fn write_plan(ws_root: &Path, plan_md: &str) -> Result<(), std::io::Error> {
+        fs::write(ws_root.join(".methodus/plan.md"), plan_md)
+    }
+
     /// Copy a few vetted knowledge files into the workspace (never the whole Face store).
     pub fn materialize_knowledge(
         ws_root: &Path,
@@ -46,14 +51,26 @@ impl WorkspaceBuilder {
             if !src.is_file() {
                 continue;
             }
-            let stem = Path::new(name)
+            let rel = Path::new(name);
+            let stem = rel
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if !is_safe_segment(&stem) || Path::new(name).extension().is_some_and(|e| e != "md") {
+            if stem.is_empty() || !is_safe_segment(&stem) {
                 continue;
             }
-            fs::copy(src, dest_dir.join(format!("{stem}.md")))?;
+            if rel.extension().is_some_and(|e| e != "md") {
+                continue;
+            }
+            let dest = if rel.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+                dest_dir.join(rel)
+            } else {
+                dest_dir.join(format!("{stem}.md"))
+            };
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(src, &dest)?;
         }
         Ok(())
     }

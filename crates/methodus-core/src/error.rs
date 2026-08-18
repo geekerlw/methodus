@@ -60,6 +60,9 @@ pub enum CoreError {
     #[error("task {0} is {1} and cannot be cancelled")]
     TaskNotCancellable(String, String),
 
+    #[error("task {0} is {1} and cannot be deleted — cancel it first")]
+    TaskNotDeletable(String, String),
+
     #[error("session not found: {0}")]
     SessionNotFound(String),
 

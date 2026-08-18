@@ -9,8 +9,14 @@ pub mod usage;
 
 // Re-export key types at crate root for convenience.
 pub use approval::ApprovalDecision;
-pub use entity::{Approval, Experience, KnowledgeItem, LearningJob, Question, Session, Task};
+pub use entity::{
+    Approval, EvolutionCandidate, Experience, Hypothesis, KnowledgeItem, LearningJob, Question,
+    Session, Task,
+};
 pub use error::DomainError;
 pub use event::{PermissionDenial, RuntimeEvent};
-pub use status::{JobKind, JobStatus, KnowledgeStatus, QuestionStatus, SessionStatus, TaskStatus};
+pub use status::{
+    EvolutionStatus, HypothesisStatus, JobKind, JobStatus, KnowledgeStatus, QuestionStatus,
+    SessionStatus, TaskStatus,
+};
 pub use usage::{UsageDelta, UsageSummary};

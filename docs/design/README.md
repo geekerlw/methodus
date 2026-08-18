@@ -13,12 +13,13 @@ Read in order:
 | 02 | [`02-architecture.md`](./02-architecture.md) | Rust technology stack, crate/module layout, the **single-process** runtime model (no daemon/client split), async/concurrency model, crash recovery. |
 | 03 | [`03-data-model.md`](./03-data-model.md) | SQLite schema (DDL), on-disk file layout, and the source-of-truth split between the database and human-readable YAML/Markdown. |
 | 04 | [`04-roadmap.md`](./04-roadmap.md) | Phased implementation plan (walking skeleton first; single always-on process), with per-phase acceptance criteria. |
+| 05 | [`05-tui.md`](./05-tui.md) | In-process **agent TUI**: ratatui (not Ink/pi-tui), chrome rules, Pi-aligned component inventory, implementation waves. The delivery shell. |
 
 ## Provenance & key decisions
 
 `00-product.md` preserves the product intent from the original spec. Three
 stack/mechanism decisions made during the design spike **correct** the original spec
-and are already reflected across `00`–`04`:
+and are already reflected across `00`–`05`:
 
 1. **Language is Rust**, not TypeScript (rationale in `02-architecture.md`).
 2. **No PTY layer.** All three executors expose structured (JSON/JSONL)
@@ -26,9 +27,15 @@ and are already reflected across `00`–`04`:
    process/protocol integration rather than screen-scraping a pseudo-terminal
    (rationale in `01-runtime-adapters.md`).
 3. **Single always-on process, not a daemon/client split.** Methodus is one
-   long-lived process kept open (in `tmux`); persistence + restart recovery come from
-   executor-native session resume. The split is a deferred, optional refactor kept
-   cheap by keeping `methodus-core` UI-free (rationale in `02-architecture.md` §0).
+   long-lived process; persistence + restart recovery come from executor-native
+   session resume. The **ratatui TUI** is the delivery shell — keep it open in
+   `tmux`. No detached daemon unless requirements change (rationale in
+   `02-architecture.md` §0).
+
+4. **User-triggered execution, not autonomous scheduled agents.** Background work
+   is post-task learning and idle Curiosity (ask the user). No cron/RSS/auto-run
+   executor loops without explicit human confirmation — the OpenClaw pattern is
+   out of scope (rationale in `04-roadmap.md` M5+).
 
 ## Design status
 

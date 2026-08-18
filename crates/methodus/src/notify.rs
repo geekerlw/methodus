@@ -2,8 +2,19 @@
 
 use std::process::{Command, Stdio};
 
+/// Urgency tier — controls sound (macOS) and notify-send level (Linux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyUrgency {
+    /// Approval blocked, executor error — may play a sound when OS notify fires.
+    Critical,
+    /// Inbox item, idle question — silent OS banner.
+    Normal,
+    /// Turn complete — only sent when the terminal pane looks idle/unfocused.
+    Low,
+}
+
 /// Fire-and-forget system notification. Safe to call from the UI thread.
-pub fn send(title: &str, body: &str) {
+pub fn send(title: &str, body: &str, urgency: NotifyUrgency) {
     let title = sanitize(title);
     let body = sanitize(body);
     if title.is_empty() || body.is_empty() {
@@ -11,14 +22,17 @@ pub fn send(title: &str, body: &str) {
     }
     let _ = std::thread::Builder::new()
         .name("methodus-notify".into())
-        .spawn(move || fire(&title, &body));
+        .spawn(move || fire(&title, &body, urgency));
 }
 
-fn fire(title: &str, body: &str) {
+fn fire(title: &str, body: &str, urgency: NotifyUrgency) {
     #[cfg(target_os = "macos")]
     {
-        let script =
-            format!(r#"display notification "{body}" with title "{title}" sound name "Glass""#);
+        let sound = match urgency {
+            NotifyUrgency::Critical => r#" sound name "Glass""#,
+            NotifyUrgency::Normal | NotifyUrgency::Low => "",
+        };
+        let script = format!(r#"display notification "{body}" with title "{title}"{sound}"#);
         let _ = Command::new("osascript")
             .arg("-e")
             .arg(script)
@@ -29,8 +43,13 @@ fn fire(title: &str, body: &str) {
     }
     #[cfg(target_os = "linux")]
     {
+        let level = match urgency {
+            NotifyUrgency::Critical => "critical",
+            NotifyUrgency::Normal => "normal",
+            NotifyUrgency::Low => "low",
+        };
         let _ = Command::new("notify-send")
-            .args([title, body])
+            .args(["-u", level, title, body])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -38,7 +57,7 @@ fn fire(title: &str, body: &str) {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (title, body);
+        let _ = (title, body, urgency);
     }
 }
 

@@ -391,7 +391,7 @@ fn job_from_query(row: &rusqlite::Row<'_>) -> Result<LearningJob, StoreError> {
     })
 }
 
-fn knowledge_from_query(row: &rusqlite::Row<'_>) -> Result<KnowledgeItem, StoreError> {
+pub(crate) fn knowledge_from_query(row: &rusqlite::Row<'_>) -> Result<KnowledgeItem, StoreError> {
     let status: String = row.get(8)?;
     Ok(KnowledgeItem {
         id: row.get(0)?,

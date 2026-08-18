@@ -366,6 +366,139 @@ impl fmt::Display for QuestionStatus {
     }
 }
 
+// ─── HypothesisStatus ────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HypothesisStatus {
+    Candidate,
+    Validated,
+    Rejected,
+    Promoted,
+}
+
+impl HypothesisStatus {
+    pub fn transitions(&self) -> Vec<Self> {
+        match self {
+            Self::Candidate => vec![Self::Validated, Self::Rejected, Self::Promoted],
+            Self::Validated => vec![Self::Promoted, Self::Rejected],
+            Self::Rejected | Self::Promoted => vec![],
+        }
+    }
+
+    pub fn can_transition_to(&self, other: &Self) -> bool {
+        self.transitions().contains(other)
+    }
+
+    pub fn checked_transition(&self, other: Self) -> Result<Self, DomainError> {
+        if self.can_transition_to(&other) {
+            Ok(other)
+        } else {
+            Err(DomainError::InvalidTransition {
+                entity: "hypothesis",
+                from: self.to_string(),
+                to: other.to_string(),
+            })
+        }
+    }
+}
+
+impl fmt::Display for HypothesisStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Candidate => "candidate",
+            Self::Validated => "validated",
+            Self::Rejected => "rejected",
+            Self::Promoted => "promoted",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for HypothesisStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "candidate" => Ok(Self::Candidate),
+            "validated" => Ok(Self::Validated),
+            "rejected" => Ok(Self::Rejected),
+            "promoted" => Ok(Self::Promoted),
+            other => Err(DomainError::InvalidStatus {
+                entity: "hypothesis",
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
+// ─── EvolutionStatus ─────────────────────────────────────────────────────────
+
+/// Lifecycle of an Evolution candidate (`00-product.md` §3.10).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolutionStatus {
+    Candidate,
+    Approved,
+    Rejected,
+    Active,
+}
+
+impl EvolutionStatus {
+    pub fn transitions(&self) -> Vec<Self> {
+        match self {
+            Self::Candidate => vec![Self::Approved, Self::Rejected, Self::Active],
+            Self::Approved => vec![Self::Active],
+            Self::Rejected | Self::Active => vec![],
+        }
+    }
+
+    pub fn can_transition_to(&self, other: &Self) -> bool {
+        self.transitions().contains(other)
+    }
+
+    pub fn checked_transition(&self, other: Self) -> Result<Self, DomainError> {
+        if self.can_transition_to(&other) {
+            Ok(other)
+        } else {
+            Err(DomainError::InvalidTransition {
+                entity: "evolution",
+                from: self.to_string(),
+                to: other.to_string(),
+            })
+        }
+    }
+}
+
+impl fmt::Display for EvolutionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Candidate => "candidate",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Active => "active",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for EvolutionStatus {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "candidate" => Ok(Self::Candidate),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            "active" => Ok(Self::Active),
+            other => Err(DomainError::InvalidStatus {
+                entity: "evolution",
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
 // ─── JobKind ─────────────────────────────────────────────────────────────────
 
 /// MVP learning-queue job kinds (`00-product.md` §7).
@@ -376,6 +509,10 @@ pub enum JobKind {
     DetectGaps,
     ProposeKnowledge,
     ProposeSkill,
+    SynthesizeKnowledge,
+    AnalyzeKnowledgeGaps,
+    AutoResearch,
+    SynthesizeMethod,
 }
 
 impl fmt::Display for JobKind {
@@ -385,6 +522,10 @@ impl fmt::Display for JobKind {
             Self::DetectGaps => "detect_gaps",
             Self::ProposeKnowledge => "propose_knowledge",
             Self::ProposeSkill => "propose_skill",
+            Self::SynthesizeKnowledge => "synthesize_knowledge",
+            Self::AnalyzeKnowledgeGaps => "analyze_knowledge_gaps",
+            Self::AutoResearch => "auto_research",
+            Self::SynthesizeMethod => "synthesize_method",
         };
         write!(f, "{}", s)
     }
@@ -399,6 +540,10 @@ impl FromStr for JobKind {
             "detect_gaps" => Ok(Self::DetectGaps),
             "propose_knowledge" => Ok(Self::ProposeKnowledge),
             "propose_skill" => Ok(Self::ProposeSkill),
+            "synthesize_knowledge" => Ok(Self::SynthesizeKnowledge),
+            "analyze_knowledge_gaps" => Ok(Self::AnalyzeKnowledgeGaps),
+            "auto_research" => Ok(Self::AutoResearch),
+            "synthesize_method" => Ok(Self::SynthesizeMethod),
             other => Err(DomainError::InvalidStatus {
                 entity: "job_kind",
                 value: other.to_string(),

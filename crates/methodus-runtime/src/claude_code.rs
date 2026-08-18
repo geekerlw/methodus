@@ -51,17 +51,21 @@ pub(crate) fn claude_args(input: &SpawnInput, resume: Option<&str>) -> Vec<Strin
         args.push("--add-dir".to_string());
         args.push(dir.to_string_lossy().into_owned());
     }
+    // `--add-dir` / `--allowed-tools` are variadic; without `--` the prompt can be
+    // swallowed as another flag value and Claude exits with no conversation.
+    args.push("--".to_string());
     args.push(input.prompt.clone());
     args
 }
 
 /// Map Methodus permission mode to Claude `--permission-mode`.
-/// Never `bypassPermissions`: edits auto-run in `acceptEdits`; shell still gated.
+/// Never `bypassPermissions`. `AcceptEdits` maps to Claude `auto` (goal-mode feel).
 pub(crate) fn claude_permission_mode(mode: &str) -> &'static str {
     match mode {
         "plan" => "plan",
         "cautious" | "manual" | "default" => "manual",
-        _ => "acceptEdits",
+        "acceptEdits" => "auto",
+        _ => "auto",
     }
 }
 
@@ -88,11 +92,17 @@ async fn spawn_claude(
         .take()
         .ok_or_else(|| RuntimeError::SpawnFailed("no stdout".into()))?;
 
+    let stderr_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
     if let Some(stderr) = child.stderr.take() {
+        let stderr_buf = stderr_buf.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 warn!(target: "claude.stderr", "{line}");
+                let mut guard = stderr_buf.lock().await;
+                if guard.len() < 20 {
+                    guard.push(line);
+                }
             }
         });
     }
@@ -101,11 +111,14 @@ async fn spawn_claude(
     let fallback_sid = resume
         .map(str::to_owned)
         .unwrap_or_else(|| input.session_id.clone());
-    let fallback_sid_for_handle = fallback_sid.clone();
+    // Fresh spawn: do not claim a resumable executor sid until Claude emits init/result.
+    // Otherwise a failed first turn stores a phantom sid and the next message `--resume`s it.
+    let handle_executor_sid = resume.map(str::to_owned);
 
     tokio::spawn(async move {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
+        let mut saw_result = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
@@ -113,19 +126,42 @@ async fn spawn_claude(
             }
             let events = parse_claude_event(&line, &fallback_sid);
             for event in events {
+                if matches!(event, RuntimeEvent::Result { .. }) {
+                    saw_result = true;
+                }
                 if tx.send(event).await.is_err() {
                     debug!("event receiver dropped, stopping reader");
-                    break;
+                    let _ = child.wait().await;
+                    return;
                 }
             }
         }
 
-        let _ = child.wait().await;
+        let status = child.wait().await;
+        let code = status.ok().and_then(|s| s.code()).unwrap_or(1);
+        if !saw_result {
+            let stderr_tail = stderr_buf.lock().await.join(" | ");
+            let detail = if stderr_tail.is_empty() {
+                format!("claude exited without a result (code {code})")
+            } else {
+                format!("claude exited without a result (code {code}): {stderr_tail}")
+            };
+            let _ = tx
+                .send(RuntimeEvent::Result {
+                    is_error: true,
+                    text: detail,
+                    cost_usd: None,
+                    usage: None,
+                    session_id: None,
+                    permission_denials: Vec::new(),
+                })
+                .await;
+        }
     });
 
     let handle = SessionHandle {
         session_id: input.session_id,
-        executor_sid: Some(fallback_sid_for_handle),
+        executor_sid: handle_executor_sid,
         pid,
     };
     Ok((handle, rx))
@@ -264,11 +300,26 @@ fn parse_claude_event(line: &str, fallback_session_id: &str) -> Vec<RuntimeEvent
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let text = value
+            let mut text = value
                 .get("result")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
+            if text.trim().is_empty() {
+                if let Some(errs) = value.get("errors").and_then(|v| v.as_array()) {
+                    let joined: Vec<&str> = errs.iter().filter_map(|e| e.as_str()).collect();
+                    if !joined.is_empty() {
+                        text = joined.join("; ");
+                    }
+                }
+            }
+            if text.trim().is_empty() {
+                if let Some(subtype) = value.get("subtype").and_then(|v| v.as_str()) {
+                    if subtype != "success" {
+                        text = format!("claude {subtype}");
+                    }
+                }
+            }
             let cost_usd = value.get("total_cost_usd").and_then(|v| v.as_f64());
             let usage = value.get("usage").cloned();
             let session_id = value
@@ -428,7 +479,28 @@ mod tests {
         let args = claude_args(&input, None);
         assert!(args.contains(&"--add-dir".to_string()));
         assert!(args.contains(&"/tmp/proj".to_string()));
+        assert!(args.iter().any(|a| a == "--"));
+        let prompt_at = args.iter().position(|a| a == "do the thing").unwrap();
+        let sep_at = args.iter().position(|a| a == "--").unwrap();
+        assert!(sep_at < prompt_at);
         assert_eq!(args.last().map(String::as_str), Some("do the thing"));
+    }
+
+    #[test]
+    fn parse_result_surfaces_errors_array() {
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","session_id":"sid","errors":["No conversation found with session ID: sid"],"permission_denials":[]}"#;
+        let events = parse_claude_event(line, "fallback");
+        match &events[0] {
+            RuntimeEvent::Result {
+                is_error,
+                text,
+                ..
+            } => {
+                assert!(*is_error);
+                assert!(text.contains("No conversation found"));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
     }
 
     #[test]
@@ -587,7 +659,7 @@ mod tests {
 
     #[test]
     fn maps_methodus_modes_never_bypass() {
-        assert_eq!(claude_permission_mode("acceptEdits"), "acceptEdits");
+        assert_eq!(claude_permission_mode("acceptEdits"), "auto");
         assert_eq!(claude_permission_mode("plan"), "plan");
         assert_eq!(claude_permission_mode("cautious"), "manual");
         assert_eq!(claude_permission_mode("default"), "manual");

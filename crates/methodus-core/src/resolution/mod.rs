@@ -28,6 +28,22 @@ pub struct ResolveOpts<'a> {
     pub methodus_home: &'a Path,
     pub request: &'a str,
     pub requested_face: Option<&'a str>,
+    /// Context Faces (committed knowledge merged; primary drives method/skill pick).
+    pub requested_context_faces: Option<&'a [String]>,
+    /// Force a specific method id (e.g. module-expert-learning for /study).
+    pub requested_method: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectedFaceContext {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub face_dir: String,
+    #[serde(default)]
+    pub face_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +91,12 @@ pub struct Resolution {
     /// `personal` or `team:<pack-id>`
     #[serde(default)]
     pub face_source: String,
+    /// User-specified paths/URLs for module-expert study (not the task workspace).
+    #[serde(default)]
+    pub study_sources: Vec<String>,
+    /// Additional Faces whose knowledge is injected (multi-Face composition).
+    #[serde(default)]
+    pub context_faces: Vec<SelectedFaceContext>,
 }
 
 impl Resolution {
@@ -127,35 +149,108 @@ impl Resolution {
                  Otherwise read the SKILL.md file and follow it before improvising.\n{listed}"
             )
         };
+        let constraints = if !self.study_sources.is_empty() {
+            "- **Study mode:** read only the sources listed in the task request (paths/URLs).\n\
+             - The task workspace is scratch/transcript only — do not treat it as the corpus.\n\
+             - Outputs become long-lived Face knowledge, skills, and experience under Methodus home.\n\
+             - Vetted Face notes in `face-context/knowledge/` are reference only.\n\
+             - Do not modify Methodus home state (`~/.methodus`) directly.\n"
+        } else {
+            "- Work inside this workspace unless a project path is in selected context.\n\
+             - Vetted Face notes live in `face-context/<face>/knowledge/` when present; prefer them.\n\
+             - Do not modify Methodus home state (`~/.methodus`).\n"
+        };
+        let context_block = if self.context_faces.is_empty() {
+            String::new()
+        } else {
+            let listed = self
+                .context_faces
+                .iter()
+                .map(|f| format!("- `{}` ({})", f.id, f.name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n## Context Faces\n\n\
+                 Primary `{primary}` drives method/skill selection. \
+                 Additional Faces contribute committed knowledge:\n\n{listed}\n\n",
+                primary = self.face_id,
+                listed = listed
+            )
+        };
         format!(
             "# Selected context\n\n\
              ## Face: {name} (`{id}`)\n\n\
              {desc}\n\n\
-             Rationale: {rationale} (confidence {conf:.2}{low})\n\n\
-             {method}\n\
+             Rationale: {rationale} (confidence {conf:.2}{low})\n\
+             {context_block}\
+             {method}\
              ## Skills\n\n\
              {skills}\n\n\
              ## Task: {title}\n\n\
              {request}\n\n\
              ## Constraints\n\n\
-             - Work inside this workspace unless a project path is in selected context.\n\
-             - Vetted Face notes live in `face-context/knowledge/` when present; prefer them.\n\
-             - Do not modify Methodus home state (`~/.methodus`).\n",
+             {constraints}",
             name = self.face_name,
             id = self.face_id,
             desc = self.description,
             rationale = self.rationale,
             conf = self.confidence,
             low = if self.low_confidence {
-                "; LOW CONFIDENCE — pin a Face on the faces page if this is wrong"
+                "; LOW CONFIDENCE — pin a Face with /face if this is wrong"
             } else {
                 ""
             },
+            context_block = context_block,
             method = method_block,
             skills = skills_block,
             title = task_title,
             request = request,
+            constraints = constraints,
         )
+    }
+
+    /// All Face ids (primary + context) for knowledge injection.
+    pub fn all_face_ids(&self) -> Vec<String> {
+        let mut ids = vec![self.face_id.clone()];
+        for f in &self.context_faces {
+            if !ids.iter().any(|i| i == &f.id) {
+                ids.push(f.id.clone());
+            }
+        }
+        ids
+    }
+
+    pub fn to_plan_markdown(&self, task_title: &str) -> String {
+        let mut out = format!(
+            "# Execution plan\n\n\
+             **Task:** {task_title}\n\n\
+             **Primary Face:** `{face}` ({face_name})\n",
+            face = self.face_id,
+            face_name = self.face_name
+        );
+        if !self.context_faces.is_empty() {
+            out.push_str("\n**Context Faces:**\n");
+            for f in &self.context_faces {
+                out.push_str(&format!("- `{}` — {}\n", f.id, f.name));
+            }
+        }
+        if let Some(m) = &self.method {
+            out.push_str(&format!("\n**Method:** `{}` — {}\n\n", m.id, m.name));
+            if !m.steps.is_empty() {
+                out.push_str("## Steps\n\n");
+                for (i, step) in m.steps.iter().enumerate() {
+                    out.push_str(&format!("{}. [ ] {step}\n", i + 1));
+                }
+            }
+        }
+        if !self.skills.is_empty() {
+            out.push_str("\n## Skills to load\n\n");
+            for s in &self.skills {
+                out.push_str(&format!("- [ ] `{}`\n", s.name));
+            }
+        }
+        out.push_str("\n---\n\nFollow `.methodus/selected-context.md` and update checkboxes as you go.\n");
+        out
     }
 }
 
@@ -211,9 +306,15 @@ pub fn resolve(opts: ResolveOpts<'_>) -> Result<Resolution, CoreError> {
     let tokens = tokenize(opts.request);
     let (face, face_conf, face_why) = pick_face(&faces, requested, &tokens)?;
     let methods = load_methods(opts.methodus_home);
-    let method = pick_method(&methods, &face, &tokens);
+    let method = if let Some(mid) = opts.requested_method {
+        pick_requested_method(&methods, mid)
+    } else {
+        pick_method(&methods, &face, &tokens)
+    };
     let catalog = scan_skills(opts.methodus_home);
     let selected_skills = pick_skills(&catalog, method.as_ref(), &face, &tokens);
+    let context_faces =
+        load_context_faces(&faces, opts.requested_context_faces, &face.id)?;
 
     let mut rationale_parts = vec![face_why];
     if let Some(m) = &method {
@@ -226,6 +327,10 @@ pub fn resolve(opts: ResolveOpts<'_>) -> Result<Resolution, CoreError> {
             .collect::<Vec<_>>()
             .join(", ");
         rationale_parts.push(format!("skills [{names}]"));
+    }
+    if !context_faces.is_empty() {
+        let ids: Vec<_> = context_faces.iter().map(|f| f.id.as_str()).collect();
+        rationale_parts.push(format!("context faces [{}]", ids.join(", ")));
     }
     let rationale = rationale_parts.join("; ");
     let low_confidence = requested.is_none() && face_conf < LOW_CONFIDENCE;
@@ -248,6 +353,8 @@ pub fn resolve(opts: ResolveOpts<'_>) -> Result<Resolution, CoreError> {
         low_confidence,
         face_dir: face.dir.to_string_lossy().into_owned(),
         face_source: face.source.clone(),
+        study_sources: Vec::new(),
+        context_faces,
     })
 }
 
@@ -292,7 +399,50 @@ pub fn resolve_face(home: &Path, requested: Option<&str>) -> Result<Resolution, 
         methodus_home: home,
         request: "",
         requested_face: requested,
+        requested_context_faces: None,
+        requested_method: None,
     })
+}
+
+fn load_context_faces(
+    catalog: &[FaceFile],
+    requested: Option<&[String]>,
+    primary_id: &str,
+) -> Result<Vec<SelectedFaceContext>, CoreError> {
+    let Some(ids) = requested else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        if id == primary_id {
+            continue;
+        }
+        if !is_safe_segment(id) {
+            return Err(CoreError::InvalidTaskId(id.clone()));
+        }
+        let Some(face) = catalog.iter().find(|f| f.id == *id) else {
+            if *id == DEFAULT_FACE_ID {
+                let b = builtin_face();
+                out.push(SelectedFaceContext {
+                    id: b.id,
+                    name: b.name,
+                    description: b.description,
+                    face_dir: b.dir.to_string_lossy().into_owned(),
+                    face_source: b.source,
+                });
+                continue;
+            }
+            return Err(CoreError::FaceNotFound(id.clone()));
+        };
+        out.push(SelectedFaceContext {
+            id: face.id.clone(),
+            name: face.name.clone(),
+            description: face.description.clone(),
+            face_dir: face.dir.to_string_lossy().into_owned(),
+            face_source: face.source.clone(),
+        });
+    }
+    Ok(out)
 }
 
 fn builtin_face() -> FaceFile {
@@ -429,6 +579,10 @@ fn pick_face(
         0.45,
         "no intent_tag match; fell back to general".to_string(),
     ))
+}
+
+fn pick_requested_method(methods: &[MethodFile], id: &str) -> Option<MethodFile> {
+    methods.iter().find(|m| m.id == id).cloned()
 }
 
 fn pick_method(
@@ -608,6 +762,8 @@ mod tests {
             methodus_home: dir.path(),
             request: "investigate tcp latency on the edge router",
             requested_face: None,
+            requested_context_faces: None,
+            requested_method: None,
         })
         .unwrap();
         assert_eq!(r.face_id, "network");
@@ -633,6 +789,8 @@ mod tests {
             low_confidence: true,
             face_dir: String::new(),
             face_source: String::new(),
+            study_sources: vec![],
+            context_faces: vec![],
         };
         let parsed = Resolution::parse_json(&r.to_json()).unwrap();
         assert_eq!(parsed.face_id, "general");
@@ -675,6 +833,8 @@ mod tests {
             methodus_home: home.path(),
             request: "investigate storage disk errors",
             requested_face: None,
+            requested_context_faces: None,
+            requested_method: None,
         })
         .unwrap();
         assert_eq!(r.face_id, "storage");
@@ -698,6 +858,8 @@ mod tests {
             methodus_home: home.path(),
             request: "investigate storage disk errors",
             requested_face: Some("storage"),
+            requested_context_faces: None,
+            requested_method: None,
         })
         .unwrap();
         assert_eq!(r.face_source, "personal");

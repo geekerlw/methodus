@@ -3,7 +3,7 @@
 The **product contract**: what Methodus is, its domain model, the three loops, the
 event catalog, the permission model, the CLI/TUI surface, what is explicitly out of
 scope, and the acceptance scenarios. This is the *what & why*; the *how* lives in
-`01`–`04`.
+`01`–`06`.
 
 > This document replaces the original `PROJECT_SPEC.md`. Product intent is preserved
 > here; stack- and mechanism-level statements that later design decisions corrected
@@ -144,9 +144,9 @@ workspace on demand; the executor loads and uses them by its own native rules.
 Skill source priority: (1) user-specified, (2) current project, (3) user global skill
 dir, (4) Methodus built-in, (5) approved auto-generated. Default to read-only symlink
 or controlled materialization; any write into the global skill dir requires human
-approval. After a non-trivial task (several tool calls, or an explicit `/learn`),
-Methodus may draft a Candidate Skill for Review — it never silently installs a live
-skill the way some agent runtimes do.
+approval. After a non-trivial task (several tool calls, structured result, or a
+`/study` run), Methodus may draft a Candidate Skill for Review — it never silently
+installs a live skill the way some agent runtimes do.
 
 ### 3.6 Knowledge
 A reusable, relatively stable, sourced, confidence-scored entry. Records source
@@ -238,8 +238,8 @@ Experience + Knowledge + Hypothesis
 Question value combines at least `importance * frequency * impact * uncertainty`, with
 an interruption budget, cooldowns, and project relevance. Pending questions stay quiet
 while a session is running; when the user is idle, Methodus promotes the highest-value
-item to Asked, notifies, and opens the Review answer box. That idle ask is how the
-habit forms — not a Review page the user has to remember to open.
+item to Asked, notifies, and occupies the composer. That idle ask is how the
+habit forms — not an inbox the user has to remember to open.
 
 ## 5. Permission, approval, human-in-the-loop
 
@@ -247,11 +247,11 @@ Policy distinguishes at least: read-only file access; project-dir writes; shell
 execution; network/research; config change or skill install; global knowledge/skill
 writes; process deletion or forced termination.
 
-Default daily mode is **acceptEdits**: file edits auto-run (like Claude Code), so the
-user is not prompted on every write. Shell, network, global config, and other sensitive
-operations still pause. The user can cycle modes in Setup:
+Default daily mode is **acceptEdits** (goal / auto): routine reads, edits, shell,
+and fetch auto-run. **High-risk** ops still pause — file delete/rename (`rm`/`mv`),
+environment teardown, and system package install/uninstall. Cycle modes in Setup:
 
-- `acceptEdits` — daily; edits auto, sensitive ops still ask
+- `acceptEdits` — goal mode; destructive ops still ask
 - `plan` — read-only / analyze
 - `cautious` — ask on writes and shell (Claude `manual` + Methodus approval)
 
@@ -301,9 +301,10 @@ time or user idle). A queue job carries at least: `kind`, `priority`, `dedupe_ke
 MVP learning jobs: `extract_experience`, `detect_gaps`, `propose_knowledge`,
 `propose_skill` (never auto-overwrites existing entries). Skill drafts are written
 to `skills/.candidates/<name>/SKILL.md` and promote to `skills/<name>/` only after
-Review commit (or `methodus knowledge review <id> --decision commit`). Mid-task
-`/learn` (or `methodus learn skill <task-id>`) skips the “worthy” threshold and
-drafts immediately. Deferred: auto-research, Method synthesis, cross-Face debate.
+Review commit (or `methodus knowledge review <id> --decision commit`). The learning
+scheduler enqueues `propose_skill` when a task is skill-worthy (tool-call count,
+result shape) or after module-expert `/study`. Deferred: auto-research, Method
+synthesis, cross-Face debate.
 All jobs are pausable, retryable, cancelable, and recoverable after a restart.
 
 ## 8. CLI / TUI surface
@@ -311,19 +312,25 @@ All jobs are pausable, retryable, cancelable, and recoverable after a restart.
 The binary is the TUI. `methodus` (no subcommands) opens it and keeps the process
 running (typically in `tmux`). First launch seeds `~/.methodus`. There is no
 operational CLI: tasks, approvals, review, packs, project directories, and settings
-all happen on TUI pages.
+all happen in the TUI.
 
-Pages: **work** (tasks + session + approvals), **faces**, **review**, **setup**.
+The daily surface is a **session** (transcript + composer). The composer is the only
+operable surface and is in exactly one state at a time: type a message, pick a
+permission/knowledge choice, answer a question, or run a slash command. Faces, Setup,
+Inbox, and the task list are not pages — they are overlays opened with `/face`,
+`/setup`, `/inbox`, and `/session` (Tab). `1`–`4` are pick options, not page switches.
+Esc closes an overlay, then cancels pick/ask. Empty-input `[` `]` cycles conversations.
 
-Setup is where the user:
+Setup (`/setup`) is where the user:
 
 - cycles default runtime (Claude Code first) / permission mode (`acceptEdits` / `plan` / `cautious`) / workspace root
 - registers **project directories** (the user's repos; focus project is attached to new tasks)
 - registers **pack folders** (`pack.yaml`; focus / enable / disable)
 - sees a health check (home files, executor CLIs on PATH)
 
-Keyboard actions must be visible, cancelable, recoverable. The TUI is part of the
-same process as the Engine.
+Keyboard actions must be visible, cancelable, recoverable. The TUI is the **delivery
+shell** — same process as the Engine, typically kept open in `tmux`. Implementation
+chrome and component inventory: [`05-tui.md`](./05-tui.md).
 
 ## 9. Workspace & isolation (product rules)
 
@@ -350,6 +357,9 @@ task workspace. (Concrete layout: `03-data-model.md` §5.)
   product or into global Faces.
 - No complex web UI, cloud accounts, remote collaboration, vector search, or
   cross-device sync.
+- No desktop GUI shell (Tauri or equivalent) — the ratatui TUI is the product surface.
+- No cron/RSS/interval triggers that auto-run the executor without explicit human
+  confirmation (no autonomous always-on agent loop).
 - No unbudgeted background scheduler continuously calling the LLM.
 - No git pull / push / commit as a Methodus feature. Packs are folders; how a team
   copies them is outside the product.

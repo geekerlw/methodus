@@ -19,6 +19,7 @@ use crate::error::CoreError;
 
 pub const DEFAULT_BUDGET: &str = r#"{"max_ms":200,"tokens":0}"#;
 pub const SKILL_DRAFT_SOURCE: &str = "skill_draft";
+pub const MODULE_STUDY_SOURCE: &str = "module_study";
 pub const MAX_KNOWLEDGE_INJECT: usize = 5;
 const MAX_SNIPPET_CHARS: usize = 900;
 const MAX_BOOTSTRAP_ITEMS: usize = 3;
@@ -27,6 +28,9 @@ const MAX_ATTEMPTS: i64 = 3;
 const DEFAULT_IMPORTANCE: f64 = 0.6;
 const DEFAULT_IMPACT: f64 = 0.5;
 const DEFAULT_UNCERTAINTY: f64 = 0.8;
+const MENTOR_IMPORTANCE: f64 = 0.85;
+const MENTOR_IMPACT: f64 = 0.7;
+const MENTOR_UNCERTAINTY: f64 = 0.95;
 /// First-gap default value is 0.24; floor lets a new unknown surface when idle.
 pub const IDLE_VALUE_FLOOR: f64 = 0.2;
 
@@ -130,6 +134,17 @@ pub fn result_section(body: &str) -> String {
     out.join("\n")
 }
 
+/// Everything after `## Result` — keeps nested `##` headings (module study output).
+pub fn full_result_section(body: &str) -> String {
+    let lower = body.to_lowercase();
+    let needle = "## result";
+    let Some(idx) = lower.find(needle) else {
+        return String::new();
+    };
+    let rest = &body[idx + needle.len()..];
+    rest.trim_start_matches(['\n', '\r']).trim().to_string()
+}
+
 pub fn extract_knowledge_hints(body: &str) -> Vec<String> {
     let mut hints = Vec::new();
     let mut in_section = false;
@@ -167,6 +182,56 @@ pub fn select_committed_knowledge(
     face_id: &str,
     request: &str,
 ) -> Result<Vec<KnowledgeSnippet>, CoreError> {
+    select_committed_knowledge_multi(store, home, &[face_id], request)
+}
+
+pub fn select_committed_knowledge_multi(
+    store: &Store,
+    home: &Path,
+    face_ids: &[&str],
+    request: &str,
+) -> Result<Vec<KnowledgeSnippet>, CoreError> {
+    if face_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let per_face = (MAX_KNOWLEDGE_INJECT / face_ids.len().max(1)).max(2);
+    let mut out = Vec::new();
+    let mut used_names = Vec::new();
+    for face_id in face_ids {
+        let mut batch =
+            select_committed_knowledge_for_face(store, home, face_id, request, per_face)?;
+        for snip in batch.drain(..) {
+            let dest = if face_ids.len() > 1 {
+                format!("{}/{}", face_id, snip.dest_name)
+            } else {
+                snip.dest_name.clone()
+            };
+            if used_names.iter().any(|n: &String| n == &dest) {
+                continue;
+            }
+            used_names.push(dest.clone());
+            out.push(KnowledgeSnippet {
+                dest_name: dest,
+                ..snip
+            });
+            if out.len() >= MAX_KNOWLEDGE_INJECT {
+                break;
+            }
+        }
+        if out.len() >= MAX_KNOWLEDGE_INJECT {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn select_committed_knowledge_for_face(
+    store: &Store,
+    home: &Path,
+    face_id: &str,
+    request: &str,
+    limit: usize,
+) -> Result<Vec<KnowledgeSnippet>, CoreError> {
     let items = store.list_knowledge(Some(KnowledgeStatus::Committed))?;
     let mut scored: Vec<(usize, KnowledgeItem, String)> = Vec::new();
     for item in items {
@@ -197,20 +262,23 @@ pub fn select_committed_knowledge(
         scored
             .into_iter()
             .filter(|(s, _, _)| *s > 0)
-            .take(MAX_KNOWLEDGE_INJECT)
+            .take(limit)
             .collect::<Vec<_>>()
-    } else if scored.len() <= MAX_BOOTSTRAP_ITEMS {
+    } else if scored.len() <= MAX_BOOTSTRAP_ITEMS.min(limit) {
         scored
     } else {
         let mut recent = scored;
         recent.sort_by_key(|b| std::cmp::Reverse(b.1.updated_at));
-        recent.truncate(MAX_FALLBACK_RECENT);
+        recent.truncate(MAX_FALLBACK_RECENT.min(limit));
         recent
     };
 
     let mut out = Vec::new();
     let mut used_names = Vec::new();
     for (_, item, body) in chosen {
+        if out.len() >= limit {
+            break;
+        }
         let dest_name = unique_dest_name(&item.path, &item.id, &used_names);
         let stem = Path::new(&dest_name)
             .file_stem()
@@ -230,6 +298,7 @@ pub fn select_committed_knowledge(
         });
     }
     append_pack_knowledge(home, face_id, request, &mut out, &mut used_names);
+    out.truncate(limit);
     Ok(out)
 }
 
@@ -384,7 +453,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn emit(store: &Store, event_type: &str, task_id: Option<&str>, payload: serde_json::Value) {
+pub(crate) fn emit(store: &Store, event_type: &str, task_id: Option<&str>, payload: serde_json::Value) {
     let id = format!("ev_{}", short_id());
     let _ = store.insert_event(
         &id,
@@ -479,6 +548,12 @@ pub fn run_job(store: &Arc<Store>, home: &Path, job: &LearningJob) -> Result<(),
         JobKind::DetectGaps => run_detect(store, home, &refs)?,
         JobKind::ProposeKnowledge => run_propose(store, home, &refs)?,
         JobKind::ProposeSkill => run_propose_skill(store, home, &refs)?,
+        JobKind::SynthesizeKnowledge => crate::curiosity::run_synthesize_knowledge(store, home, &refs)?,
+        JobKind::AnalyzeKnowledgeGaps => {
+            crate::curiosity::run_analyze_knowledge_gaps(store, home, &refs)?
+        }
+        JobKind::AutoResearch => crate::curiosity::run_auto_research(store, home, &refs)?,
+        JobKind::SynthesizeMethod => crate::evolution::run_synthesize_method(store, home, &refs)?,
     }
     Ok(())
 }
@@ -492,15 +567,30 @@ fn run_extract(store: &Store, home: &Path, refs: &JobRefs) -> Result<(), CoreErr
         .get_experience(exp_id)?
         .ok_or_else(|| CoreError::Other(format!("experience not found: {exp_id}")))?;
     let body = fs::read_to_string(home.join(&exp.path)).unwrap_or_default();
-    let _gaps = extract_gaps(&body);
-    enqueue_job(
-        store,
-        JobKind::DetectGaps,
-        &format!("detect:{}", exp.id),
-        refs,
-        8,
-    )?;
+    let method_id = task_method_id(store, &exp.task_id);
+    if crate::curiosity::is_module_expert_experience(&body, method_id.as_deref()) {
+        crate::curiosity::enqueue_module_study_jobs(store, &exp, refs)?;
+    } else if method_id.as_deref() == Some(crate::ingest::DOC_INGEST_METHOD_ID) {
+        crate::ingest::enqueue_ingest_jobs(store, &exp, refs)?;
+    } else if method_id.as_deref() == Some(crate::ingest::REPO_SURVEY_METHOD_ID) {
+        crate::ingest::enqueue_survey_jobs(store, &exp, refs)?;
+    } else {
+        let _gaps = extract_gaps(&body);
+        enqueue_job(
+            store,
+            JobKind::DetectGaps,
+            &format!("detect:{}", exp.id),
+            refs,
+            8,
+        )?;
+    }
     Ok(())
+}
+
+fn task_method_id(store: &Store, task_id: &str) -> Option<String> {
+    let task = store.get_task(task_id).ok()??;
+    let resolution = crate::resolution::Resolution::parse_json(task.resolution.as_deref()?)?;
+    resolution.method.map(|m| m.id)
 }
 
 fn run_detect(store: &Store, home: &Path, refs: &JobRefs) -> Result<(), CoreError> {
@@ -512,15 +602,28 @@ fn run_detect(store: &Store, home: &Path, refs: &JobRefs) -> Result<(), CoreErro
         .get_experience(exp_id)?
         .ok_or_else(|| CoreError::Other(format!("experience not found: {exp_id}")))?;
     let body = fs::read_to_string(home.join(&exp.path)).unwrap_or_default();
-    let gaps = extract_gaps(&body);
+    let mut gaps = extract_gaps(&body);
+    if gaps.is_empty() && exp.outcome.as_deref() == Some("failed") {
+        let result = result_section(&body);
+        let fallback = result
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("the last run failed");
+        let sig = normalize_gap(fallback);
+        if !sig.is_empty() {
+            gaps.push(sig);
+        }
+    }
     let hints = extract_knowledge_hints(&body);
+    let result = result_section(&body);
     let face = exp.face_id.clone().or_else(|| refs.face_id.clone());
 
     for gap in &gaps {
         upsert_question(store, gap, &exp, face.as_deref())?;
     }
 
-    if !gaps.is_empty() || !hints.is_empty() {
+    if !gaps.is_empty() || !hints.is_empty() || result.trim().chars().count() >= 20 {
         let mut propose_refs = refs.clone();
         propose_refs.source = Some("experience".to_string());
         enqueue_job(
@@ -609,6 +712,103 @@ fn upsert_question(
     Ok(())
 }
 
+/// Mentor-facing question from module study or knowledge uncertainty.
+pub fn upsert_mentor_question(
+    store: &Store,
+    text: &str,
+    reason_detail: &str,
+    exp: &Experience,
+    face: Option<&str>,
+) -> Result<(), CoreError> {
+    let question = text.trim();
+    if question.is_empty() {
+        return Ok(());
+    }
+    let now = Utc::now();
+    if let Some(mut existing) = store.find_question_by_text(question, face)? {
+        if existing.status == QuestionStatus::Answered
+            || existing.status == QuestionStatus::Dismissed
+        {
+            return Ok(());
+        }
+        existing.frequency += 1.0;
+        existing.value = question_value(
+            existing.importance,
+            existing.frequency,
+            existing.impact,
+            existing.uncertainty,
+        );
+        existing.updated_at = now;
+        if existing.reason.as_deref().is_none_or(|r| r.is_empty()) {
+            existing.reason = Some(format!("mentor: {reason_detail}"));
+        }
+        store.update_question(&existing)?;
+        return Ok(());
+    }
+
+    let freq = 1.0;
+    let value = question_value(MENTOR_IMPORTANCE, freq, MENTOR_IMPACT, MENTOR_UNCERTAINTY);
+    let q = Question {
+        id: format!("q_{}", short_id()),
+        question: question.to_string(),
+        reason: Some(format!("mentor: {reason_detail}")),
+        task_id: Some(exp.task_id.clone()),
+        face_id: face.map(str::to_string),
+        importance: MENTOR_IMPORTANCE,
+        frequency: freq,
+        impact: MENTOR_IMPACT,
+        uncertainty: MENTOR_UNCERTAINTY,
+        value,
+        status: QuestionStatus::Pending,
+        not_before: None,
+        answer: None,
+        created_at: now,
+        updated_at: now,
+    };
+    store.insert_question(&q)?;
+    emit(
+        store,
+        "question.created",
+        Some(&exp.task_id),
+        serde_json::json!({
+            "question_id": q.id,
+            "value": q.value,
+            "audience": "mentor",
+            "source": "module_study",
+        }),
+    );
+    Ok(())
+}
+
+pub fn write_candidate_from_study(
+    store: &Store,
+    home: &Path,
+    face: &str,
+    title: &str,
+    content: &str,
+    exp: &Experience,
+    refs: &JobRefs,
+) -> Result<(), CoreError> {
+    let sources = crate::curiosity::extract_section(content, &["Sources"]);
+    let mut body = content.to_string();
+    if !sources.is_empty() {
+        body = format!("{content}\n\n## Sources (inline)\n\n{sources}");
+    }
+    write_candidate(
+        store,
+        home,
+        face,
+        title,
+        &body,
+        MODULE_STUDY_SOURCE,
+        Some(&exp.task_id),
+        Some(&exp.id),
+        0.65,
+    )?;
+    let _ = refs;
+    Ok(())
+}
+
 fn run_propose(store: &Store, home: &Path, refs: &JobRefs) -> Result<(), CoreError> {
     if let Some(qid) = refs.question_id.as_deref() {
         return propose_from_question(store, home, qid);
@@ -624,16 +824,43 @@ fn propose_from_experience(store: &Store, home: &Path, exp_id: &str) -> Result<(
     let exp = store
         .get_experience(exp_id)?
         .ok_or_else(|| CoreError::Other(format!("experience not found: {exp_id}")))?;
+    if let Some(method) = task_method_id(store, &exp.task_id) {
+        if method == crate::ingest::DOC_INGEST_METHOD_ID {
+            return crate::ingest::propose_project_from_experience(
+                store,
+                home,
+                exp_id,
+                crate::ingest::DOC_INGEST_SOURCE,
+            );
+        }
+        if method == crate::ingest::REPO_SURVEY_METHOD_ID {
+            return crate::ingest::propose_project_from_experience(
+                store,
+                home,
+                exp_id,
+                crate::ingest::REPO_SURVEY_SOURCE,
+            );
+        }
+    }
     let body = fs::read_to_string(home.join(&exp.path)).unwrap_or_default();
+    let result = result_section(&body);
     let mut chunks = extract_knowledge_hints(&body);
     if chunks.is_empty() {
         chunks = extract_gaps(&body);
     }
     if chunks.is_empty() {
-        return Ok(());
+        let trimmed = result.trim();
+        if trimmed.chars().count() < 20 {
+            return Ok(());
+        }
+        let title_line = trimmed
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("task result");
+        chunks.push(ellipsize_desc(title_line));
     }
     let title = chunks[0].clone();
-    let result = result_section(&body);
     let content = if result.trim().is_empty() {
         chunks.join("\n\n")
     } else {
@@ -675,7 +902,7 @@ fn propose_from_question(store: &Store, home: &Path, question_id: &str) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_candidate(
+pub(crate) fn write_candidate(
     store: &Store,
     home: &Path,
     face: &str,
@@ -839,36 +1066,9 @@ fn write_at(
     Ok(())
 }
 
-pub fn is_learn_request(text: &str) -> bool {
-    let t = text.trim().to_lowercase();
-    t == "/learn"
-        || t.starts_with("/learn ")
-        || t.contains("沉淀成技能")
-        || t.contains("沉淀为技能")
-        || t.contains("save this as a skill")
-        || t.contains("save as a skill")
-}
-
-pub fn learn_hint(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    let rest = if let Some(r) = trimmed.strip_prefix("/learn") {
-        r.trim()
-    } else if let Some(r) = trimmed.strip_prefix("沉淀成技能") {
-        r.trim()
-    } else if let Some(r) = trimmed.strip_prefix("沉淀为技能") {
-        r.trim()
-    } else {
-        ""
-    };
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest.to_string())
-    }
-}
-
-/// Draft a candidate skill from a live task (explicit `/learn`).
-pub fn propose_skill_from_task(
+/// Force a skill draft from a task (tests). Never writes a live skill.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn propose_skill_from_task(
     store: &Store,
     home: &Path,
     task_id: &str,
@@ -882,12 +1082,16 @@ pub fn propose_skill_from_task(
         task_id: Some(task.id.clone()),
         face_id: face_from_task(&task),
         question_id: None,
-        source: Some("user_learn".to_string()),
+        source: Some("task_distill".to_string()),
     };
     write_skill_candidate(store, home, &refs, hint, true)
 }
 
-pub fn install_skill_draft(home: &Path, item: &KnowledgeItem) -> Result<String, CoreError> {
+pub fn install_skill_draft(
+    home: &Path,
+    item: &KnowledgeItem,
+    replace: bool,
+) -> Result<String, CoreError> {
     if item.source != SKILL_DRAFT_SOURCE {
         return Ok(item.path.clone());
     }
@@ -899,9 +1103,9 @@ pub fn install_skill_draft(home: &Path, item: &KnowledgeItem) -> Result<String, 
     }
     let live_rel = format!("skills/{name}/SKILL.md");
     let live_abs = home.join(&live_rel);
-    if live_abs.exists() {
+    if live_abs.exists() && !replace {
         return Err(CoreError::Other(format!(
-            "skill `{name}` already exists at {live_rel}; left as conflict"
+            "skill `{name}` already exists at {live_rel} — use replace in /inbox"
         )));
     }
     let promoted = body.replace("status: candidate", "status: committed");
@@ -995,12 +1199,31 @@ fn write_skill_candidate(
     let result = if let Some(eid) = refs.experience_id.as_deref() {
         store
             .get_experience(eid)?
-            .and_then(|e| fs::read_to_string(home.join(&e.path)).ok())
-            .map(|b| result_section(&b))
+            .map(|e| {
+                let body = fs::read_to_string(home.join(&e.path)).unwrap_or_default();
+                let method_id = task_method_id(store, &e.task_id);
+                if crate::curiosity::is_module_expert_experience(&body, method_id.as_deref()) {
+                    full_result_section(&body)
+                } else {
+                    result_section(&body)
+                }
+            })
             .unwrap_or_default()
     } else {
         String::new()
     };
+    let study_skill = refs.experience_id.as_deref().is_some_and(|eid| {
+        store
+            .get_experience(eid)
+            .ok()
+            .flatten()
+            .is_some_and(|e| {
+                let body = fs::read_to_string(home.join(&e.path)).unwrap_or_default();
+                let method_id = task_method_id(store, &e.task_id);
+                crate::curiosity::is_module_expert_experience(&body, method_id.as_deref())
+            })
+    });
+    let explicit = explicit || study_skill;
     if !explicit && !skill_worthy(&result, tools.len()) {
         return Ok(None);
     }
@@ -1280,6 +1503,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_result_becomes_candidate_and_failed_run_asks() {
+        use crate::scheduler;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("state.db")).unwrap());
+        let now = Utc::now();
+        let rel = "faces/general/experiences/exp_plain.md";
+        fs::create_dir_all(dir.path().join("faces/general/experiences")).unwrap();
+        fs::write(
+            dir.path().join(rel),
+            "# Experience `exp_plain`\n\n\
+             - outcome: success\n\n\
+             ## Request\n\nfix the latch\n\n\
+             ## Result\n\n\
+             The latch on the carrier board uses gpio 4 with a 3.3V pull-up.\n",
+        )
+        .unwrap();
+        store
+            .insert_experience(&Experience {
+                id: "exp_plain".into(),
+                task_id: "task_plain".into(),
+                face_id: Some("general".into()),
+                path: rel.into(),
+                content_hash: "h".into(),
+                outcome: Some("success".into()),
+                summary: Some("The latch on the carrier board uses gpio 4.".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        enqueue_extract(&store, &store.get_experience("exp_plain").unwrap().unwrap()).unwrap();
+        scheduler::tick(&store, dir.path()).unwrap();
+        let cands = store
+            .list_knowledge(Some(KnowledgeStatus::Candidate))
+            .unwrap();
+        assert!(
+            cands.iter().any(|k| k.source == "experience"),
+            "plain result should become candidate knowledge"
+        );
+        assert!(store.list_questions(None).unwrap().is_empty());
+
+        let fail_rel = "faces/general/experiences/exp_fail.md";
+        fs::write(
+            dir.path().join(fail_rel),
+            "# Experience `exp_fail`\n\n\
+             - outcome: failed\n\n\
+             ## Result\n\n\
+             executor timed out talking to the probe\n",
+        )
+        .unwrap();
+        store
+            .insert_experience(&Experience {
+                id: "exp_fail".into(),
+                task_id: "task_fail".into(),
+                face_id: Some("general".into()),
+                path: fail_rel.into(),
+                content_hash: "h2".into(),
+                outcome: Some("failed".into()),
+                summary: Some("executor timed out talking to the probe".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        enqueue_extract(&store, &store.get_experience("exp_fail").unwrap().unwrap()).unwrap();
+        scheduler::tick(&store, dir.path()).unwrap();
+        let qs = store.list_questions(None).unwrap();
+        assert!(
+            qs.iter().any(|q| q.question.contains("timed out")),
+            "failed run should open a question: {qs:?}"
+        );
+    }
+
+    #[test]
     fn gap_lines_and_slug() {
         let body = "# Experience\n\n## Result\n\nunknown: latch protocol\nall good\n";
         let gaps = extract_gaps(body);
@@ -1300,23 +1597,14 @@ mod tests {
     }
 
     #[test]
-    fn learn_request_and_worthy_heuristic() {
-        assert!(is_learn_request("/learn"));
-        assert!(is_learn_request("/learn cpu-sample"));
-        assert!(is_learn_request("请沉淀成技能"));
-        assert!(is_learn_request("save this as a skill"));
-        assert!(!is_learn_request("learn about rust"));
-        assert_eq!(
-            learn_hint("/learn cpu-sample").as_deref(),
-            Some("cpu-sample")
-        );
+    fn skill_worthy_heuristic() {
         assert!(skill_worthy("", 3));
         assert!(!skill_worthy("done", 0));
         assert!(skill_worthy("- a\n- b\n- c\n", 0));
     }
 
     #[test]
-    fn explicit_learn_writes_candidate_and_install_promotes() {
+    fn skill_draft_writes_candidate_and_install_promotes() {
         use methodus_domain::{Task, TaskStatus};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1347,14 +1635,15 @@ mod tests {
         assert!(draft.contains("status: candidate"));
         assert!(draft.contains("cpu-sample"));
 
-        let live = install_skill_draft(dir.path(), &item).unwrap();
+        let live = install_skill_draft(dir.path(), &item, false).unwrap();
         assert_eq!(
             live,
             format!("skills/{}/SKILL.md", skill_slug("cpu-sample", &task.id))
         );
         let live_body = fs::read_to_string(dir.path().join(&live)).unwrap();
         assert!(live_body.contains("status: committed"));
-        assert!(install_skill_draft(dir.path(), &item).is_err());
+        assert!(install_skill_draft(dir.path(), &item, false).is_err());
+        assert!(install_skill_draft(dir.path(), &item, true).is_ok());
     }
 
     #[test]
@@ -1446,5 +1735,66 @@ mod tests {
             .insert_question(&sample_question("q_tiny", 0.01, QuestionStatus::Pending))
             .unwrap();
         assert!(promote_idle_question(&store).unwrap().is_none());
+    }
+
+    #[test]
+    fn module_study_synthesizes_knowledge_and_mentor_questions() {
+        use crate::scheduler;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("state.db")).unwrap());
+        let now = Utc::now();
+        let rel = "faces/general/experiences/exp_study.md";
+        fs::create_dir_all(dir.path().join("faces/general/experiences")).unwrap();
+        fs::create_dir_all(dir.path().join("faces/general/knowledge")).unwrap();
+        let result = "## Sources\n\n- `src/main.c`\n\n\
+             ## Knowledge\n\n### Boot\n\nCalls init(). TBD: clock source.\n\n\
+             ## Open Questions (for Mentor)\n\n\
+             - Which clock source on rev B?\n";
+        fs::write(
+            dir.path().join(rel),
+            format!(
+                "# Experience `exp_study`\n\n\
+                 - task: `task_study`\n\
+                 - face: `general`\n\
+                 - outcome: success\n\
+                 - mode: module_expert\n\
+                 - created: {}\n\n\
+                 ## Request\n\nstudy boot\n\n\
+                 ## Result\n\n{result}",
+                now.to_rfc3339()
+            ),
+        )
+        .unwrap();
+        store
+            .insert_experience(&Experience {
+                id: "exp_study".into(),
+                task_id: "task_study".into(),
+                face_id: Some("general".into()),
+                path: rel.into(),
+                content_hash: "h".into(),
+                outcome: Some("success".into()),
+                summary: Some("study boot".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        enqueue_extract(&store, &store.get_experience("exp_study").unwrap().unwrap()).unwrap();
+        scheduler::tick(&store, dir.path()).unwrap();
+
+        let cands = store
+            .list_knowledge(Some(KnowledgeStatus::Candidate))
+            .unwrap();
+        assert!(
+            cands.iter().any(|k| k.source == MODULE_STUDY_SOURCE),
+            "expected module_study candidate, got {cands:?}"
+        );
+        let qs = store.list_questions(None).unwrap();
+        assert!(
+            qs.iter()
+                .any(|q| q.question.contains("clock source") && q.reason.as_deref().is_some_and(|r| r.starts_with("mentor:"))),
+            "expected mentor question, got {qs:?}"
+        );
     }
 }

@@ -18,7 +18,7 @@ mod tui;
     version,
     about = "Persistent Personal Expert System",
     long_about = "Opens the Methodus TUI. Keep this process running (e.g. in tmux).\n\
-                  First launch creates ~/.methodus. Projects, packs, and settings live on the setup page."
+                  First launch creates ~/.methodus. Projects, packs, and settings live in /setup."
 )]
 struct Cli {}
 

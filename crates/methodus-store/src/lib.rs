@@ -1,3 +1,6 @@
+pub mod catalog;
+pub mod evolution;
+pub mod hypothesis;
 pub mod learning;
 pub mod migration;
 pub mod store;

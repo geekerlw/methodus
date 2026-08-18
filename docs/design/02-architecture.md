@@ -23,9 +23,8 @@ requirement:
 
 - Methodus must keep working with **no window open at all** (true unattended service).
 - **Multiple simultaneous clients** need to talk to the same live brain.
-- A **desktop (Tauri) client** should attach to the same running core.
 
-Until then: single process. See §4 and `04-roadmap.md`.
+Until then: single process, TUI in `tmux`. See §4 and `04-roadmap.md`.
 
 ## 1. Why Rust
 
@@ -41,8 +40,6 @@ personal infrastructure, not a throwaway prototype:
   `match` express these precisely and catch missing transitions at compile time.
 - **Low external-IO complexity** — Methodus mostly spawns CLIs, reads/writes files,
   and talks SQLite. It does not need the npm ecosystem.
-- **Future desktop client** — a Tauri app can reuse the Rust core directly, with no
-  bridge layer, *if* the optional client split is ever added.
 
 Accepted cost: ~2–3× slower initial development than TypeScript. Worth it for a tool
 meant to be maintained and trusted over years.

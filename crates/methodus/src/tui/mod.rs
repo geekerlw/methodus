@@ -1,12 +1,19 @@
 //! In-process ratatui UI. Observes the Engine; does not own session lifecycle.
 
 mod app;
+mod fuzzy;
+mod md;
 mod ui;
+mod util;
 
 use std::io::stdout;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyboardEnhancementFlags, KeyEventKind, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -16,6 +23,7 @@ use methodus_core::{Engine, InstanceLock, RecoveredSession};
 use ratatui::prelude::{CrosstermBackend, Terminal};
 
 use app::{App, Command, StatusLevel};
+use crate::notify::NotifyUrgency;
 
 pub async fn run(
     engine: Engine,
@@ -24,6 +32,12 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    stdout().execute(EnableMouseCapture)?;
+    stdout().execute(EnableBracketedPaste)?;
+    let _ = stdout().execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+    ));
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -31,6 +45,9 @@ pub async fn run(
     let result = run_loop(&mut terminal, engine, recovered).await;
 
     disable_raw_mode()?;
+    let _ = stdout().execute(PopKeyboardEnhancementFlags);
+    stdout().execute(DisableBracketedPaste)?;
+    stdout().execute(DisableMouseCapture)?;
     stdout().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
@@ -142,13 +159,58 @@ async fn run_loop(
                 }
                 Err(e) => app.set_status(StatusLevel::Error, format!("cancel failed: {e}")),
             },
-            Command::ReviewKnowledge { id, commit } => {
-                match app.engine.review_knowledge(&id, commit) {
+            Command::Delete { task_id } => match app.engine.delete_task(&task_id) {
+                Ok(()) => {
+                    if app.session_task_id.as_deref() == Some(task_id.as_str()) {
+                        app.session_task_id = None;
+                        app.event_rx = None;
+                        app.transcript.clear();
+                    }
+                    app.set_status(StatusLevel::Ok, format!("deleted {task_id}"));
+                    app.refresh();
+                }
+                Err(e) => app.set_status(StatusLevel::Error, format!("delete failed: {e}")),
+            },
+            Command::ReviewKnowledge { id, action } => {
+                match app.engine.review_knowledge(&id, action) {
                     Ok(item) => {
+                        app.knowledge_pick_id = None;
+                        if app.inbox_detail_open() {
+                            app.close_inbox_detail();
+                        }
                         app.set_status(StatusLevel::Ok, format!("{} → {}", item.id, item.status));
                         app.refresh();
                     }
                     Err(e) => app.set_status(StatusLevel::Error, format!("review failed: {e}")),
+                }
+            }
+            Command::ReviewEvolution { id, approve } => {
+                match app.engine.review_evolution(&id, approve) {
+                    Ok(item) => {
+                        app.evolution_pick_id = None;
+                        if app.inbox_detail_open() {
+                            app.close_inbox_detail();
+                        }
+                        app.set_status(
+                            StatusLevel::Ok,
+                            format!("{} → {} (face `{}`)", item.id, item.status, item.target_id),
+                        );
+                        app.refresh();
+                    }
+                    Err(e) => app.set_status(StatusLevel::Error, format!("evolution failed: {e}")),
+                }
+            }
+            Command::ReviewHypothesis { id, action } => {
+                match app.engine.review_hypothesis(&id, action) {
+                    Ok(item) => {
+                        app.hypothesis_pick_id = None;
+                        if app.inbox_detail_open() {
+                            app.close_inbox_detail();
+                        }
+                        app.set_status(StatusLevel::Ok, format!("{} → {}", item.id, item.status));
+                        app.refresh();
+                    }
+                    Err(e) => app.set_status(StatusLevel::Error, format!("hypothesis failed: {e}")),
                 }
             }
             Command::AnswerQuestion { id, text } => match app.engine.answer_question(&id, &text) {
@@ -158,6 +220,9 @@ async fn run_loop(
                     app.input.clear();
                     app.input_error = None;
                     app.answering_id = None;
+                    if app.inbox_detail_open() {
+                        app.close_inbox_detail();
+                    }
                     app.refresh();
                 }
                 Err(e) => {
@@ -168,6 +233,9 @@ async fn run_loop(
             Command::SnoozeQuestion { id } => match app.engine.snooze_question(&id) {
                 Ok(q) => {
                     app.set_status(StatusLevel::Ok, format!("{} snoozed", q.id));
+                    if app.inbox_detail_open() {
+                        app.close_inbox_detail();
+                    }
                     app.refresh();
                 }
                 Err(e) => app.set_status(StatusLevel::Error, format!("snooze failed: {e}")),
@@ -175,26 +243,140 @@ async fn run_loop(
             Command::DismissQuestion { id } => match app.engine.dismiss_question(&id) {
                 Ok(q) => {
                     app.set_status(StatusLevel::Ok, format!("{} dismissed", q.id));
+                    if app.inbox_detail_open() {
+                        app.close_inbox_detail();
+                    }
                     app.refresh();
                 }
                 Err(e) => app.set_status(StatusLevel::Error, format!("dismiss failed: {e}")),
             },
-            Command::LearnSkill { task_id, hint } => {
-                match app.engine.learn_skill(&task_id, hint.as_deref()) {
-                    Ok(item) => {
+            Command::CompleteReview { task_id } => match app.engine.complete_review(&task_id) {
+                Ok(task) => {
+                    app.set_status(StatusLevel::Ok, format!("{} → {}", task.id, task.status));
+                    if app.inbox_detail_open() {
+                        app.close_inbox_detail();
+                    }
+                    app.refresh();
+                }
+                Err(e) => app.set_status(StatusLevel::Error, format!("review done failed: {e}")),
+            },
+            Command::StudyModule { scope, sources, face } => {
+                if app.busy() {
+                    app.set_status(StatusLevel::Warn, "wait until this turn ends");
+                    continue;
+                }
+                match app.engine.create_study_task(&scope, &sources, face.as_deref()) {
+                    Ok(task) => {
+                        let id = task.id.clone();
+                        app.session_task_id = None;
+                        app.event_rx = None;
+                        app.transcript.clear();
                         app.input.clear();
                         app.input_error = None;
-                        app.page = app::Page::Review;
-                        app.refresh();
-                        app.set_status(
-                            StatusLevel::Ok,
-                            format!("{} drafted — y to commit on review", item.id),
-                        );
+                        match app.engine.run_task(&id, false).await {
+                            Ok(rx) => {
+                                app.attach_session(id, rx);
+                                app.set_status(
+                                    StatusLevel::Info,
+                                    format!("module study — {scope}"),
+                                );
+                                app.refresh();
+                            }
+                            Err(e) => {
+                                app.input_error = Some(e.to_string());
+                                app.set_status(StatusLevel::Error, format!("study failed: {e}"));
+                            }
+                        }
                     }
                     Err(e) => {
                         app.input_error = Some(e.to_string());
-                        app.set_status(StatusLevel::Error, format!("learn failed: {e}"));
+                        app.set_status(StatusLevel::Error, format!("study failed: {e}"));
                     }
+                }
+            }
+            Command::IngestDocs { sources } => {
+                if app.busy() {
+                    app.set_status(StatusLevel::Warn, "wait until this turn ends");
+                    continue;
+                }
+                match app.engine.create_ingest_task(&sources) {
+                    Ok(task) => {
+                        let id = task.id.clone();
+                        app.session_task_id = None;
+                        app.event_rx = None;
+                        app.transcript.clear();
+                        app.input.clear();
+                        app.input_error = None;
+                        match app.engine.run_task(&id, false).await {
+                            Ok(rx) => {
+                                app.attach_session(id, rx);
+                                app.set_status(StatusLevel::Info, "doc ingest — running");
+                                app.refresh();
+                            }
+                            Err(e) => {
+                                app.input_error = Some(e.to_string());
+                                app.set_status(StatusLevel::Error, format!("ingest failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.input_error = Some(e.to_string());
+                        app.set_status(StatusLevel::Error, format!("ingest failed: {e}"));
+                    }
+                }
+            }
+            Command::SurveyRepo => {
+                if app.busy() {
+                    app.set_status(StatusLevel::Warn, "wait until this turn ends");
+                    continue;
+                }
+                match app.engine.create_survey_task() {
+                    Ok(task) => {
+                        let id = task.id.clone();
+                        app.session_task_id = None;
+                        app.event_rx = None;
+                        app.transcript.clear();
+                        app.input.clear();
+                        app.input_error = None;
+                        match app.engine.run_task(&id, false).await {
+                            Ok(rx) => {
+                                app.attach_session(id, rx);
+                                app.set_status(StatusLevel::Info, "repo survey — running");
+                                app.refresh();
+                            }
+                            Err(e) => {
+                                app.input_error = Some(e.to_string());
+                                app.set_status(StatusLevel::Error, format!("survey failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.input_error = Some(e.to_string());
+                        app.set_status(StatusLevel::Error, format!("survey failed: {e}"));
+                    }
+                }
+            }
+            Command::CleanupWorkspaces { max_age_days } => {
+                match app.engine.cleanup_workspaces(max_age_days) {
+                    Ok(n) => {
+                        app.set_status(
+                            StatusLevel::Ok,
+                            format!("removed {n} workspace dir(s) older than {max_age_days}d"),
+                        );
+                        app.refresh();
+                    }
+                    Err(e) => app.set_status(StatusLevel::Error, format!("cleanup failed: {e}")),
+                }
+            }
+            Command::CancelLearningJob { id } => {
+                match app.engine.cancel_learning_job(&id) {
+                    Ok(true) => {
+                        app.set_status(StatusLevel::Ok, format!("cancelled job {id}"));
+                        app.refresh_system_lists();
+                        app.refresh();
+                    }
+                    Ok(false) => app.set_status(StatusLevel::Warn, format!("job {id} not cancellable")),
+                    Err(e) => app.set_status(StatusLevel::Error, format!("cancel failed: {e}")),
                 }
             }
         }
@@ -207,7 +389,34 @@ fn key_command(app: &mut App, ev: Option<Result<Event, std::io::Error>>) -> Comm
         Some(Ok(Event::Key(key)))
             if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
         {
+            app.touch_user_input();
             app.handle_key(key)
+        }
+        Some(Ok(Event::Paste(text))) => {
+            app.touch_user_input();
+            app.insert_paste(&text);
+            Command::None
+        }
+        Some(Ok(Event::Mouse(mouse))) => {
+            app.touch_user_input();
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if app.inbox_detail_open() {
+                        app.scroll_review_detail(-3);
+                    } else {
+                        app.scroll_session(1);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if app.inbox_detail_open() {
+                        app.scroll_review_detail(3);
+                    } else {
+                        app.scroll_session(-1);
+                    }
+                }
+                _ => {}
+            }
+            Command::None
         }
         Some(Err(e)) => {
             app.set_status(StatusLevel::Error, format!("input error: {e}"));
@@ -221,13 +430,21 @@ async fn recv_runtime(app: &mut App) -> Option<methodus_domain::RuntimeEvent> {
     match app.event_rx.as_mut() {
         Some(rx) => match rx.recv().await {
             Some(ev) => Some(ev),
-            None => {
-                app.event_rx = None;
-                app.set_status(StatusLevel::Ok, "your turn — type a follow-up");
-                app.notify("turn", "your turn — type a follow-up");
-                app.refresh();
-                None
-            }
+                None => {
+                    app.event_rx = None;
+                    app.set_status(
+                        StatusLevel::Ok,
+                        "your turn — type below · /inbox",
+                    );
+                    let task = app.session_task_id.as_deref().unwrap_or("session");
+                    app.notify(
+                        &format!("turn:{task}"),
+                        NotifyUrgency::Low,
+                        &format!("[{task}] your turn — type a follow-up"),
+                    );
+                    app.refresh();
+                    None
+                }
         },
         None => std::future::pending().await,
     }

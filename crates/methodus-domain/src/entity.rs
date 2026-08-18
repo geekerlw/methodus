@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::status::{
-    JobKind, JobStatus, KnowledgeStatus, QuestionStatus, SessionStatus, TaskStatus,
+    EvolutionStatus, HypothesisStatus, JobKind, JobStatus, KnowledgeStatus, QuestionStatus,
+    SessionStatus, TaskStatus,
 };
 
 /// A user-submitted task that Methodus orchestrates through an executor.
@@ -126,6 +127,33 @@ pub struct LearningJob {
     pub not_before: Option<DateTime<Utc>>,
     pub budget: Option<String>,
     pub requires_approval: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Indexed hypothesis. Body lives at `path` under Methodus home.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Hypothesis {
+    pub id: String,
+    pub face_id: Option<String>,
+    pub path: String,
+    pub content_hash: String,
+    pub confidence: Option<f64>,
+    pub status: HypothesisStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Proposed upgrade to a Face, Method, Skill, or Knowledge entry (`00-product.md` §3.10).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EvolutionCandidate {
+    pub id: String,
+    pub target_kind: String, // face|method|skill|knowledge
+    pub target_id: String,
+    pub diff: String, // JSON payload
+    pub rationale: Option<String>,
+    pub source: Option<String>,
+    pub status: EvolutionStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

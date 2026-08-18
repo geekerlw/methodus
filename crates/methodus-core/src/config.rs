@@ -1,4 +1,4 @@
-//! User config from `<METHODUS_HOME>/config.yaml`. Edited from the TUI setup page.
+//! User config from `<METHODUS_HOME>/config.yaml`. Edited from `/setup`.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,9 @@ pub struct UserConfig {
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_face: Option<String>,
+    /// Additional Faces whose committed knowledge is injected alongside the primary Face.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_faces: Option<Vec<String>>,
     /// Per-task executor cwd root. Unset → `<home>/workspaces`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
@@ -148,6 +151,7 @@ mod tests {
             default_runtime: Some("codex".into()),
             permission_mode: Some("plan".into()),
             default_face: Some("network".into()),
+            context_faces: Some(vec!["storage".into()]),
             workspace_root: Some("/data/runs".into()),
             notifications: Some(true),
         };

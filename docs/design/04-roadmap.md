@@ -112,13 +112,15 @@ on Codex by switching `--runtime`. Process restart during a session recovers sta
 Make the daily-driver UI real so dogfooding is pleasant (this is what drives
 knowledge accumulation). The TUI is part of the **same process** as the Engine.
 
-**Scope:** `ratatui` TUI subscribing to the in-process event bus — Dashboard
-(queue/tasks/pending approvals/pending questions), Tasks, Session (live transcript +
-input + approve), Faces. Because UI and Engine share a process, "the TUI is the app";
-keep it open in `tmux` to keep Methodus running.
+**Scope:** `ratatui` agent chat (see [`05-tui.md`](./05-tui.md)) — transcript + composer
+(multiline, lightweight markdown), floating overlays (`/session` `/face` `/inbox`
+`/setup`) with type-to-filter, permission/knowledge picks in the composer. Not a
+multi-page dashboard; not Ink/pi-tui. Because UI and Engine share a process, "the TUI
+is the app"; keep it open in `tmux` to keep Methodus running.
 
 **Acceptance:** the full task loop (create → resolve → run → approve → view result) is
-completable from the TUI; detaching the `tmux` window keeps sessions running.
+completable from the TUI; detaching the `tmux` window keeps sessions running; overlays
+do not wipe the conversation underneath.
 
 > **Dogfood gate:** from M3 on, use Methodus for real work (e.g. NXM/embedded tasks).
 > This produces the Experience corpus that M4 depends on.
@@ -132,7 +134,7 @@ Only now, and only with a real Experience corpus from dogfooding.
 **Scope (the Learning + Curiosity loops, `00-product.md` §4.2–4.3):** Learning Queue + scheduler (event/threshold/idle);
 `extract_experience` → `detect_gaps` → `propose_knowledge` / `propose_skill`; Question state machine +
 valuation; candidate Knowledge with conflict detection; Candidate Skills land in
-`skills/.candidates/` and promote only on Review commit; TUI Review page + `/learn`.
+`skills/.candidates/` and promote only on Review commit; TUI `/inbox` overlay.
 Team **packs** as Methodus-format folders: register paths in `packs.yaml`,
 focus / enable / disable; resolution overlays personal home on packs. Copying folders
 (git, USB, shared drive) is outside Methodus — no pull/push/commit in the product.
@@ -157,12 +159,32 @@ Multi-Face composition & dynamic Methods; Evolution with human-approved
 versioned upgrades; pack promote / PR-style contribution back to a team folder
 (still not git inside Methodus); repo-survey as a Method that writes **project**
 knowledge (not global Faces); Codex **app-server** full `InteractiveRuntime`
-(real-time approval + interrupt + steer); advanced collaboration,
-research, desktop (Tauri) client, remote nodes.
+(real-time approval + interrupt + steer); advanced collaboration and research.
 
-The Codex app-server client and a future Tauri desktop client are enabled by the
-architecture (structured event streams, UI-free core) but are **not** MVP. A desktop
-client is also one of the triggers that would justify the optional daemon/client split.
+The Codex app-server client is enabled by the architecture (structured event
+streams, UI-free core) but is **not** MVP. The optional daemon/client split is
+revisited only if unattended service or multiple clients becomes a hard requirement
+(see M4 note).
+
+### Explicitly dropped (2026-08)
+
+**Desktop app (Tauri)** — removed. The ratatui TUI is the delivery shell; a second
+GUI duplicated TUI parity without adding product value for the primary user
+(user-triggered work in `tmux`). Do not reintroduce without a new audience or
+surface requirement.
+
+**Autonomous scheduled executor** — cron/RSS/interval triggers that call
+`run_task` without human confirmation are out of scope. They mirror the
+always-on agent pattern (high token burn, low trust) that the market has moved
+away from. Allowed instead:
+
+- **Post-task learning** — event-driven, budgeted jobs after the user finishes work.
+- **Curiosity** — idle promotion of a Question to the composer; OS notify when away.
+- **Human-gated hooks** — file/git events may enqueue *reminders* or Inbox items,
+  not silent executor runs.
+
+Optional future: user-confirmed reminders ("survey this repo?") with a daily cap —
+not auto-execution.
 
 ---
 

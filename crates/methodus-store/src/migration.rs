@@ -50,6 +50,18 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         mark_applied(conn, 6)?;
     }
 
+    // V7: evolution candidates (Face/Method/Skill upgrades)
+    if !is_applied(conn, 7)? {
+        apply_v7(conn)?;
+        mark_applied(conn, 7)?;
+    }
+
+    // V8: catalog index tables (faces, methods, skills)
+    if !is_applied(conn, 8)? {
+        apply_v8(conn)?;
+        mark_applied(conn, 8)?;
+    }
+
     Ok(())
 }
 
@@ -277,6 +289,68 @@ fn apply_v6(conn: &Connection) -> Result<(), StoreError> {
         );
         CREATE INDEX idx_usage_occurred ON usage_rolls(occurred_at);
         CREATE INDEX idx_usage_task ON usage_rolls(task_id);
+        ",
+    )?;
+    Ok(())
+}
+
+fn apply_v7(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "
+        CREATE TABLE evolution_candidates (
+            id           TEXT PRIMARY KEY,
+            target_kind  TEXT NOT NULL,
+            target_id    TEXT NOT NULL,
+            diff         TEXT NOT NULL,
+            rationale    TEXT,
+            source       TEXT,
+            status       TEXT NOT NULL,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        );
+        CREATE INDEX idx_evolution_status ON evolution_candidates(status);
+        CREATE INDEX idx_evolution_target ON evolution_candidates(target_kind, target_id);
+        ",
+    )?;
+    Ok(())
+}
+
+fn apply_v8(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "
+        CREATE TABLE faces (
+            id           TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            path         TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            intent_tags  TEXT,
+            version      INTEGER NOT NULL DEFAULT 1,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        );
+
+        CREATE TABLE methods (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            path          TEXT NOT NULL,
+            content_hash  TEXT NOT NULL,
+            intent_tags   TEXT,
+            version       TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
+
+        CREATE TABLE skills (
+            id            TEXT PRIMARY KEY,
+            source        TEXT NOT NULL,
+            path          TEXT NOT NULL,
+            content_hash  TEXT NOT NULL,
+            version       TEXT,
+            compat        TEXT,
+            conflict      TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
         ",
     )?;
     Ok(())

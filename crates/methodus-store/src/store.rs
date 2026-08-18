@@ -660,6 +660,35 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Remove a task and its sessions / events / approvals / workspace rows.
+    /// Returns workspace directories the caller should delete from disk.
+    pub fn delete_task(&self, id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let mut paths = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT root_path FROM workspaces WHERE task_id = ?1")?;
+            let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                paths.push(row?);
+            }
+        }
+        conn.execute("DELETE FROM usage_rolls WHERE task_id = ?1", params![id])?;
+        conn.execute("DELETE FROM approvals WHERE task_id = ?1", params![id])?;
+        conn.execute("DELETE FROM events WHERE task_id = ?1", params![id])?;
+        conn.execute("DELETE FROM experiences WHERE task_id = ?1", params![id])?;
+        conn.execute("DELETE FROM workspaces WHERE task_id = ?1", params![id])?;
+        conn.execute("DELETE FROM sessions WHERE task_id = ?1", params![id])?;
+        conn.execute(
+            "UPDATE questions SET task_id = NULL WHERE task_id = ?1",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        Ok(paths)
+    }
 }
 
 /// Append-only event log row (lifecycle index; payload is JSON).
@@ -961,6 +990,41 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let result = store.get_task("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_task_removes_sessions_and_events() {
+        let store = Store::open_memory().unwrap();
+        let now = Utc::now();
+        store
+            .insert_task(&Task {
+                id: "t-001".to_string(),
+                title: "gone".to_string(),
+                request: "x".to_string(),
+                project_id: None,
+                status: TaskStatus::Failed,
+                runtime: None,
+                workspace_id: None,
+                resolution: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store
+            .insert_event(
+                "e1",
+                "user.message",
+                &now.to_rfc3339(),
+                Some("t-001"),
+                None,
+                "{}",
+                None,
+            )
+            .unwrap();
+        store.delete_task("t-001").unwrap();
+        assert!(store.get_task("t-001").unwrap().is_none());
+        assert!(store.list_events(Some("t-001"), 10).unwrap().is_empty());
     }
 
     #[test]

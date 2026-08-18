@@ -14,12 +14,12 @@ executor (Claude Code, Codex, or Cursor) acts as the hands.
 
 ## Status
 
-**M0–M3 in progress.** `methodus` opens the TUI (same process as the Engine). First
-launch seeds `~/.methodus`. Daily work, review, packs, project directories, and
-settings happen on TUI pages — there is no operational CLI. Skills stay
+**M0–M3 in progress.** `methodus` opens the TUI (same process as the Engine) — the
+daily shell. First launch seeds `~/.methodus`. Daily work, review, packs, and settings
+run in the TUI (`/setup` `/inbox` `/face` `/session`).
 Methodus-owned (`~/.methodus/skills`); executor user dirs are not scanned. After a
 task, Methodus may draft a candidate skill; it is live only after Review commit
-(`/learn` in the TUI).
+(via `/inbox`).
 
 - Product & design: [`docs/design/`](./docs/design/) — the product contract
   ([`00-product.md`](./docs/design/00-product.md): the *what & why*) plus the technical
@@ -28,9 +28,9 @@ task, Methodus may draft a candidate skill; it is live only after Review commit
 
 ## Core ideas
 
-- **Persistent** — a single long-lived local process you keep open (e.g. in `tmux`);
-  background work is scheduled, budgeted, and policy-controlled (never an unbounded
-  `while true` LLM loop).
+- **Persistent** — a single long-lived local process you keep open in `tmux`;
+  background work is event-driven, budgeted, and policy-controlled (never an unbounded
+  `while true` LLM loop or unattended autonomous agent).
 - **Personal** — knowledge, experience, and project context are yours, stored locally.
 - **Adaptive** — no permanently bound role; each task loads one or more *Faces*
   (domain expert snapshots) on demand.
@@ -63,8 +63,8 @@ reconciles and resumes rather than losing work. Run it in `tmux` to keep it aliv
 across terminal sessions.
 
 > No separate daemon/client split in v1. `methodus-core` is kept UI-free so that
-> split can be added later as an optional layer *if* an unattended service, multiple
-> simultaneous clients, or a desktop app is ever required. See
+> split can be added later as an optional layer *if* an unattended service or multiple
+> simultaneous clients is ever required. See
 > [`docs/design/02-architecture.md`](./docs/design/02-architecture.md) §0.
 
 ## Technology

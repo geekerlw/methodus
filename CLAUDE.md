@@ -7,12 +7,11 @@ Guidance for Claude Code (and any AI executor) when working in this repository.
 Methodus is a **Persistent Personal Expert System**: a single long-running local Rust
 process that orchestrates an external AI coding agent (Claude Code, Codex, or Cursor)
 to complete tasks, then distills vetted experience into reusable knowledge. You keep
-the one `methodus` process open (e.g. in `tmux`). Methodus is the *brain*; the executor
-is the *hands*.
+the one `methodus` process open in `tmux`. Methodus is the *brain*;
+the executor is the *hands*.
 
-**Current state: pre-implementation.** The repo holds the product reference and
-technical design only. There is no Rust code yet. Do not assume a build exists until
-`Cargo.toml` is present.
+**Current state:** Rust workspace with in-process Engine and ratatui TUI (`methodus`) as
+the delivery shell. Keep the process open in `tmux` for daily use.
 
 ## Source of truth (read before writing code)
 
@@ -30,11 +29,12 @@ All documentation lives in [`docs/design/`](./docs/design/):
    runtime model (no daemon/client split), async model, crash recovery.
 4. `03-data-model.md` — SQLite schema DDL, file layout, source-of-truth rules.
 5. `04-roadmap.md` — implementation order and acceptance criteria per milestone.
-6. [`docs/legacy/`](./docs/legacy/) — the archived v1 prompt agent. Reference only;
+6. `05-tui.md` — agent TUI contract (ratatui chrome, overlays, Pi-aligned components).
+7. [`docs/legacy/`](./docs/legacy/) — the archived v1 prompt agent. Reference only;
    do not extend it.
 
-`00-product.md` defines product intent; `01`–`04` define implementation. When they
-appear to disagree, `01`–`04` win for implementation detail and `00` wins for product
+`00-product.md` defines product intent; `01`–`05` define implementation. When they
+appear to disagree, `01`–`05` win for implementation detail and `00` wins for product
 intent. If neither is clear, ask.
 
 ## Non-negotiable design principles (from `00-product.md`)

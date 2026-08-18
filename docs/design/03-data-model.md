@@ -76,7 +76,7 @@ is searched first.
 
 A **project** is a directory on disk (the user's repo). `projects.yaml` records `id`,
 `name`, `path`, and `focus`. New tasks pick up the focus project. Register paths from
-the TUI setup page — Methodus does not clone or pull.
+the TUI `/setup` overlay — Methodus does not clone or pull.
 
 ```yaml
 # ~/.methodus/projects.yaml

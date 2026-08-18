@@ -10,8 +10,14 @@ use crate::error::CoreError;
 
 const GENERAL_FACE_YAML: &str = include_str!("../../../resources/faces/general/face.yaml");
 const GENERAL_METHOD_YAML: &str = include_str!("../../../resources/methods/general-software.yaml");
+const MODULE_EXPERT_METHOD_YAML: &str =
+    include_str!("../../../resources/methods/module-expert-learning.yaml");
+const DOC_INGEST_METHOD_YAML: &str = include_str!("../../../resources/methods/doc-ingest.yaml");
+const REPO_SURVEY_METHOD_YAML: &str = include_str!("../../../resources/methods/repo-survey.yaml");
 const WORKSPACE_SKILL_MD: &str =
     include_str!("../../../resources/skills/workspace-hygiene/SKILL.md");
+const MODULE_EXPERT_SKILL_MD: &str =
+    include_str!("../../../resources/skills/module-expert-learning/SKILL.md");
 const DEFAULT_CONFIG: &str = include_str!("../../../resources/config.yaml");
 
 #[derive(Debug, Clone)]
@@ -37,7 +43,8 @@ pub fn methodus_home() -> Result<PathBuf, CoreError> {
 pub fn ensure_home(home: &Path) -> Result<(), CoreError> {
     fs::create_dir_all(home)?;
     seed_home(home)?;
-    Store::open(&home.join("state.db"))?;
+    let store = Store::open(&home.join("state.db"))?;
+    let _ = crate::catalog::sync_catalog(&store, home)?;
     Ok(())
 }
 
@@ -54,6 +61,7 @@ fn seed_home(home: &Path) -> Result<(), CoreError> {
         "faces/general/knowledge",
         "faces/general/hypotheses",
         "skills/workspace-hygiene",
+        "skills/module-expert-learning",
     ] {
         fs::create_dir_all(home.join(sub))?;
     }
@@ -63,21 +71,31 @@ fn seed_home(home: &Path) -> Result<(), CoreError> {
         GENERAL_METHOD_YAML,
     )?;
     write_if_missing(
+        home.join("methods/module-expert-learning.yaml"),
+        MODULE_EXPERT_METHOD_YAML,
+    )?;
+    write_if_missing(home.join("methods/doc-ingest.yaml"), DOC_INGEST_METHOD_YAML)?;
+    write_if_missing(home.join("methods/repo-survey.yaml"), REPO_SURVEY_METHOD_YAML)?;
+    write_if_missing(
         home.join("skills/workspace-hygiene/SKILL.md"),
         WORKSPACE_SKILL_MD,
+    )?;
+    write_if_missing(
+        home.join("skills/module-expert-learning/SKILL.md"),
+        MODULE_EXPERT_SKILL_MD,
     )?;
     write_if_missing(home.join("config.yaml"), DEFAULT_CONFIG)?;
     write_if_missing(
         home.join("packs.yaml"),
         "# Team baseline packs (Methodus-format folders).\n\
-         # Register a folder from the TUI setup page.\n\
+         # Register a folder from /setup.\n\
          # How you copy folders between people is up to you.\n\
          focus:\n\
          packs: []\n",
     )?;
     write_if_missing(
         home.join("projects.yaml"),
-        "# Project directories (your repos). Register from the TUI setup page.\n\
+        "# Project directories (your repos). Register from /setup.\n\
          focus:\n\
          projects: []\n",
     )?;

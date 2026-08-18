@@ -1,0 +1,14 @@
+id: doc-ingest
+version: 1.0.0
+name: Document ingest
+intent_tags:
+  - ingest
+  - docs
+  - standards
+steps:
+  - read the listed sources in place
+  - extract stable facts with citations
+  - note applicability and conflicts
+  - output candidate knowledge sections
+recommended_skills:
+  - workspace-hygiene
