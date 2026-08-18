@@ -1,7 +1,7 @@
 //! Status enums and state-machine transition logic for Methodus domain entities.
 //!
 //! Each enum defines valid transitions per the state machines documented in
-//! `docs/design/03-data-model.md` §4.
+//! `docs/03-data-model.md` §4.
 
 use std::fmt;
 use std::str::FromStr;
@@ -513,6 +513,7 @@ pub enum JobKind {
     AnalyzeKnowledgeGaps,
     AutoResearch,
     SynthesizeMethod,
+    ProposeRefinement,
 }
 
 impl fmt::Display for JobKind {
@@ -526,6 +527,7 @@ impl fmt::Display for JobKind {
             Self::AnalyzeKnowledgeGaps => "analyze_knowledge_gaps",
             Self::AutoResearch => "auto_research",
             Self::SynthesizeMethod => "synthesize_method",
+            Self::ProposeRefinement => "propose_refinement",
         };
         write!(f, "{}", s)
     }
@@ -544,6 +546,7 @@ impl FromStr for JobKind {
             "analyze_knowledge_gaps" => Ok(Self::AnalyzeKnowledgeGaps),
             "auto_research" => Ok(Self::AutoResearch),
             "synthesize_method" => Ok(Self::SynthesizeMethod),
+            "propose_refinement" => Ok(Self::ProposeRefinement),
             other => Err(DomainError::InvalidStatus {
                 entity: "job_kind",
                 value: other.to_string(),
@@ -866,6 +869,10 @@ mod tests {
         assert_eq!(
             "propose_skill".parse::<JobKind>().unwrap(),
             JobKind::ProposeSkill
+        );
+        assert_eq!(
+            "propose_refinement".parse::<JobKind>().unwrap(),
+            JobKind::ProposeRefinement
         );
     }
 

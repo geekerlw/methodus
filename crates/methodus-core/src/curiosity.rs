@@ -127,6 +127,24 @@ pub fn uncertainty_lines(text: &str) -> Vec<String> {
     out
 }
 
+/// Reusable skill prose from module-expert / learn executor output.
+pub fn extract_skill_section(body: &str) -> String {
+    let result = crate::learning::full_result_section(body);
+    let section = extract_section(
+        &result,
+        &[
+            "Skill",
+            "Skill angle",
+            "Reusable procedure",
+            "Reusable Procedure",
+        ],
+    );
+    if !section.trim().is_empty() {
+        return section;
+    }
+    extract_section(&result, &["Procedure"])
+}
+
 /// Parse mentor-facing questions from a study Result body.
 pub fn parse_mentor_questions(result: &str) -> Vec<(String, String)> {
     let section = extract_section(
@@ -256,7 +274,7 @@ pub fn run_auto_research(
          **Source:** curiosity auto-research from experience `{exp_id}`\n\n\
          Suggested next steps:\n\
          - consult committed Face knowledge\n\
-         - run `/study` on relevant docs if URLs/paths are known\n\
+         - run `/learn` on relevant docs if URLs/paths are known\n\
          - answer mentor questions in `/inbox`\n"
     );
     let _ = crate::learning::write_candidate(
@@ -311,7 +329,7 @@ pub fn enqueue_module_study_jobs(
     Ok(())
 }
 
-/// Split `/study` input into topic label and explicit sources (paths / URLs).
+/// Split `/learn` input into topic label and explicit sources (paths / URLs).
 pub fn parse_study_invocation(input: &str) -> (String, Vec<String>) {
     let mut sources = Vec::new();
     let mut scope_parts = Vec::new();
@@ -443,6 +461,16 @@ The device boots via `main()` then calls init. TBD: clock source on rev B.
         let body = "# Experience\n\n- mode: module_expert\n";
         assert!(is_module_expert_experience(body, None));
         assert!(!is_module_expert_experience("plain", None));
+    }
+
+    #[test]
+    fn extracts_skill_section_from_learn_output() {
+        let body = format!(
+            "## Result\n\n{SAMPLE}\n\n## Skill\n\n1. Read `src/foo.c` entry\n2. Trace `foo_init` before drivers\n"
+        );
+        let skill = extract_skill_section(&body);
+        assert!(skill.contains("foo_init"));
+        assert!(skill.contains("Read `src/foo.c`"));
     }
 
     #[test]

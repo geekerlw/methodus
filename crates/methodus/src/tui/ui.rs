@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -195,8 +195,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Overlay::Setup => "  setup",
         Overlay::Inbox => "  inbox",
         Overlay::Faces => "  faces",
-        Overlay::Events => "  events",
-        Overlay::Jobs => "  jobs",
         Overlay::Sessions => "  sessions",
         Overlay::None => "",
     };
@@ -226,8 +224,6 @@ fn draw_overlay(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Overlay::Sessions => draw_sessions(frame, area, app, theme),
         Overlay::Faces => draw_faces(frame, area, app, theme),
         Overlay::Inbox => draw_review(frame, area, app, theme),
-        Overlay::Events => draw_system_events(frame, area, app, theme),
-        Overlay::Jobs => draw_system_jobs(frame, area, app, theme),
         Overlay::Setup => {
             frame.render_widget(Clear, area);
             draw_setup(frame, area, app, theme);
@@ -377,28 +373,28 @@ fn draw_slash_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         matches
             .iter()
-            .enumerate()
-            .map(|(i, cmd)| {
-                let mark = if i == app.slash_sel { ">" } else { " " };
+            .map(|cmd| {
                 let alias = if cmd.aliases.is_empty() {
                     String::new()
                 } else {
                     format!("  /{}", cmd.aliases.join(" /"))
                 };
-                let style = if i == app.slash_sel {
-                    theme.selected()
-                } else {
-                    theme.text()
-                };
-                ListItem::new(format!("{mark} /{}{alias}  {}", cmd.name, cmd.summary)).style(style)
+                ListItem::new(format!("  /{}{alias}  {}", cmd.name, cmd.summary)).style(theme.text())
             })
             .collect()
     };
-    frame.render_widget(
+    let mut state = ListState::default();
+    if !matches.is_empty() {
+        state.select(Some(app.slash_sel));
+    }
+    frame.render_stateful_widget(
         List::new(items)
-            .block(hairline(" /  tab complete · enter run ", theme.accent_border()))
-            .style(theme.text()),
+            .block(hairline(" /  ↑↓ j k · tab complete · enter run ", theme.accent_border()))
+            .style(theme.text())
+            .highlight_style(theme.selected())
+            .highlight_symbol("> "),
         area,
+        &mut state,
     );
 }
 
@@ -414,26 +410,29 @@ fn draw_at_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         matches
             .iter()
-            .enumerate()
-            .map(|(i, cand)| {
-                let mark = if i == app.mention_sel { ">" } else { " " };
+            .map(|cand| {
                 let kind = if cand.is_dir { "dir " } else { "file" };
-                let style = if i == app.mention_sel {
-                    theme.selected()
-                } else if cand.is_dir {
+                let style = if cand.is_dir {
                     Style::default().fg(theme.info)
                 } else {
                     theme.text()
                 };
-                ListItem::new(format!("{mark} {kind}  {}", cand.label)).style(style)
+                ListItem::new(format!("  {kind}  {}", cand.label)).style(style)
             })
             .collect()
     };
-    frame.render_widget(
+    let mut state = ListState::default();
+    if !matches.is_empty() {
+        state.select(Some(app.mention_sel));
+    }
+    frame.render_stateful_widget(
         List::new(items)
-            .block(hairline(" @  tab drill · enter attach ", theme.accent_border()))
-            .style(theme.text()),
+            .block(hairline(" @  ↑↓ j k · tab drill · enter attach ", theme.accent_border()))
+            .style(theme.text())
+            .highlight_style(theme.selected())
+            .highlight_symbol("> "),
         area,
+        &mut state,
     );
 }
 
@@ -804,11 +803,7 @@ fn draw_knowledge_prompt(frame: &mut Frame, area: Rect, app: &App, theme: &Theme
     let Some(k) = app.pending_knowledge() else {
         return;
     };
-    let kind = if k.source == methodus_core::learning::SKILL_DRAFT_SOURCE {
-        "skill draft"
-    } else {
-        "knowledge"
-    };
+    let kind = methodus_core::learning::knowledge_inbox_label(&k.source);
     let mut header = vec![
         Line::from(Span::styled(
             format!("Commit this {kind}?"),
@@ -1171,79 +1166,6 @@ fn display_cols(s: &str) -> u16 {
     display_width(s) as u16
 }
 
-fn draw_system_events(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let popup = floating_popup(area, 86, 72);
-    frame.render_widget(Clear, popup);
-    let title = format!(" events ({}) · esc back ", app.system_events.len());
-    let block = panel(&title, true, theme);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    if app.system_events.is_empty() {
-        frame.render_widget(
-            Paragraph::new("no events yet").style(theme.dim()).alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
-    let items: Vec<ListItem> = app
-        .system_events
-        .iter()
-        .enumerate()
-        .map(|(i, ev)| {
-            let mark = if i == app.system_sel { ">" } else { " " };
-            let style = if i == app.system_sel {
-                theme.selected()
-            } else {
-                theme.text()
-            };
-            ListItem::new(format!(
-                "{mark} {:<22}  {}",
-                ev.event_type,
-                ellipsize(&ev.occurred_at, 20)
-            ))
-            .style(style)
-        })
-        .collect();
-    frame.render_widget(List::new(items).style(theme.text()), inner);
-}
-
-fn draw_system_jobs(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let popup = floating_popup(area, 86, 72);
-    frame.render_widget(Clear, popup);
-    let title = format!(" learning jobs ({}) · [c] cancel · esc ", app.learning_jobs.len());
-    let block = panel(&title, true, theme);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    if app.learning_jobs.is_empty() {
-        frame.render_widget(
-            Paragraph::new("queue empty").style(theme.dim()).alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
-    let items: Vec<ListItem> = app
-        .learning_jobs
-        .iter()
-        .enumerate()
-        .map(|(i, job)| {
-            let mark = if i == app.system_sel { ">" } else { " " };
-            let style = if i == app.system_sel {
-                theme.selected()
-            } else {
-                theme.text()
-            };
-            ListItem::new(format!(
-                "{mark} {:<18}  {:<10}  {}",
-                job.kind,
-                job.status,
-                ellipsize(&job.id, 16)
-            ))
-            .style(style)
-        })
-        .collect();
-    frame.render_widget(List::new(items).style(theme.text()), inner);
-}
-
 fn draw_sessions(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let popup = floating_popup(area, 78, 70);
     frame.render_widget(Clear, popup);
@@ -1381,6 +1303,18 @@ fn draw_faces(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     frame.render_widget(List::new(items).style(theme.text()), inner);
 }
 
+fn inbox_knowledge_title(source: &str) -> &'static str {
+    match methodus_core::learning::knowledge_inbox_label(source) {
+        "skill draft" => " skill draft ",
+        "skill patch" => " skill patch ",
+        "harness note" => " harness note ",
+        other => {
+            let _ = other;
+            " knowledge "
+        }
+    }
+}
+
 fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let popup = floating_popup(area, 82, 72);
     frame.render_widget(Clear, popup);
@@ -1401,9 +1335,9 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Paragraph::new(
                 "inbox is empty\n\n\
                  after a turn, experience may land here.\n\
-                 /study runs module expert learning — knowledge + mentor questions land in /inbox.\n\
-                 /ingest and /survey write into the focus project's knowledge corpus.\n\
-                 skill drafts appear here automatically after non-trivial tasks.\n\
+                 /learn reads your sources and archives into project or Face knowledge.\n\
+                 Outcomes land in /inbox for review — no separate jobs dashboard.\n\
+                 skill drafts, patches, and Face notes appear here after non-trivial tasks.\n\
                  hypotheses appear when curiosity finds under-evidenced claims.\n\
                  face evolution proposals appear after study knowledge is committed.\n\
                  idle questions use the composer: type an answer, Enter.",
@@ -1443,11 +1377,7 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         let j = idx - app.questions.len();
         if j < app.knowledge.len() {
             let k = &app.knowledge[j];
-            let kind = if k.source == methodus_core::learning::SKILL_DRAFT_SOURCE {
-                "S"
-            } else {
-                "K"
-            };
+            let kind = methodus_core::learning::knowledge_inbox_tag(&k.source);
             let style = sel_style(idx == app.review_sel, theme.fg, theme);
             items.push(
                 ListItem::new(format!(
@@ -1505,12 +1435,7 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let body = app.review_summary();
     let title = match app.selected_review() {
         Some(ReviewItem::Question(_)) => " summary ",
-        Some(ReviewItem::Knowledge(k))
-            if k.source == methodus_core::learning::SKILL_DRAFT_SOURCE =>
-        {
-            " skill draft "
-        }
-        Some(ReviewItem::Knowledge(_)) => " knowledge ",
+        Some(ReviewItem::Knowledge(k)) => inbox_knowledge_title(&k.source),
         Some(ReviewItem::Hypothesis(_)) => " hypothesis ",
         Some(ReviewItem::Evolution(_)) => " face evolution ",
         Some(ReviewItem::Experience(_)) => " experience ",
@@ -1532,12 +1457,7 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 fn draw_inbox_detail(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let title = match app.selected_review() {
         Some(ReviewItem::Question(_)) => " question ",
-        Some(ReviewItem::Knowledge(k))
-            if k.source == methodus_core::learning::SKILL_DRAFT_SOURCE =>
-        {
-            " skill draft "
-        }
-        Some(ReviewItem::Knowledge(_)) => " knowledge ",
+        Some(ReviewItem::Knowledge(k)) => inbox_knowledge_title(&k.source),
         Some(ReviewItem::Hypothesis(_)) => " hypothesis ",
         Some(ReviewItem::Evolution(_)) => " face evolution ",
         Some(ReviewItem::Experience(_)) => " experience ",
@@ -1918,7 +1838,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
         Line::from("  /face        pin a Face (or /face <id>)"),
         Line::from("  /session     pick another conversation"),
         Line::from("  /clear /new  new conversation — does not resume the executor"),
-        Line::from("  /study       sources → knowledge + skill + mentor Qs (not workspace)"),
+        Line::from("  /learn       @paths/URLs → knowledge (auto pipeline)"),
         Line::from("  /retry       retry the open conversation"),
         Line::from("  /cancel      cancel a running task"),
         Line::from("  /delete      delete a finished task"),

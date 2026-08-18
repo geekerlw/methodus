@@ -35,6 +35,11 @@ impl WorkspaceBuilder {
         Ok(ws_root)
     }
 
+    /// Snapshot of which Face notes/knowledge this turn injected (`(none)` if empty).
+    pub fn write_injected(ws_root: &Path, inventory: &str) -> Result<(), std::io::Error> {
+        fs::write(ws_root.join(".methodus/injected.md"), inventory)
+    }
+
     /// Write execution plan from resolved method steps and Faces.
     pub fn write_plan(ws_root: &Path, plan_md: &str) -> Result<(), std::io::Error> {
         fs::write(ws_root.join(".methodus/plan.md"), plan_md)
@@ -110,6 +115,7 @@ not copied here.
 - Follow `.methodus/selected-context.md`.
 - Directories listed under **Readable directories** are the real folders on disk.
   Read / Glob / LS them in place (they are also passed as extra dirs to the CLI).
+- `.methodus/injected.md` lists which Face notes/knowledge were selected this turn.
 - Vetted Face notes (if any) live in `face-context/knowledge/` — prefer them over guessing.
 - Project skills live in `.claude/skills/<name>/SKILL.md` (copy also under `.methodus/skills/`).
 - If you have a Skill tool, invoke each listed skill by name before improvising.

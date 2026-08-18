@@ -22,7 +22,7 @@ use futures::StreamExt;
 use methodus_core::{Engine, InstanceLock, RecoveredSession};
 use ratatui::prelude::{CrosstermBackend, Terminal};
 
-use app::{App, Command, StatusLevel};
+use app::{slash_menu_open, App, Command, StatusLevel};
 use crate::notify::NotifyUrgency;
 
 pub async fn run(
@@ -260,14 +260,15 @@ async fn run_loop(
                 }
                 Err(e) => app.set_status(StatusLevel::Error, format!("review done failed: {e}")),
             },
-            Command::StudyModule { scope, sources, face } => {
+            Command::Learn { hint, sources, face } => {
                 if app.busy() {
                     app.set_status(StatusLevel::Warn, "wait until this turn ends");
                     continue;
                 }
-                match app.engine.create_study_task(&scope, &sources, face.as_deref()) {
-                    Ok(task) => {
+                match app.engine.create_learn_task(&hint, &sources, face.as_deref()) {
+                    Ok((task, mode)) => {
                         let id = task.id.clone();
+                        let label = mode.label();
                         app.session_task_id = None;
                         app.event_rx = None;
                         app.transcript.clear();
@@ -278,81 +279,19 @@ async fn run_loop(
                                 app.attach_session(id, rx);
                                 app.set_status(
                                     StatusLevel::Info,
-                                    format!("module study — {scope}"),
+                                    format!("learn ({label}) — results land in /inbox"),
                                 );
                                 app.refresh();
                             }
                             Err(e) => {
                                 app.input_error = Some(e.to_string());
-                                app.set_status(StatusLevel::Error, format!("study failed: {e}"));
+                                app.set_status(StatusLevel::Error, format!("learn failed: {e}"));
                             }
                         }
                     }
                     Err(e) => {
                         app.input_error = Some(e.to_string());
-                        app.set_status(StatusLevel::Error, format!("study failed: {e}"));
-                    }
-                }
-            }
-            Command::IngestDocs { sources } => {
-                if app.busy() {
-                    app.set_status(StatusLevel::Warn, "wait until this turn ends");
-                    continue;
-                }
-                match app.engine.create_ingest_task(&sources) {
-                    Ok(task) => {
-                        let id = task.id.clone();
-                        app.session_task_id = None;
-                        app.event_rx = None;
-                        app.transcript.clear();
-                        app.input.clear();
-                        app.input_error = None;
-                        match app.engine.run_task(&id, false).await {
-                            Ok(rx) => {
-                                app.attach_session(id, rx);
-                                app.set_status(StatusLevel::Info, "doc ingest — running");
-                                app.refresh();
-                            }
-                            Err(e) => {
-                                app.input_error = Some(e.to_string());
-                                app.set_status(StatusLevel::Error, format!("ingest failed: {e}"));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        app.input_error = Some(e.to_string());
-                        app.set_status(StatusLevel::Error, format!("ingest failed: {e}"));
-                    }
-                }
-            }
-            Command::SurveyRepo => {
-                if app.busy() {
-                    app.set_status(StatusLevel::Warn, "wait until this turn ends");
-                    continue;
-                }
-                match app.engine.create_survey_task() {
-                    Ok(task) => {
-                        let id = task.id.clone();
-                        app.session_task_id = None;
-                        app.event_rx = None;
-                        app.transcript.clear();
-                        app.input.clear();
-                        app.input_error = None;
-                        match app.engine.run_task(&id, false).await {
-                            Ok(rx) => {
-                                app.attach_session(id, rx);
-                                app.set_status(StatusLevel::Info, "repo survey — running");
-                                app.refresh();
-                            }
-                            Err(e) => {
-                                app.input_error = Some(e.to_string());
-                                app.set_status(StatusLevel::Error, format!("survey failed: {e}"));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        app.input_error = Some(e.to_string());
-                        app.set_status(StatusLevel::Error, format!("survey failed: {e}"));
+                        app.set_status(StatusLevel::Error, format!("learn failed: {e}"));
                     }
                 }
             }
@@ -366,17 +305,6 @@ async fn run_loop(
                         app.refresh();
                     }
                     Err(e) => app.set_status(StatusLevel::Error, format!("cleanup failed: {e}")),
-                }
-            }
-            Command::CancelLearningJob { id } => {
-                match app.engine.cancel_learning_job(&id) {
-                    Ok(true) => {
-                        app.set_status(StatusLevel::Ok, format!("cancelled job {id}"));
-                        app.refresh_system_lists();
-                        app.refresh();
-                    }
-                    Ok(false) => app.set_status(StatusLevel::Warn, format!("job {id} not cancellable")),
-                    Err(e) => app.set_status(StatusLevel::Error, format!("cancel failed: {e}")),
                 }
             }
         }
@@ -403,6 +331,10 @@ fn key_command(app: &mut App, ev: Option<Result<Event, std::io::Error>>) -> Comm
                 MouseEventKind::ScrollUp => {
                     if app.inbox_detail_open() {
                         app.scroll_review_detail(-3);
+                    } else if slash_menu_open(&app.input) {
+                        app.move_slash_sel(-1);
+                    } else if app.mention_menu_open() {
+                        app.move_mention_sel(-1);
                     } else {
                         app.scroll_session(1);
                     }
@@ -410,6 +342,10 @@ fn key_command(app: &mut App, ev: Option<Result<Event, std::io::Error>>) -> Comm
                 MouseEventKind::ScrollDown => {
                     if app.inbox_detail_open() {
                         app.scroll_review_detail(3);
+                    } else if slash_menu_open(&app.input) {
+                        app.move_slash_sel(1);
+                    } else if app.mention_menu_open() {
+                        app.move_mention_sel(1);
                     } else {
                         app.scroll_session(-1);
                     }

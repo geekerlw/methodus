@@ -1,6 +1,6 @@
 # Module expert learning
 
-Use when the user runs **`/study`** with explicit **paths or URLs** — not to learn the ephemeral task workspace.
+Use when the user runs **`/learn`** with explicit **paths or URLs** — not to learn the ephemeral task workspace.
 
 ## Goal
 
@@ -30,6 +30,10 @@ Future **execution tasks** load committed knowledge/skills into their workspace 
 ### {Subtopic}
 
 {Stable facts. Cite sources.}
+
+## Skill
+
+{Reusable procedure — how to navigate this module next time. Numbered steps preferred.}
 
 ## Open Questions (for Mentor)
 

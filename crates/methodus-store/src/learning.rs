@@ -216,8 +216,8 @@ impl Store {
         conn.execute(
             "UPDATE knowledge_items
              SET status = ?1, conflict_of = ?2, content_hash = ?3, version = ?4,
-                 updated_at = ?5, path = ?6
-             WHERE id = ?7",
+                 updated_at = ?5, path = ?6, confidence = ?7
+             WHERE id = ?8",
             params![
                 item.status.to_string(),
                 item.conflict_of,
@@ -225,6 +225,7 @@ impl Store {
                 item.version,
                 item.updated_at.to_rfc3339(),
                 item.path,
+                item.confidence,
                 item.id,
             ],
         )?;

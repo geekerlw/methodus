@@ -9,3 +9,8 @@ permission_mode: acceptEdits
 # In the TUI, status bar + composer always show pending work. Set METHODUS_NOTIFY=always
 # to force OS banners even when the pane looks active.
 # notifications: true
+#
+# Polish rule-based note/patch drafts with one short executor call (plan mode, no tools).
+# Apply still goes through /inbox. Failed polish keeps the rules draft.
+# refine_llm: true
+# refine_llm_daily_cap: 8

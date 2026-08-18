@@ -30,7 +30,7 @@ pub struct ResolveOpts<'a> {
     pub requested_face: Option<&'a str>,
     /// Context Faces (committed knowledge merged; primary drives method/skill pick).
     pub requested_context_faces: Option<&'a [String]>,
-    /// Force a specific method id (e.g. module-expert-learning for /study).
+    /// Force a specific method id (e.g. module-expert-learning for `/learn` module-expert mode).
     pub requested_method: Option<&'a str>,
 }
 

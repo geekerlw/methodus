@@ -3,8 +3,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -35,6 +36,7 @@ pub enum KnowledgeReviewAction {
     ReplaceExisting,
 }
 
+#[derive(Clone)]
 pub struct Engine {
     store: Arc<Store>,
     adapters: HashMap<String, Arc<dyn RuntimeAdapter>>,
@@ -134,6 +136,136 @@ impl Engine {
         scheduler::tick(&self.store, &self.home)
     }
 
+    /// One budgeted executor call to polish a rules note/patch. Never applies.
+    pub async fn tick_refine_llm(&self) -> Result<usize, CoreError> {
+        let cfg = UserConfig::load(&self.home);
+        if !cfg.refine_llm_enabled() {
+            return Ok(0);
+        }
+        if self.has_live_executor_session()? {
+            return Ok(0);
+        }
+        let (used, skip_ids) = self.refine_llm_today()?;
+        if used >= cfg.refine_llm_daily_cap() {
+            return Ok(0);
+        }
+        let Some(item) =
+            crate::refine::next_unpolished_candidate(&self.store, &self.home, &skip_ids)?
+        else {
+            return Ok(0);
+        };
+        match self.polish_one_candidate(&item).await {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.emit_refine_llm(&item.id, false, Some(&e.to_string()));
+                Ok(0)
+            }
+        }
+    }
+
+    fn has_live_executor_session(&self) -> Result<bool, CoreError> {
+        Ok(self.store.list_non_terminal_sessions()?.iter().any(|s| {
+            matches!(s.status, SessionStatus::Running | SessionStatus::Spawning)
+        }))
+    }
+
+    fn refine_llm_today(&self) -> Result<(i64, Vec<String>), CoreError> {
+        let today = Utc::now().date_naive();
+        let events = self.store.list_events(None, 2000)?;
+        let mut ids = Vec::new();
+        let mut n = 0i64;
+        for ev in events {
+            if ev.event_type != crate::refine::REFINE_LLM_EVENT {
+                continue;
+            }
+            if !event_on_date(&ev.occurred_at, today) {
+                continue;
+            }
+            n += 1;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
+                if let Some(id) = v.get("knowledge_id").and_then(|x| x.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        Ok((n, ids))
+    }
+
+    fn emit_refine_llm(&self, knowledge_id: &str, skip: bool, error: Option<&str>) {
+        let mut payload = serde_json::json!({
+            "knowledge_id": knowledge_id,
+            "skip": skip,
+        });
+        if let Some(err) = error {
+            payload["error"] = serde_json::Value::String(err.to_string());
+        }
+        self.emit_simple(crate::refine::REFINE_LLM_EVENT, None, &payload.to_string());
+    }
+
+    async fn polish_one_candidate(&self, item: &KnowledgeItem) -> Result<usize, CoreError> {
+        let body = fs::read_to_string(self.home.join(&item.path)).unwrap_or_default();
+        let proposal = crate::refine::parse_proposal(&body).ok_or_else(|| {
+            CoreError::Other("refine llm: candidate missing proposal JSON".into())
+        })?;
+        let task_id = proposal
+            .evidence_refs
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let title = self
+            .store
+            .get_task(&task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.title)
+            .unwrap_or_else(|| proposal.target_id.clone());
+        let digest = crate::refine::trajectory_digest(&self.store, &task_id, &title);
+        let draft_json = serde_json::to_string_pretty(&proposal).unwrap_or_else(|_| "{}".into());
+        let prompt = crate::refine::polish_prompt(&digest, &draft_json);
+        let runtime = self.preferred_runtime(None);
+        let adapter = self.adapter(&runtime)?;
+        let cwd = self.workspace_root().join("_refine_llm");
+        fs::create_dir_all(&cwd)?;
+        let session_id = Uuid::new_v4().to_string();
+        let (handle, rx) = adapter
+            .spawn(SpawnInput {
+                prompt,
+                cwd,
+                session_id,
+                permission_mode: "plan".into(),
+                allowed_tools: Vec::new(),
+                sandbox: Some("read-only".into()),
+                extra_dirs: Vec::new(),
+                model: None,
+            })
+            .await?;
+        let collected = tokio::time::timeout(Duration::from_secs(45), collect_refine_text(rx)).await;
+        let _ = adapter.stop(&handle).await;
+        let text = match collected {
+            Ok(s) => s,
+            Err(_) => {
+                self.emit_refine_llm(&item.id, false, Some("timeout"));
+                return Ok(0);
+            }
+        };
+        if text.trim().is_empty() {
+            self.emit_refine_llm(&item.id, false, Some("empty"));
+            return Ok(0);
+        }
+        let Some(out) = crate::refine::parse_llm_refine_output(&text) else {
+            self.emit_refine_llm(&item.id, false, Some("parse"));
+            return Ok(0);
+        };
+        if out.skip {
+            let _ = self.review_knowledge(&item.id, KnowledgeReviewAction::Reject);
+            self.emit_refine_llm(&item.id, true, None);
+            return Ok(1);
+        }
+        crate::refine::apply_llm_polish(&self.store, &self.home, item, &out)?;
+        self.emit_refine_llm(&item.id, false, None);
+        Ok(1)
+    }
+
     pub fn list_learning_jobs(&self) -> Result<Vec<methodus_domain::LearningJob>, CoreError> {
         Ok(self.store.list_jobs()?)
     }
@@ -190,13 +322,28 @@ impl Engine {
                 }
             }
         }
+        if action == KnowledgeReviewAction::Commit || action == KnowledgeReviewAction::ReplaceExisting
+        {
+            if item.source == crate::refine::SKILL_PATCH_SOURCE {
+                item.path = crate::refine::apply_skill_patch(&self.home, &item)?;
+            }
+            if item.source == crate::refine::HARNESS_NOTE_SOURCE {
+                let (live, _hits) =
+                    crate::refine::apply_harness_note(&self.store, &self.home, &item)?;
+                item.path = live;
+            }
+        }
         if action == KnowledgeReviewAction::ReplaceExisting {
-            if item.source != learning::SKILL_DRAFT_SOURCE {
+            if item.source != learning::SKILL_DRAFT_SOURCE
+                && item.source != crate::refine::SKILL_PATCH_SOURCE
+            {
                 return Err(CoreError::Other(
-                    "replace only applies to skill drafts".into(),
+                    "replace only applies to skill drafts or patches".into(),
                 ));
             }
-            item.path = learning::install_skill_draft(&self.home, &item, true)?;
+            if item.source == learning::SKILL_DRAFT_SOURCE {
+                item.path = learning::install_skill_draft(&self.home, &item, true)?;
+            }
         }
         let next = match action {
             KnowledgeReviewAction::Commit | KnowledgeReviewAction::ReplaceExisting => {
@@ -399,7 +546,7 @@ impl Engine {
     pub fn create_ingest_task(&self, sources: &[String]) -> Result<Task, CoreError> {
         if sources.is_empty() {
             return Err(CoreError::Other(
-                "/ingest needs sources — e.g. /ingest @~/docs/standard.pdf".into(),
+                "/learn needs document sources — e.g. /learn @~/docs/standard.pdf".into(),
             ));
         }
         let project = crate::project::focus_project(&self.home)
@@ -554,7 +701,7 @@ impl Engine {
     ) -> Result<Task, CoreError> {
         if sources.is_empty() {
             return Err(CoreError::Other(
-                "study needs at least one path or URL — e.g. /study nxm @~/docs/nxm https://…"
+                "learn needs at least one path or URL — e.g. /learn nxm @~/docs/nxm https://…"
                     .into(),
             ));
         }
@@ -618,6 +765,24 @@ impl Engine {
         self.store.insert_task(&task)?;
         self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": task.title}).to_string());
         Ok(task)
+    }
+
+    /// Unified learn: user supplies sources; Methodus picks survey / ingest / module-expert.
+    pub fn create_learn_task(
+        &self,
+        hint: &str,
+        sources: &[String],
+        face: Option<&str>,
+    ) -> Result<(Task, crate::learn::LearnMode), CoreError> {
+        let (mode, scope) = crate::learn::plan_learn(&self.home, sources, hint)?;
+        let task = match mode {
+            crate::learn::LearnMode::RepoSurvey => self.create_survey_task()?,
+            crate::learn::LearnMode::DocIngest => self.create_ingest_task(sources)?,
+            crate::learn::LearnMode::ModuleExpert => {
+                self.create_study_task(&scope, sources, face)?
+            }
+        };
+        Ok((task, mode))
     }
 
     /// Reconcile every non-terminal session against pid liveness + `claude agents --json`.
@@ -838,8 +1003,29 @@ impl Engine {
                 &task.request,
             )?
         };
+        let notes = if is_study {
+            Vec::new()
+        } else {
+            crate::refine::select_committed_notes(
+                &self.store,
+                &self.home,
+                &face_refs,
+                &task.request,
+            )?
+        };
+        let inventory = learning::render_injected_inventory(&notes, &snippets);
+        if !is_study {
+            let _ = learning::record_injections(
+                &self.store,
+                &self.home,
+                task_id,
+                &notes,
+                &snippets,
+            )?;
+        }
         let mut context = resolution.to_context_markdown(&task.title, &task.request);
         if !is_study {
+            context.push_str(&inventory);
             if let Some(ref pid) = task.project_id {
                 if let Some(proj) = crate::project::list_projects(&self.home)
                     .into_iter()
@@ -851,6 +1037,7 @@ impl Engine {
                     ));
                 }
             }
+            context.push_str(&crate::refine::render_notes_context(&notes));
             context.push_str(&learning::render_knowledge_context(&snippets));
         } else {
             context.push_str(&crate::curiosity::render_study_sources(
@@ -868,9 +1055,11 @@ impl Engine {
         context.push_str(&crate::mentions::render_attached(&mentions));
         let extra_dirs = crate::mentions::readable_dirs(&named_roots);
         let ws_root = WorkspaceBuilder::build(&self.workspace_root(), task_id, &context)?;
+        WorkspaceBuilder::write_injected(&ws_root, &inventory)?;
         WorkspaceBuilder::write_plan(&ws_root, &resolution.to_plan_markdown(&task.title))?;
-        let knowledge_files: Vec<(String, PathBuf)> = snippets
+        let knowledge_files: Vec<(String, PathBuf)> = notes
             .iter()
+            .chain(snippets.iter())
             .map(|s| (s.dest_name.clone(), s.src_path.clone()))
             .collect();
         WorkspaceBuilder::materialize_knowledge(&ws_root, &knowledge_files)?;
@@ -1676,6 +1865,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn event_on_date(occurred_at: &str, day: chrono::NaiveDate) -> bool {
+    DateTime::parse_from_rfc3339(occurred_at)
+        .map(|d| d.date_naive() == day)
+        .unwrap_or(false)
+}
+
+async fn collect_refine_text(mut rx: mpsc::Receiver<RuntimeEvent>) -> String {
+    let mut last = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            RuntimeEvent::Result {
+                is_error: true, ..
+            } => return String::new(),
+            RuntimeEvent::Result { text, .. } => {
+                if !text.trim().is_empty() {
+                    return text;
+                }
+                return last;
+            }
+            RuntimeEvent::AssistantText { text } => last = text,
+            RuntimeEvent::Error { .. } => return String::new(),
+            _ => {}
+        }
+    }
+    last
+}
+
 fn append_transcript(path: &std::path::Path, line: &str) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2056,12 +2272,171 @@ mod tests {
         .unwrap();
         assert!(ctx.contains("gpio 4"), "context missing knowledge: {ctx}");
         assert!(ctx.contains("Face knowledge (committed)"));
+        assert!(ctx.contains("## Injected this turn"));
+        assert!(ctx.contains("**knowledge**"));
+        let injected = fs::read_to_string(
+            dir.path()
+                .join("workspaces")
+                .join(&task.id)
+                .join(".methodus/injected.md"),
+        )
+        .unwrap();
+        assert!(injected.contains("latch"));
+        let evs = engine.store().list_events(Some(&task.id), 80).unwrap();
+        assert!(
+            evs.iter()
+                .any(|e| e.event_type == crate::learning::INJECTED_EVENT),
+            "missing learning.injected: {evs:?}"
+        );
         assert!(dir
             .path()
             .join("workspaces")
             .join(&task.id)
             .join("face-context/knowledge/latch.md")
             .is_file());
+    }
+
+    #[tokio::test]
+    async fn inject_increments_note_hits_and_promotes() {
+        let (engine, dir) = engine_with_turns(vec![
+            vec![ok_result("ok1")],
+            vec![ok_result("ok2")],
+            vec![ok_result("ok3")],
+        ]);
+        let now = Utc::now();
+        let rel = "faces/general/notes/latch-gpio.md";
+        fs::create_dir_all(dir.path().join("faces/general/notes")).unwrap();
+        fs::write(
+            dir.path().join(rel),
+            "---\nkind: note\nhits: 0\nstatus: committed\n---\n\n# latch gpio\n\n- probe gpio 4 first\n",
+        )
+        .unwrap();
+        engine
+            .store()
+            .insert_knowledge(&KnowledgeItem {
+                id: "know_note".into(),
+                face_id: Some("general".into()),
+                project_id: None,
+                path: rel.into(),
+                content_hash: "h".into(),
+                source: crate::refine::HARNESS_NOTE_SOURCE.into(),
+                confidence: Some(0.55),
+                scope: Some("note".into()),
+                status: KnowledgeStatus::Committed,
+                conflict_of: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        for title in ["debug latch a", "debug latch b", "debug latch c"] {
+            let task = engine
+                .create_task(title, "debug the latch gpio", None, None)
+                .unwrap();
+            let mut rx = engine.run_task(&task.id, false).await.unwrap();
+            while rx.recv().await.is_some() {}
+        }
+        let body = fs::read_to_string(dir.path().join(rel)).unwrap();
+        assert!(body.contains("hits: 3"), "{body}");
+        engine.tick_learning().unwrap();
+        let jobs = engine.store().list_jobs().unwrap();
+        assert!(
+            jobs.iter().any(|j| j.kind == JobKind::ProposeSkill),
+            "3 injections should enqueue skill promote: {jobs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn injection_miss_lowers_confidence() {
+        let (engine, dir) = engine_with(vec![ok_result(
+            "unknown: latch protocol still broken on gpio",
+        )]);
+        let now = Utc::now();
+        let rel = "faces/general/knowledge/latch.md";
+        fs::create_dir_all(dir.path().join("faces/general/knowledge")).unwrap();
+        fs::write(
+            dir.path().join(rel),
+            "# Latch protocol\n\nThe latch uses gpio 4.\n",
+        )
+        .unwrap();
+        engine
+            .store()
+            .insert_knowledge(&KnowledgeItem {
+                id: "know_latch".into(),
+                face_id: Some("general".into()),
+                project_id: None,
+                path: rel.into(),
+                content_hash: "h".into(),
+                source: "experience".into(),
+                confidence: Some(0.8),
+                scope: None,
+                status: KnowledgeStatus::Committed,
+                conflict_of: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let task = engine
+            .create_task("debug latch", "debug the latch gpio", None, None)
+            .unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        engine.tick_learning().unwrap();
+
+        let item = engine.store().get_knowledge("know_latch").unwrap().unwrap();
+        assert!(
+            item.confidence.unwrap() < 0.8,
+            "miss should downrank: {:?}",
+            item.confidence
+        );
+        let qs = engine.store().list_questions(None).unwrap();
+        assert!(
+            qs.iter()
+                .any(|q| q.question.contains("Injected") && q.question.contains("latch")),
+            "expected mentor question: {qs:?}"
+        );
+        let evs = engine.store().list_events(Some(&task.id), 200).unwrap();
+        assert!(evs
+            .iter()
+            .any(|e| e.event_type == crate::learning::INJECTION_MISSED_EVENT));
+    }
+
+    #[tokio::test]
+    async fn trajectory_skill_skips_experience_knowledge() {
+        let (engine, _dir) = engine_with(vec![
+            tool_start_with("Bash", serde_json::json!({"command": "ps aux | grep nginx"})),
+            tool_start_with("Read", serde_json::json!({"path": "/proc/1/stat"})),
+            tool_start_with("Grep", serde_json::json!({"pattern": "cpu"})),
+            ok_result(
+                "The latch on the carrier board uses gpio 4 with a 3.3V pull-up.",
+            ),
+        ]);
+        let task = engine
+            .create_task("sample cpu", "sample cpu of nginx", None, None)
+            .unwrap();
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        engine.tick_learning().unwrap();
+        let experience_cands: Vec<_> = engine
+            .store()
+            .list_knowledge(Some(KnowledgeStatus::Candidate))
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.source == "experience")
+            .collect();
+        assert!(
+            experience_cands.is_empty(),
+            "trajectory distill should not also mint knowledge: {experience_cands:?}"
+        );
+        assert!(engine
+            .store()
+            .list_knowledge(Some(KnowledgeStatus::Candidate))
+            .unwrap()
+            .iter()
+            .any(|k| k.source == crate::learning::SKILL_DRAFT_SOURCE));
     }
 
     #[tokio::test]
@@ -2442,8 +2817,15 @@ mod tests {
         engine.tick_learning().unwrap();
 
         let qs = engine.store().list_questions(None).unwrap();
-        assert_eq!(qs.len(), 1);
-        assert!(qs[0].frequency >= 2.0);
+        let gap_q = qs
+            .iter()
+            .find(|q| q.question.starts_with("What should we know about"))
+            .expect("gap question");
+        assert!(
+            gap_q.frequency >= 2.0,
+            "gap frequency: {} qs={qs:?}",
+            gap_q.frequency
+        );
         let conflicts = engine
             .store()
             .list_knowledge(Some(KnowledgeStatus::Conflicted))
@@ -2454,7 +2836,7 @@ mod tests {
         assert!(!still.contains("gpio 7"));
 
         let answered = engine
-            .answer_question(&qs[0].id, "the latch uses 3.3V pull-up")
+            .answer_question(&gap_q.id, "the latch uses 3.3V pull-up")
             .unwrap();
         assert_eq!(answered.status, QuestionStatus::Answered);
         let from_answer = engine
@@ -2468,19 +2850,23 @@ mod tests {
     }
 
     fn tool_start(name: &str) -> RuntimeEvent {
+        tool_start_with(name, serde_json::json!({}))
+    }
+
+    fn tool_start_with(name: &str, input: serde_json::Value) -> RuntimeEvent {
         RuntimeEvent::ToolCallStarted {
             id: name.to_string(),
             name: name.to_string(),
-            input: serde_json::json!({}),
+            input,
         }
     }
 
     #[tokio::test]
     async fn auto_skill_draft_then_review_installs_live_skill() {
         let (engine, _dir) = engine_with(vec![
-            tool_start("Bash"),
-            tool_start("Read"),
-            tool_start("Grep"),
+            tool_start_with("Bash", serde_json::json!({"command": "ps aux | grep nginx"})),
+            tool_start_with("Read", serde_json::json!({"path": "/proc/1/stat"})),
+            tool_start_with("Grep", serde_json::json!({"pattern": "cpu"})),
             ok_result("sampled"),
         ]);
         let task = engine
@@ -2516,27 +2902,104 @@ mod tests {
         let catalog = crate::resolution::scan_skills(engine.home());
         assert!(catalog.iter().any(|s| s.name.contains("sample")));
 
-        // Second draft for the same slug → conflict; replace promotes the new candidate.
+        // Same trajectory against a live skill → incremental patch, not a parallel draft.
         let again = crate::learning::propose_skill_from_task(
             engine.store(),
             engine.home(),
             &task.id,
             None,
         )
-        .unwrap()
-        .expect("second draft");
-        assert_eq!(again.status, KnowledgeStatus::Conflicted);
-        assert!(engine
-            .review_knowledge(&again.id, KnowledgeReviewAction::Commit)
-            .is_err());
-        let replaced = engine
-            .review_knowledge(&again.id, KnowledgeReviewAction::ReplaceExisting)
+        .unwrap();
+        if let Some(patch) = again {
+            assert_eq!(patch.source, crate::refine::SKILL_PATCH_SOURCE);
+            let applied = engine
+                .review_knowledge(&patch.id, KnowledgeReviewAction::Commit)
+                .unwrap();
+            assert_eq!(applied.status, KnowledgeStatus::Committed);
+            assert!(applied.path.starts_with("skills/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_tool_calls_do_not_draft_skill() {
+        let (engine, _dir) = engine_with(vec![
+            tool_start("Bash"),
+            tool_start("Read"),
+            tool_start("Grep"),
+            ok_result("sampled"),
+        ]);
+        let task = engine
+            .create_task("sample cpu", "sample cpu of nginx", None, None)
             .unwrap();
-        assert_eq!(replaced.status, KnowledgeStatus::Committed);
-        assert!(replaced.path.starts_with("skills/"));
-        assert!(engine.home().join(&replaced.path).exists());
-        let still = engine.store().get_knowledge(&again.id).unwrap().unwrap();
-        assert_eq!(still.status, KnowledgeStatus::Committed);
+        let mut rx = engine.run_task(&task.id, false).await.unwrap();
+        while rx.recv().await.is_some() {}
+        engine.tick_learning().unwrap();
+        let auto_drafts: Vec<_> = engine
+            .store()
+            .list_knowledge(Some(KnowledgeStatus::Candidate))
+            .unwrap()
+            .into_iter()
+            .filter(|k| {
+                k.source == crate::learning::SKILL_DRAFT_SOURCE
+                    || k.source == crate::refine::HARNESS_NOTE_SOURCE
+                    || k.source == crate::refine::SKILL_PATCH_SOURCE
+            })
+            .collect();
+        assert!(
+            auto_drafts.is_empty(),
+            "bare Use Tool steps must not distill"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_refine_llm_polishes_note() {
+        let polished = r#"{"skip":false,"rationale":"prefer ss -tnp","note_body":"- run ss -tnp before blaming the app"}"#;
+        let (engine, dir) = engine_with(vec![ok_result(polished)]);
+        let now = Utc::now();
+        let proposal = crate::refine::RefinementProposal {
+            target_kind: crate::refine::RefineTargetKind::Note,
+            target_id: "tcp-note".into(),
+            op: crate::refine::RefineOp::Create,
+            add_procedure: Vec::new(),
+            add_pitfalls: Vec::new(),
+            note_body: Some("- Use `Read`".into()),
+            evidence_refs: vec!["task_refine".into()],
+            rationale: "raw".into(),
+            hits: 1,
+            planner: "rules".into(),
+        };
+        let json = serde_json::to_string_pretty(&proposal).unwrap();
+        let rel = "faces/general/notes/.candidates/tcp-note.md";
+        let body = format!(
+            "---\nkind: note\nplanner: rules\nsource_task: task_refine\n---\n\n# tcp-note\n\n- Use `Read`\n\n## Proposal\n\n```json\n{json}\n```\n"
+        );
+        fs::create_dir_all(dir.path().join("faces/general/notes/.candidates")).unwrap();
+        fs::write(dir.path().join(rel), &body).unwrap();
+        engine
+            .store()
+            .insert_knowledge(&KnowledgeItem {
+                id: "know_refine".into(),
+                face_id: Some("general".into()),
+                project_id: None,
+                path: rel.into(),
+                content_hash: "h".into(),
+                source: crate::refine::HARNESS_NOTE_SOURCE.into(),
+                confidence: Some(0.5),
+                scope: Some("note".into()),
+                status: KnowledgeStatus::Candidate,
+                conflict_of: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let n = engine.tick_refine_llm().await.unwrap();
+        assert_eq!(n, 1);
+        let rewritten = fs::read_to_string(dir.path().join(rel)).unwrap();
+        assert!(rewritten.contains("planner: llm"), "{rewritten}");
+        assert!(rewritten.contains("prefer ss -tnp"), "{rewritten}");
+        assert!(rewritten.contains("ss -tnp before blaming"));
     }
 
     #[test]

@@ -16,6 +16,10 @@ use methodus_domain::{
 use methodus_store::Store;
 
 use crate::error::CoreError;
+pub use crate::refine::{
+    is_refinement_source, knowledge_inbox_label, knowledge_inbox_tag, HARNESS_NOTE_SOURCE,
+    SKILL_PATCH_SOURCE,
+};
 
 pub const DEFAULT_BUDGET: &str = r#"{"max_ms":200,"tokens":0}"#;
 pub const SKILL_DRAFT_SOURCE: &str = "skill_draft";
@@ -238,7 +242,10 @@ fn select_committed_knowledge_for_face(
         if !knowledge_belongs_to_face(&item, face_id) {
             continue;
         }
-        if item.source == SKILL_DRAFT_SOURCE {
+        if item.source == SKILL_DRAFT_SOURCE
+            || item.source == crate::refine::SKILL_PATCH_SOURCE
+            || item.source == crate::refine::HARNESS_NOTE_SOURCE
+        {
             continue;
         }
         if matches!(item.scope.as_deref(), Some("skill") | Some("interaction")) {
@@ -382,6 +389,35 @@ pub fn render_knowledge_context(snippets: &[KnowledgeSnippet]) -> String {
     out
 }
 
+/// Short inventory of what this turn actually loaded — first thing the executor should see.
+pub fn render_injected_inventory(
+    notes: &[KnowledgeSnippet],
+    knowledge: &[KnowledgeSnippet],
+) -> String {
+    let mut out = String::from(
+        "\n## Injected this turn\n\n\
+         Methodus selected these committed Face items for this task. Prefer them over improvising.\n\n",
+    );
+    if notes.is_empty() && knowledge.is_empty() {
+        out.push_str("- (none)\n");
+        return out;
+    }
+    for snip in notes {
+        out.push_str(&format!(
+            "- **note** `{}` → `face-context/knowledge/{}`\n",
+            snip.title, snip.dest_name
+        ));
+    }
+    for snip in knowledge {
+        out.push_str(&format!(
+            "- **knowledge** `{}` ({}) → `face-context/knowledge/{}`\n",
+            snip.title, snip.origin, snip.dest_name
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 fn knowledge_belongs_to_face(item: &KnowledgeItem, face_id: &str) -> bool {
     match item.face_id.as_deref() {
         Some(id) => id == face_id,
@@ -415,7 +451,7 @@ fn knowledge_title(path: &str, body: &str) -> String {
         .unwrap_or_else(|| "note".to_string())
 }
 
-fn excerpt_body(body: &str, max_chars: usize) -> String {
+pub(crate) fn excerpt_body(body: &str, max_chars: usize) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() <= max_chars {
         return trimmed.to_string();
@@ -424,7 +460,7 @@ fn excerpt_body(body: &str, max_chars: usize) -> String {
     format!("{t}...")
 }
 
-fn unique_dest_name(path: &str, id: &str, used: &[String]) -> String {
+pub(crate) fn unique_dest_name(path: &str, id: &str, used: &[String]) -> String {
     let raw_stem = Path::new(path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -443,11 +479,11 @@ fn unique_dest_name(path: &str, id: &str, used: &[String]) -> String {
     name
 }
 
-fn short_id() -> String {
+pub(crate) fn short_id() -> String {
     Uuid::new_v4().to_string().replace('-', "")[..12].to_string()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
@@ -554,6 +590,7 @@ pub fn run_job(store: &Arc<Store>, home: &Path, job: &LearningJob) -> Result<(),
         }
         JobKind::AutoResearch => crate::curiosity::run_auto_research(store, home, &refs)?,
         JobKind::SynthesizeMethod => crate::evolution::run_synthesize_method(store, home, &refs)?,
+        JobKind::ProposeRefinement => crate::refine::run_propose_refinement(store, home, &refs)?,
     }
     Ok(())
 }
@@ -615,36 +652,180 @@ fn run_detect(store: &Store, home: &Path, refs: &JobRefs) -> Result<(), CoreErro
             gaps.push(sig);
         }
     }
-    let hints = extract_knowledge_hints(&body);
-    let result = result_section(&body);
     let face = exp.face_id.clone().or_else(|| refs.face_id.clone());
 
     for gap in &gaps {
         upsert_question(store, gap, &exp, face.as_deref())?;
     }
+    record_injection_misses(store, home, &exp, &gaps)?;
 
-    if !gaps.is_empty() || !hints.is_empty() || result.trim().chars().count() >= 20 {
-        let mut propose_refs = refs.clone();
-        propose_refs.source = Some("experience".to_string());
-        enqueue_job(
+    enqueue_job(
+        store,
+        JobKind::ProposeRefinement,
+        &format!("refine:exp:{}", exp.id),
+        refs,
+        6,
+    )?;
+    Ok(())
+}
+
+pub const INJECTED_EVENT: &str = "learning.injected";
+pub const INJECTION_MISSED_EVENT: &str = "learning.injection_missed";
+
+/// Count Face notes/knowledge selected for this task. Deduped per task; notes gain hits.
+pub fn record_injections(
+    store: &Store,
+    home: &Path,
+    task_id: &str,
+    notes: &[KnowledgeSnippet],
+    knowledge: &[KnowledgeSnippet],
+) -> Result<usize, CoreError> {
+    let already = injected_ids_for_task(store, task_id)?;
+    let mut n = 0usize;
+    for (snip, kind) in notes
+        .iter()
+        .map(|s| (s, "note"))
+        .chain(knowledge.iter().map(|s| (s, "knowledge")))
+    {
+        if already.iter().any(|id| id == &snip.id) {
+            continue;
+        }
+        if snip.id.starts_with("pack_") || snip.origin.starts_with("team:") {
+            emit(
+                store,
+                INJECTED_EVENT,
+                Some(task_id),
+                serde_json::json!({
+                    "knowledge_id": snip.id,
+                    "kind": kind,
+                    "origin": snip.origin,
+                    "hits": 0,
+                }),
+            );
+            n += 1;
+            continue;
+        }
+        let Some(item) = store.get_knowledge(&snip.id)? else {
+            continue;
+        };
+        let hits = if item.source == crate::refine::HARNESS_NOTE_SOURCE {
+            crate::refine::bump_note_inject_hit(home, &item)?
+        } else {
+            count_injected_events(store, &item.id)? + 1
+        };
+        emit(
             store,
-            JobKind::ProposeKnowledge,
-            &format!("propose:exp:{}", exp.id),
-            &propose_refs,
-            5,
-        )?;
+            INJECTED_EVENT,
+            Some(task_id),
+            serde_json::json!({
+                "knowledge_id": item.id,
+                "kind": kind,
+                "hits": hits,
+            }),
+        );
+        if item.source == crate::refine::HARNESS_NOTE_SOURCE {
+            crate::refine::enqueue_note_skill_promote(store, &item, hits, Some(task_id))?;
+        }
+        n += 1;
     }
-    if skill_worthy(
-        &result_section(&body),
-        count_tool_events(store, &exp.task_id),
-    ) {
-        enqueue_job(
+    Ok(n)
+}
+
+fn injected_ids_for_task(store: &Store, task_id: &str) -> Result<Vec<String>, CoreError> {
+    let mut ids = Vec::new();
+    for ev in store.list_events(Some(task_id), 400)? {
+        if ev.event_type != INJECTED_EVENT {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
+            if let Some(id) = v.get("knowledge_id").and_then(|x| x.as_str()) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn count_injected_events(store: &Store, knowledge_id: &str) -> Result<i64, CoreError> {
+    let mut n = 0i64;
+    for ev in store.list_events(None, 2000)? {
+        if ev.event_type != INJECTED_EVENT {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
+            if v.get("knowledge_id").and_then(|x| x.as_str()) == Some(knowledge_id) {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// After this task used injected Face items, the same gap still appeared → downrank + ask.
+fn record_injection_misses(
+    store: &Store,
+    home: &Path,
+    exp: &Experience,
+    gaps: &[String],
+) -> Result<(), CoreError> {
+    if gaps.is_empty() {
+        return Ok(());
+    }
+    let gap_text = gaps.join("\n");
+    let mut asked = 0usize;
+    for ev in store.list_events(Some(&exp.task_id), 400)? {
+        if ev.event_type != INJECTED_EVENT {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.payload) else {
+            continue;
+        };
+        let Some(id) = v.get("knowledge_id").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if id.starts_with("pack_") {
+            continue;
+        }
+        let Some(mut item) = store.get_knowledge(id)? else {
+            continue;
+        };
+        if item.status != KnowledgeStatus::Committed {
+            continue;
+        }
+        let body = fs::read_to_string(home.join(&item.path)).unwrap_or_default();
+        if knowledge_score(&gap_text, &item.path, &body) == 0 {
+            continue;
+        }
+        let old = item.confidence.unwrap_or(0.55);
+        let next = (old * 0.7).max(0.2);
+        item.confidence = Some(next);
+        item.updated_at = Utc::now();
+        store.update_knowledge(&item)?;
+        emit(
             store,
-            JobKind::ProposeSkill,
-            &format!("skill:exp:{}", exp.id),
-            refs,
-            4,
-        )?;
+            INJECTION_MISSED_EVENT,
+            Some(&exp.task_id),
+            serde_json::json!({
+                "knowledge_id": item.id,
+                "confidence": next,
+                "gap": gaps.first().cloned().unwrap_or_default(),
+            }),
+        );
+        if asked < 2 {
+            let title = knowledge_title(&item.path, &body);
+            let gap0 = gaps.first().map(String::as_str).unwrap_or("this gap");
+            let q = format!(
+                "Injected `{title}` did not cover: {gap0}. Revise that note, or dismiss it?"
+            );
+            upsert_mentor_question(
+                store,
+                &q,
+                "injection miss",
+                exp,
+                item.face_id.as_deref(),
+            )?;
+            asked += 1;
+        }
     }
     Ok(())
 }
@@ -1066,6 +1247,75 @@ fn write_at(
     Ok(())
 }
 
+/// Write or refresh a knowledge candidate at an explicit path (notes / skill patches).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_knowledge_file(
+    store: &Store,
+    home: &Path,
+    path: &str,
+    id: &str,
+    face: &str,
+    source: &str,
+    status: KnowledgeStatus,
+    conflict_of: Option<String>,
+    confidence: f64,
+    body: &str,
+    _task_id: Option<&str>,
+    scope: Option<&str>,
+    emit_task_id: Option<&str>,
+) -> Result<Option<KnowledgeItem>, CoreError> {
+    let hash = sha256_hex(body.as_bytes());
+    let existing = store.list_knowledge_by_path(path)?;
+    if let Some(prev) = existing.iter().find(|k| k.content_hash == hash) {
+        return Ok(Some(prev.clone()));
+    }
+    let now = Utc::now();
+    if let Some(mut prev) = existing
+        .into_iter()
+        .find(|k| k.status == KnowledgeStatus::Candidate || k.status == KnowledgeStatus::Conflicted)
+    {
+        let abs = home.join(&prev.path);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&abs, body)?;
+        prev.content_hash = hash;
+        prev.status = status;
+        prev.conflict_of = conflict_of;
+        prev.updated_at = now;
+        store.update_knowledge(&prev)?;
+        return Ok(Some(prev));
+    }
+    let abs = home.join(path);
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&abs, body)?;
+    let item = KnowledgeItem {
+        id: id.to_string(),
+        face_id: Some(face.to_string()),
+        project_id: None,
+        path: path.to_string(),
+        content_hash: hash,
+        source: source.to_string(),
+        confidence: Some(confidence),
+        scope: scope.map(str::to_string),
+        status,
+        conflict_of,
+        version: 1,
+        created_at: now,
+        updated_at: now,
+    };
+    store.insert_knowledge(&item)?;
+    emit(
+        store,
+        "learning.candidate_created",
+        emit_task_id,
+        serde_json::json!({"knowledge_id": id, "path": path, "kind": source}),
+    );
+    Ok(Some(item))
+}
+
 /// Force a skill draft from a task (tests). Never writes a live skill.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn propose_skill_from_task(
@@ -1223,17 +1473,35 @@ fn write_skill_candidate(
                 crate::curiosity::is_module_expert_experience(&body, method_id.as_deref())
             })
     });
+    let skill_from_study = if study_skill {
+        refs.experience_id.as_deref().and_then(|eid| {
+            store.get_experience(eid).ok().flatten().map(|e| {
+                let body = fs::read_to_string(home.join(&e.path)).unwrap_or_default();
+                crate::curiosity::extract_skill_section(&body)
+            })
+        })
+    } else {
+        None
+    };
+    let skill_from_study = skill_from_study.filter(|s| !s.trim().is_empty());
     let explicit = explicit || study_skill;
     if !explicit && !skill_worthy(&result, tools.len()) {
         return Ok(None);
     }
-    if tools.is_empty() && result.trim().is_empty() && !explicit {
+    if tools.is_empty() && result.trim().is_empty() && skill_from_study.is_none() && !explicit {
         return Ok(None);
     }
 
     let title = hint
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            skill_from_study.as_ref().and_then(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with('#'))
+            })
+        })
         .unwrap_or(task.title.trim());
     let slug = skill_slug(title, task_id);
     let face = refs
@@ -1246,19 +1514,17 @@ fn write_skill_candidate(
         ellipsize_desc(&task.request)
     );
     let desc_yaml = yaml_quote(&desc);
-    let procedure = if tools.is_empty() {
-        if result.trim().is_empty() {
+    let procedure = if let Some(skill) = skill_from_study.as_deref() {
+        skill.trim().to_string()
+    } else {
+        let from_events = collect_procedure_steps(store, task_id);
+        if !from_events.is_empty() {
+            from_events
+        } else if result.trim().is_empty() {
             format!("1. Revisit the original request:\n   {}", task.request)
         } else {
             result.trim().to_string()
         }
-    } else {
-        tools
-            .iter()
-            .enumerate()
-            .map(|(i, t)| format!("{}. Use `{t}`", i + 1))
-            .collect::<Vec<_>>()
-            .join("\n")
     };
     let pit_block = if pitfalls.is_empty() {
         "- (none recorded yet)".to_string()
@@ -1269,6 +1535,43 @@ fn write_skill_candidate(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    if let Some((name, live)) = crate::refine::find_related_skill(home, title) {
+        let live_body = fs::read_to_string(&live).unwrap_or_default();
+        let add_procedure: Vec<String> = procedure
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                l.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ')
+                    .trim()
+                    .to_string()
+            })
+            .filter(|c| {
+                let key = c.chars().take(40).collect::<String>().to_lowercase();
+                !live_body.to_lowercase().contains(&key) && c.chars().count() >= 8
+            })
+            .take(6)
+            .collect();
+        let add_pitfalls: Vec<String> = pitfalls
+            .iter()
+            .filter(|c| {
+                let key = c.chars().take(40).collect::<String>().to_lowercase();
+                !live_body.to_lowercase().contains(&key) && c.chars().count() >= 8
+            })
+            .cloned()
+            .take(6)
+            .collect();
+        return crate::refine::write_skill_patch(
+            store,
+            home,
+            refs,
+            &task,
+            &face,
+            &name,
+            add_procedure,
+            add_pitfalls,
+        );
+    }
     let now = Utc::now();
     let id = format!("know_{}", short_id());
     let rel = format!("skills/.candidates/{slug}/SKILL.md");
@@ -1287,7 +1590,10 @@ fn write_skill_candidate(
          ## Pitfalls\n\n\
          {pit_block}\n\n\
          ## Verification\n\n\
-         Re-run the original request and confirm the same outcome.\n"
+         Re-run the original request and confirm the same outcome.\n\n\
+         ## Evidence\n\n\
+         - task: `{task_id}`\n\
+         - distilled: {now}\n"
     );
     let hash = sha256_hex(body.as_bytes());
     let existing = store.list_knowledge_by_path(&rel)?;
@@ -1309,15 +1615,35 @@ fn write_skill_candidate(
         return Ok(Some(prev));
     }
     let live = home.join(format!("skills/{slug}/SKILL.md"));
-    let live_rows = store.list_knowledge_by_path(&format!("skills/{slug}/SKILL.md"))?;
     let (path, status, conflict_of) = if live.exists() {
+        if let Some((name, live_path)) = crate::refine::find_related_skill(home, title) {
+            let live_body = fs::read_to_string(&live_path).unwrap_or_default();
+            let add_procedure = procedure
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !live_body.contains(*l))
+                .map(str::to_string)
+                .take(6)
+                .collect();
+            return crate::refine::write_skill_patch(
+                store,
+                home,
+                refs,
+                &task,
+                &face,
+                &name,
+                add_procedure,
+                pitfalls.clone(),
+            );
+        }
         (
             format!("skills/.candidates/{slug}--{id}/SKILL.md"),
             KnowledgeStatus::Conflicted,
-            live_rows
-                .iter()
+            store
+                .list_knowledge_by_path(&format!("skills/{slug}/SKILL.md"))?
+                .into_iter()
                 .find(|k| k.status == KnowledgeStatus::Committed)
-                .map(|k| k.id.clone()),
+                .map(|k| k.id),
         )
     } else {
         (rel, KnowledgeStatus::Candidate, None)
@@ -1368,11 +1694,7 @@ fn skill_worthy(result: &str, tool_count: usize) -> bool {
     steps >= 3
 }
 
-fn count_tool_events(store: &Store, task_id: &str) -> usize {
-    collect_tools(store, task_id).len()
-}
-
-fn collect_tools(store: &Store, task_id: &str) -> Vec<String> {
+pub(crate) fn collect_tools(store: &Store, task_id: &str) -> Vec<String> {
     let Ok(events) = store.list_events(Some(task_id), 400) else {
         return Vec::new();
     };
@@ -1390,7 +1712,62 @@ fn collect_tools(store: &Store, task_id: &str) -> Vec<String> {
     out
 }
 
-fn collect_pitfalls(store: &Store, task_id: &str) -> Vec<String> {
+/// Ordered tool steps from the session event stream (trajectory-first distillation).
+pub(crate) fn collect_procedure_steps(store: &Store, task_id: &str) -> String {
+    let Ok(events) = store.list_events(Some(task_id), 400) else {
+        return String::new();
+    };
+    let mut steps = Vec::new();
+    for ev in events {
+        let Ok(parsed) = serde_json::from_str::<RuntimeEvent>(&ev.payload) else {
+            continue;
+        };
+        if let RuntimeEvent::ToolCallStarted { name, input, .. } = parsed {
+            let detail = summarize_tool_input(&name, &input);
+            let line = if detail.is_empty() {
+                format!("Use `{name}`")
+            } else {
+                format!("`{name}` — {detail}")
+            };
+            if steps.last().is_some_and(|prev: &String| prev == &line) {
+                continue;
+            }
+            steps.push(line);
+        }
+    }
+    if steps.is_empty() {
+        return String::new();
+    }
+    steps
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {s}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
+    let pick = |keys: &[&str]| -> Option<String> {
+        for key in keys {
+            if let Some(v) = input.get(*key).and_then(|v| v.as_str()) {
+                let t = v.trim();
+                if !t.is_empty() {
+                    return Some(ellipsize_desc(t));
+                }
+            }
+        }
+        None
+    };
+    match name {
+        "Read" | "Write" | "Edit" | "StrReplace" => pick(&["path", "file_path", "target_file"]),
+        "Shell" | "Bash" => pick(&["command"]),
+        "Grep" | "Glob" => pick(&["pattern", "glob_pattern"]),
+        _ => pick(&["path", "command", "pattern", "query", "url"]),
+    }
+    .unwrap_or_default()
+}
+
+pub(crate) fn collect_pitfalls(store: &Store, task_id: &str) -> Vec<String> {
     let Ok(events) = store.list_events(Some(task_id), 400) else {
         return Vec::new();
     };
@@ -1534,6 +1911,21 @@ mod tests {
                 updated_at: now,
             })
             .unwrap();
+        store
+            .insert_task(&methodus_domain::Task {
+                id: "task_plain".into(),
+                title: "fix the latch".into(),
+                request: "fix the latch".into(),
+                project_id: None,
+                status: methodus_domain::TaskStatus::Reviewing,
+                runtime: None,
+                workspace_id: None,
+                resolution: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
         enqueue_extract(&store, &store.get_experience("exp_plain").unwrap().unwrap()).unwrap();
         scheduler::tick(&store, dir.path()).unwrap();
         let cands = store
@@ -1563,6 +1955,21 @@ mod tests {
                 content_hash: "h2".into(),
                 outcome: Some("failed".into()),
                 summary: Some("executor timed out talking to the probe".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store
+            .insert_task(&methodus_domain::Task {
+                id: "task_fail".into(),
+                title: "probe".into(),
+                request: "probe".into(),
+                project_id: None,
+                status: methodus_domain::TaskStatus::Failed,
+                runtime: None,
+                workspace_id: None,
+                resolution: None,
+                version: 1,
                 created_at: now,
                 updated_at: now,
             })
@@ -1685,6 +2092,10 @@ mod tests {
         assert_eq!(picked.len(), 1);
         assert!(picked[0].excerpt.contains("gpio 4"));
         assert!(render_knowledge_context(&picked).contains("face-context/knowledge/"));
+        let inv = render_injected_inventory(&[], &picked);
+        assert!(inv.contains("## Injected this turn"));
+        assert!(inv.contains("**knowledge**"));
+        assert!(render_injected_inventory(&[], &[]).contains("(none)"));
     }
 
     fn sample_question(id: &str, value: f64, status: QuestionStatus) -> Question {

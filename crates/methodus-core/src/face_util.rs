@@ -61,6 +61,7 @@ fn ensure_personal_face(
     fs::create_dir_all(dir.join("knowledge"))?;
     fs::create_dir_all(dir.join("experiences"))?;
     fs::create_dir_all(dir.join("hypotheses"))?;
+    fs::create_dir_all(dir.join("notes"))?;
     let name = scope.trim();
     let name = if name.is_empty() { id } else { name };
     let mut tags: Vec<String> = scope

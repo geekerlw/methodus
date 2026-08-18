@@ -26,6 +26,13 @@ pub struct UserConfig {
     /// OS notifications when Methodus needs you (approval, your turn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notifications: Option<bool>,
+    /// Polish rule-based note/patch drafts with one budgeted executor call.
+    /// Default on. Set `false` to keep rules-only drafts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine_llm: Option<bool>,
+    /// Max polish calls per calendar day. `0` disables. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine_llm_daily_cap: Option<i64>,
 }
 
 impl UserConfig {
@@ -53,6 +60,14 @@ impl UserConfig {
 
     pub fn notifications_enabled(&self) -> bool {
         self.notifications != Some(false)
+    }
+
+    pub fn refine_llm_enabled(&self) -> bool {
+        self.refine_llm != Some(false) && self.refine_llm_daily_cap() > 0
+    }
+
+    pub fn refine_llm_daily_cap(&self) -> i64 {
+        self.refine_llm_daily_cap.unwrap_or(8).max(0)
     }
 
     pub fn cycle_runtime(&mut self) {
@@ -154,6 +169,7 @@ mod tests {
             context_faces: Some(vec!["storage".into()]),
             workspace_root: Some("/data/runs".into()),
             notifications: Some(true),
+            ..Default::default()
         };
         cfg.save(dir.path()).unwrap();
         let mut loaded = UserConfig::load(dir.path());
@@ -171,5 +187,15 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("config.yaml"), "notifications: false\n").unwrap();
         assert!(!UserConfig::load(dir.path()).notifications_enabled());
+    }
+
+    #[test]
+    fn refine_llm_defaults_on() {
+        let cfg = UserConfig::default();
+        assert!(cfg.refine_llm_enabled());
+        assert_eq!(cfg.refine_llm_daily_cap(), 8);
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), "refine_llm: false\n").unwrap();
+        assert!(!UserConfig::load(dir.path()).refine_llm_enabled());
     }
 }

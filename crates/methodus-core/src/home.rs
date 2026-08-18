@@ -60,6 +60,7 @@ fn seed_home(home: &Path) -> Result<(), CoreError> {
         "faces/general/experiences",
         "faces/general/knowledge",
         "faces/general/hypotheses",
+        "faces/general/notes",
         "skills/workspace-hygiene",
         "skills/module-expert-learning",
     ] {

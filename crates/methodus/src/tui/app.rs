@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -31,8 +33,6 @@ pub enum Overlay {
     Inbox,
     Sessions,
     Faces,
-    Events,
-    Jobs,
 }
 
 impl Overlay {
@@ -151,18 +151,11 @@ pub enum Command {
         id: String,
         action: HypothesisReviewAction,
     },
-    IngestDocs {
-        sources: Vec<String>,
-    },
-    SurveyRepo,
     CleanupWorkspaces {
         max_age_days: i64,
     },
-    CancelLearningJob {
-        id: String,
-    },
-    StudyModule {
-        scope: String,
+    Learn {
+        hint: String,
         sources: Vec<String>,
         face: Option<String>,
     },
@@ -183,9 +176,6 @@ pub struct App {
     pub runtime: Option<String>,
     pub default_face: Option<String>,
     pub context_faces: Vec<String>,
-    pub system_events: Vec<methodus_store::EventRecord>,
-    pub learning_jobs: Vec<methodus_domain::LearningJob>,
-    pub system_sel: usize,
     pub permission_mode: String,
     pub workspace_root: String,
     pub notifications: bool,
@@ -240,6 +230,7 @@ pub struct App {
     last_activity: Instant,
     last_idle_ask: Option<Instant>,
     pending_quit_at: Option<Instant>,
+    refine_llm_inflight: Arc<AtomicBool>,
 }
 
 impl App {
@@ -276,9 +267,6 @@ impl App {
             ),
             default_face: cfg.default_face.clone(),
             context_faces: cfg.context_faces.clone().unwrap_or_default(),
-            system_events: Vec::new(),
-            learning_jobs: Vec::new(),
-            system_sel: 0,
             permission_mode: cfg
                 .permission_mode
                 .clone()
@@ -335,6 +323,7 @@ impl App {
             last_activity: Instant::now(),
             last_idle_ask: None,
             pending_quit_at: None,
+            refine_llm_inflight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -439,6 +428,25 @@ impl App {
         self.event_rx.is_some()
     }
 
+    fn maybe_spawn_refine_llm(&self) {
+        if self.busy() || self.tick % 8 != 0 {
+            return;
+        }
+        if self
+            .refine_llm_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let engine = self.engine.clone();
+        let flag = self.refine_llm_inflight.clone();
+        tokio::spawn(async move {
+            let _ = engine.tick_refine_llm().await;
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn idle_for_questions(&self) -> bool {
         if self.busy() || self.show_help {
             return false;
@@ -532,7 +540,7 @@ impl App {
                 if k.source == methodus_core::learning::SKILL_DRAFT_SOURCE {
                     "skill draft".to_string()
                 } else {
-                    "knowledge".to_string()
+                    methodus_core::learning::knowledge_inbox_label(&k.source).to_string()
                 },
             ));
         }
@@ -646,13 +654,7 @@ impl App {
             .knowledge
             .iter()
             .find(|k| k.id == id)
-            .map(|k| {
-                if k.source == methodus_core::learning::SKILL_DRAFT_SOURCE {
-                    "skill draft"
-                } else {
-                    "knowledge"
-                }
-            })
+            .map(|k| methodus_core::learning::knowledge_inbox_label(&k.source))
             .unwrap_or("candidate");
         if in_inbox {
             self.set_status(
@@ -683,28 +685,10 @@ impl App {
         }
     }
 
-    pub fn refresh_system_lists(&mut self) {
-        self.system_events = self
-            .engine
-            .list_recent_events(80)
-            .unwrap_or_default();
-        self.learning_jobs = self.engine.list_learning_jobs().unwrap_or_default();
-        if self.system_sel >= self.system_list_len() {
-            self.system_sel = self.system_list_len().saturating_sub(1);
-        }
-    }
-
-    pub fn system_list_len(&self) -> usize {
-        match self.overlay {
-            Overlay::Events => self.system_events.len(),
-            Overlay::Jobs => self.learning_jobs.len(),
-            _ => 0,
-        }
-    }
-
     pub fn refresh(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         let _ = self.engine.tick_learning();
+        self.maybe_spawn_refine_llm();
         if let Ok(tasks) = self.engine.store().list_tasks() {
             self.tasks = tasks;
             if self.task_sel >= self.tasks.len() {
@@ -1214,7 +1198,6 @@ impl App {
             Overlay::Inbox => return self.handle_inbox_key(key),
             Overlay::Faces => return self.handle_faces_key(key),
             Overlay::Sessions => return self.handle_sessions_key(key),
-            Overlay::Events | Overlay::Jobs => return self.handle_system_key(key),
             Overlay::None => {}
         }
         self.handle_session_key(key)
@@ -1311,7 +1294,7 @@ impl App {
     fn overlay_filter_active(&self) -> bool {
         match self.overlay {
             Overlay::Inbox if self.inbox_detail => false,
-            Overlay::Sessions | Overlay::Faces | Overlay::Inbox | Overlay::Events | Overlay::Jobs => true,
+            Overlay::Sessions | Overlay::Faces | Overlay::Inbox => true,
             _ => false,
         }
     }
@@ -1357,7 +1340,6 @@ impl App {
             Overlay::Sessions => self.visible_task_indices(),
             Overlay::Faces => self.visible_face_indices(),
             Overlay::Inbox => self.visible_review_indices(),
-            Overlay::Events | Overlay::Jobs => (0..self.system_list_len()).collect(),
             Overlay::Setup => (0..self.setup_list_len()).collect(),
             Overlay::None => Vec::new(),
         }
@@ -1691,37 +1673,6 @@ impl App {
         }
     }
 
-    fn handle_system_key(&mut self, key: KeyEvent) -> Command {
-        let n = self.system_list_len();
-        match key.code {
-            KeyCode::Esc => {
-                self.close_overlay();
-                Command::None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.system_sel = self.system_sel.saturating_sub(1);
-                Command::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if n > 0 {
-                    self.system_sel = (self.system_sel + 1).min(n - 1);
-                }
-                Command::None
-            }
-            KeyCode::Char('c') if self.overlay == Overlay::Jobs => {
-                if let Some(job) = self.learning_jobs.get(self.system_sel) {
-                    return Command::CancelLearningJob { id: job.id.clone() };
-                }
-                Command::None
-            }
-            KeyCode::Char('r') => {
-                self.refresh_system_lists();
-                Command::None
-            }
-            _ => Command::None,
-        }
-    }
-
     fn handle_faces_key(&mut self, key: KeyEvent) -> Command {
         if self.overlay_consume_filter_key(key) {
             return Command::None;
@@ -1926,11 +1877,11 @@ impl App {
             }
             KeyCode::Up => {
                 if slash_open {
-                    self.slash_sel = self.slash_sel.saturating_sub(1);
+                    self.move_slash_sel(-1);
                     return Command::None;
                 }
                 if mention_open {
-                    self.mention_sel = self.mention_sel.saturating_sub(1);
+                    self.move_mention_sel(-1);
                     return Command::None;
                 }
                 self.scroll_transcript(1);
@@ -1938,27 +1889,53 @@ impl App {
             }
             KeyCode::Down => {
                 if slash_open {
-                    let n = matching_slash(&self.input).len();
-                    if n > 0 {
-                        self.slash_sel = (self.slash_sel + 1).min(n - 1);
-                    }
+                    self.move_slash_sel(1);
                     return Command::None;
                 }
                 if mention_open {
-                    let n = self.matching_mentions().len();
-                    if n > 0 {
-                        self.mention_sel = (self.mention_sel + 1).min(n - 1);
-                    }
+                    self.move_mention_sel(1);
                     return Command::None;
                 }
                 self.scroll_transcript(-1);
                 Command::None
             }
+            KeyCode::Char('k') if slash_open && slash_palette_browse(&self.input) => {
+                self.move_slash_sel(-1);
+                Command::None
+            }
+            KeyCode::Char('j') if slash_open && slash_palette_browse(&self.input) => {
+                self.move_slash_sel(1);
+                Command::None
+            }
+            KeyCode::Char('k') if mention_open && mention_palette_browse(&self.input) => {
+                self.move_mention_sel(-1);
+                Command::None
+            }
+            KeyCode::Char('j') if mention_open && mention_palette_browse(&self.input) => {
+                self.move_mention_sel(1);
+                Command::None
+            }
             KeyCode::PageUp => {
+                if slash_open {
+                    self.move_slash_sel(-3);
+                    return Command::None;
+                }
+                if mention_open {
+                    self.move_mention_sel(-3);
+                    return Command::None;
+                }
                 self.scroll_transcript(10);
                 Command::None
             }
             KeyCode::PageDown => {
+                if slash_open {
+                    self.move_slash_sel(3);
+                    return Command::None;
+                }
+                if mention_open {
+                    self.move_mention_sel(3);
+                    return Command::None;
+                }
                 self.scroll_transcript(-10);
                 Command::None
             }
@@ -2117,22 +2094,21 @@ impl App {
     }
 
     fn persist_config(&self) -> Result<(), String> {
-        let cfg = UserConfig {
-            default_runtime: self.runtime.clone(),
-            permission_mode: Some(self.permission_mode.clone()),
-            default_face: self.default_face.clone(),
-            context_faces: if self.context_faces.is_empty() {
-                None
-            } else {
-                Some(self.context_faces.clone())
-            },
-            workspace_root: if self.workspace_root.trim().is_empty() {
-                None
-            } else {
-                Some(self.workspace_root.clone())
-            },
-            notifications: Some(self.notifications),
+        let mut cfg = UserConfig::load(self.engine.home());
+        cfg.default_runtime = self.runtime.clone();
+        cfg.permission_mode = Some(self.permission_mode.clone());
+        cfg.default_face = self.default_face.clone();
+        cfg.context_faces = if self.context_faces.is_empty() {
+            None
+        } else {
+            Some(self.context_faces.clone())
         };
+        cfg.workspace_root = if self.workspace_root.trim().is_empty() {
+            None
+        } else {
+            Some(self.workspace_root.clone())
+        };
+        cfg.notifications = Some(self.notifications);
         cfg.save(self.engine.home()).map_err(|e| e.to_string())
     }
 
@@ -2461,22 +2437,8 @@ impl App {
     }
 
     fn toggle_runtime(&mut self) {
-        let mut cfg = UserConfig {
-            default_runtime: self.runtime.clone(),
-            permission_mode: Some(self.permission_mode.clone()),
-            default_face: self.default_face.clone(),
-            context_faces: if self.context_faces.is_empty() {
-                None
-            } else {
-                Some(self.context_faces.clone())
-            },
-            workspace_root: if self.workspace_root.trim().is_empty() {
-                None
-            } else {
-                Some(self.workspace_root.clone())
-            },
-            notifications: Some(self.notifications),
-        };
+        let mut cfg = UserConfig::load(self.engine.home());
+        cfg.default_runtime = self.runtime.clone();
         cfg.cycle_runtime();
         self.runtime = cfg.default_runtime.clone();
         if let Err(e) = self.persist_config() {
@@ -2494,7 +2456,6 @@ impl App {
             Overlay::Sessions => self.task_sel,
             Overlay::Faces => self.face_sel,
             Overlay::Inbox => self.review_sel,
-            Overlay::Events | Overlay::Jobs => self.system_sel,
             Overlay::Setup => self.setup_sel,
             Overlay::None => 0,
         }
@@ -2508,7 +2469,6 @@ impl App {
                 self.review_sel = sel;
                 self.review_detail_scroll = 0;
             }
-            Overlay::Events | Overlay::Jobs => self.system_sel = sel,
             Overlay::Setup => self.setup_sel = sel,
             Overlay::None => {}
         }
@@ -2593,6 +2553,32 @@ impl App {
             self.slash_sel = 0;
         } else {
             self.slash_sel = self.slash_sel.min(n - 1);
+        }
+    }
+
+    pub fn move_slash_sel(&mut self, delta: isize) {
+        let n = matching_slash(&self.input).len();
+        if n == 0 {
+            self.slash_sel = 0;
+            return;
+        }
+        if delta < 0 {
+            self.slash_sel = self.slash_sel.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.slash_sel = (self.slash_sel + delta as usize).min(n - 1);
+        }
+    }
+
+    pub fn move_mention_sel(&mut self, delta: isize) {
+        let n = self.matching_mentions().len();
+        if n == 0 {
+            self.mention_sel = 0;
+            return;
+        }
+        if delta < 0 {
+            self.mention_sel = self.mention_sel.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.mention_sel = (self.mention_sel + delta as usize).min(n - 1);
         }
     }
 
@@ -2773,50 +2759,20 @@ impl App {
                 self.slash_sel = 0;
                 self.cmd_run(false)
             }
-            "study" => {
+            "learn" => {
                 self.input.clear();
                 self.slash_sel = 0;
                 if self.busy() {
                     self.input_error = Some("wait until this turn ends".to_string());
                     return Command::None;
                 }
-                let (scope, sources) = methodus_core::curiosity::parse_study_invocation(rest.trim());
-                if sources.is_empty() {
-                    self.input_error = Some(
-                        "/study needs sources — e.g. /study nxm @~/docs/nxm https://wiki.example.com/x".to_string(),
-                    );
-                    return Command::None;
-                }
-                Command::StudyModule {
-                    scope,
+                let (hint, sources) =
+                    methodus_core::learn::parse_learn_invocation(rest.trim());
+                Command::Learn {
+                    hint,
                     sources,
                     face: self.default_face.clone(),
                 }
-            }
-            "ingest" => {
-                self.input.clear();
-                self.slash_sel = 0;
-                if self.busy() {
-                    self.input_error = Some("wait until this turn ends".to_string());
-                    return Command::None;
-                }
-                let (_, sources) = methodus_core::curiosity::parse_study_invocation(rest.trim());
-                if sources.is_empty() {
-                    self.input_error = Some(
-                        "/ingest needs sources — e.g. /ingest @~/docs/standard.pdf".to_string(),
-                    );
-                    return Command::None;
-                }
-                Command::IngestDocs { sources }
-            }
-            "survey" => {
-                self.input.clear();
-                self.slash_sel = 0;
-                if self.busy() {
-                    self.input_error = Some("wait until this turn ends".to_string());
-                    return Command::None;
-                }
-                Command::SurveyRepo
             }
             "cleanup" => {
                 self.input.clear();
@@ -2827,26 +2783,6 @@ impl App {
                     .unwrap_or(30)
                     .clamp(1, 3650);
                 Command::CleanupWorkspaces { max_age_days: days }
-            }
-            "events" => {
-                self.input.clear();
-                self.slash_sel = 0;
-                self.overlay_filter.clear();
-                self.refresh_system_lists();
-                self.system_sel = 0;
-                self.overlay = Overlay::Events;
-                self.set_status(StatusLevel::Info, "events — esc back");
-                Command::None
-            }
-            "jobs" => {
-                self.input.clear();
-                self.slash_sel = 0;
-                self.overlay_filter.clear();
-                self.refresh_system_lists();
-                self.system_sel = 0;
-                self.overlay = Overlay::Jobs;
-                self.set_status(StatusLevel::Info, "jobs — [c] cancel selected · esc back");
-                Command::None
             }
             _ => {
                 self.input_error = Some("unknown command".to_string());
@@ -2935,11 +2871,7 @@ impl App {
                 )
             }
             Some(ReviewItem::Knowledge(k)) => {
-                let kind = if k.source == methodus_core::learning::SKILL_DRAFT_SOURCE {
-                    "skill draft"
-                } else {
-                    "knowledge"
-                };
+                let kind = methodus_core::learning::knowledge_inbox_label(&k.source);
                 let mut head = format!("{kind} · {status}\n{path}\n", status = k.status, path = k.path);
                 if k.status == KnowledgeStatus::Conflicted {
                     head.push_str("conflicts with committed version\n");
@@ -3015,6 +2947,9 @@ impl App {
 
     fn knowledge_review_body(&self, k: &KnowledgeItem) -> String {
         let home = self.engine.home();
+        if methodus_core::learning::is_refinement_source(&k.source) {
+            return methodus_core::refine::render_refinement_detail(home, k);
+        }
         let candidate = std::fs::read_to_string(home.join(&k.path))
             .unwrap_or_else(|_| format!("(missing file)\n{}", k.path));
         if k.status != KnowledgeStatus::Conflicted {
@@ -3454,7 +3389,6 @@ fn overlay_reserved_char(overlay: Overlay, c: char) -> bool {
         Overlay::Sessions => matches!(c, 'j' | 'k' | 'g' | 'G' | '?' | 'd' | 'x' | 'c'),
         Overlay::Faces => matches!(c, 'j' | 'k' | '?'),
         Overlay::Inbox => matches!(c, 'j' | 'k' | 'g' | 'G' | '?' | 'y' | 'd' | 'x' | 'z'),
-        Overlay::Events | Overlay::Jobs => matches!(c, 'j' | 'k' | 'r' | 'c' | '?'),
         Overlay::Setup | Overlay::None => true,
     }
 }
@@ -3602,6 +3536,32 @@ pub const KNOWLEDGE_CHOICES: &[KnowledgeChoice] = &[
     },
 ];
 
+pub const SKILL_PATCH_CHOICES: &[KnowledgeChoice] = &[
+    KnowledgeChoice {
+        action: KnowledgeReviewAction::Commit,
+        key: "1",
+        label: "Yes — apply patch to live skill",
+    },
+    KnowledgeChoice {
+        action: KnowledgeReviewAction::Reject,
+        key: "2",
+        label: "No — reject",
+    },
+];
+
+pub const HARNESS_NOTE_CHOICES: &[KnowledgeChoice] = &[
+    KnowledgeChoice {
+        action: KnowledgeReviewAction::Commit,
+        key: "1",
+        label: "Yes — keep as Face note",
+    },
+    KnowledgeChoice {
+        action: KnowledgeReviewAction::Reject,
+        key: "2",
+        label: "No — reject",
+    },
+];
+
 pub const KNOWLEDGE_CONFLICT_CHOICES: &[KnowledgeChoice] = &[
     KnowledgeChoice {
         action: KnowledgeReviewAction::ReplaceExisting,
@@ -3620,6 +3580,10 @@ pub fn knowledge_choices_for(item: &KnowledgeItem) -> &'static [KnowledgeChoice]
         && item.status == KnowledgeStatus::Conflicted
     {
         KNOWLEDGE_CONFLICT_CHOICES
+    } else if item.source == methodus_core::learning::SKILL_PATCH_SOURCE {
+        SKILL_PATCH_CHOICES
+    } else if item.source == methodus_core::learning::HARNESS_NOTE_SOURCE {
+        HARNESS_NOTE_CHOICES
     } else {
         KNOWLEDGE_CHOICES
     }
@@ -3664,34 +3628,14 @@ pub const SLASH_COMMANDS: &[SlashCmd] = &[
         summary: "remove old task workspace dirs (default 30 days)",
     },
     SlashCmd {
-        name: "events",
+        name: "learn",
         aliases: &[],
-        summary: "recent audit events",
-    },
-    SlashCmd {
-        name: "jobs",
-        aliases: &[],
-        summary: "learning queue — cancel with [c] in overlay",
-    },
-    SlashCmd {
-        name: "ingest",
-        aliases: &[],
-        summary: "ingest docs into focus project knowledge",
+        summary: "learn from @paths/URLs — agent picks pipeline and archives",
     },
     SlashCmd {
         name: "inbox",
         aliases: &[],
         summary: "questions, candidate knowledge, experience",
-    },
-    SlashCmd {
-        name: "survey",
-        aliases: &[],
-        summary: "survey focus project repo layout into project notes",
-    },
-    SlashCmd {
-        name: "study",
-        aliases: &[],
-        summary: "module expert study — paths/URLs → knowledge, skill, mentor Qs",
     },
     SlashCmd {
         name: "quit",
@@ -3730,6 +3674,15 @@ pub fn slash_menu_open(input: &str) -> bool {
     input.trim_start().starts_with('/')
 }
 
+/// j/k browse the slash palette without inserting a filter character.
+fn slash_palette_browse(input: &str) -> bool {
+    slash_token(input).is_some_and(|t| t.is_empty())
+}
+
+fn mention_palette_browse(input: &str) -> bool {
+    at_query(input).is_some_and(|q| q.is_empty())
+}
+
 fn slash_token(input: &str) -> Option<String> {
     let t = input.trim_start();
     let rest = t.strip_prefix('/')?;
@@ -3743,7 +3696,10 @@ pub fn matching_slash(input: &str) -> Vec<&'static SlashCmd> {
     };
     SLASH_COMMANDS
         .iter()
-        .filter(|c| c.name.starts_with(&token) || c.aliases.iter().any(|a| a.starts_with(&token)))
+        .filter(|c| {
+            c.name.starts_with(&token)
+                || (token.len() >= 3 && c.aliases.iter().any(|a| a.starts_with(&token)))
+        })
         .collect()
 }
 
@@ -3809,14 +3765,12 @@ pub fn help_line(app: &App) -> String {
                 " [enter] open  [d]elete  [c]ancel  type to filter  [tab]/[esc] back "
                     .to_string()
             }
-            Overlay::Events => {
-                " [↑↓]select  [r]efresh  [esc]session ".to_string()
-            }
-            Overlay::Jobs => {
-                " [↑↓]select  [c] cancel job  [r]efresh  [esc]session ".to_string()
-            }
             Overlay::None => {
-                if app.pending_approval().is_some() {
+                if slash_menu_open(&app.input) {
+                    " [↑↓ j k]choose  [tab]complete  [enter]run  [esc]clear ".to_string()
+                } else if app.mention_menu_open() {
+                    " [↑↓ j k]choose  [tab]drill  [enter]attach  [esc]cancel ".to_string()
+                } else if app.pending_approval().is_some() {
                     let n = app.session_approvals().len();
                     format!(
                         " !{n} pending approval · [↑↓]choose [enter] [1]yes [2]session [3]no [4]abort "
@@ -3870,7 +3824,7 @@ mod tests {
             .iter()
             .map(|c| c.name)
             .collect();
-        for need in ["setup", "inbox", "face", "session", "clear", "help", "quit", "study", "ingest", "survey", "cleanup"] {
+        for need in ["setup", "inbox", "face", "session", "clear", "help", "quit", "learn", "cleanup"] {
             assert!(names.contains(&need), "missing /{need} in {names:?}");
         }
         assert_eq!(
@@ -3885,7 +3839,12 @@ mod tests {
                 .iter()
                 .map(|c| c.name)
                 .collect::<Vec<_>>(),
-            vec!["ingest", "inbox"]
+            vec!["inbox"]
+        );
+        assert!(
+            matching_slash("/learn")
+                .iter()
+                .any(|c| c.name == "learn")
         );
         assert_eq!(
             matching_slash("/new")
