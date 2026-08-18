@@ -190,6 +190,8 @@ pub struct App {
     pub review_detail_scroll: usize,
     /// Inbox list + summary vs full-page detail with composer actions.
     pub inbox_detail: bool,
+    /// When true, ↑↓/j/k scroll the detail body; Tab flips this to the decision list.
+    pub inbox_detail_focus_body: bool,
     pub inbox_menu_choice: usize,
     pub answering_id: Option<String>,
     pub confirm_task_id: Option<String>,
@@ -284,6 +286,7 @@ impl App {
             review_sel: 0,
             review_detail_scroll: 0,
             inbox_detail: false,
+            inbox_detail_focus_body: true,
             inbox_menu_choice: 0,
             answering_id: None,
             confirm_task_id: None,
@@ -773,8 +776,9 @@ impl App {
                 }
             }
         }
-        // Inbox data: only when inbox overlay is open or for badge counts.
-        if self.overlay == Overlay::Inbox || self.tick % 32 == 0 {
+        // Inbox data: list overlay is live; detail view only refreshes on the
+        // badge cadence so scrolling a long body is not blocked by SQLite.
+        if (self.overlay == Overlay::Inbox && !self.inbox_detail) || self.tick % 32 == 0 {
             self.questions = self
                 .engine
                 .store()
@@ -1243,6 +1247,9 @@ impl App {
             return self.handle_prompt_key(key);
         }
         if self.mode == Mode::Answering {
+            if self.inbox_detail_open() && self.apply_inbox_detail_scroll(key) {
+                return Command::None;
+            }
             return self.handle_answer_key(key);
         }
         if self.mode == Mode::ConfirmCancel {
@@ -1268,6 +1275,7 @@ impl App {
 
     fn close_overlay(&mut self) {
         self.inbox_detail = false;
+        self.inbox_detail_focus_body = true;
         self.inbox_menu_choice = 0;
         self.knowledge_pick_id = None;
         self.answering_id = None;
@@ -1315,6 +1323,7 @@ impl App {
         }
         self.inbox_detail = true;
         self.review_detail_scroll = 0;
+        self.inbox_detail_focus_body = true;
         self.inbox_menu_choice = 0;
         self.input.clear();
         self.input_error = None;
@@ -1335,12 +1344,16 @@ impl App {
             self.evolution_pick_id = None;
             self.evolution_choice = 0;
         }
-        self.set_status(StatusLevel::Info, "inbox detail — scroll · esc back to list");
+        self.set_status(
+            StatusLevel::Info,
+            "inbox detail — ↑↓ scroll body · tab decide · esc list",
+        );
     }
 
     pub fn close_inbox_detail(&mut self) {
         self.inbox_detail = false;
         self.review_detail_scroll = 0;
+        self.inbox_detail_focus_body = true;
         self.inbox_menu_choice = 0;
         self.knowledge_pick_id = None;
         self.hypothesis_pick_id = None;
@@ -1619,6 +1632,43 @@ impl App {
     }
 
     fn handle_inbox_detail_key(&mut self, key: KeyEvent) -> Command {
+        if self.apply_inbox_detail_scroll(key) {
+            return Command::None;
+        }
+        match key.code {
+            KeyCode::Tab => {
+                self.inbox_detail_focus_body = !self.inbox_detail_focus_body;
+                if self.inbox_detail_focus_body {
+                    self.set_status(
+                        StatusLevel::Info,
+                        "body focused — ↑↓ scroll · tab back to decide",
+                    );
+                } else {
+                    self.set_status(
+                        StatusLevel::Info,
+                        "decide below — ↑↓ choose · tab to scroll body",
+                    );
+                }
+                return Command::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.inbox_detail_focus_body => {
+                self.scroll_review_detail(-1);
+                return Command::None;
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.inbox_detail_focus_body => {
+                self.scroll_review_detail(1);
+                return Command::None;
+            }
+            KeyCode::Home | KeyCode::Char('g') if self.inbox_detail_focus_body => {
+                self.review_detail_scroll = 0;
+                return Command::None;
+            }
+            KeyCode::End | KeyCode::Char('G') if self.inbox_detail_focus_body => {
+                self.review_detail_scroll = usize::MAX;
+                return Command::None;
+            }
+            _ => {}
+        }
         if self.pending_knowledge().is_some() {
             return self.handle_knowledge_key(key);
         }
@@ -1641,22 +1691,6 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.show_help = true;
-                Command::None
-            }
-            KeyCode::Char('[') => {
-                self.scroll_review_detail(-3);
-                Command::None
-            }
-            KeyCode::Char(']') => {
-                self.scroll_review_detail(3);
-                Command::None
-            }
-            KeyCode::PageUp => {
-                self.scroll_review_detail(-8);
-                Command::None
-            }
-            KeyCode::PageDown => {
-                self.scroll_review_detail(8);
                 Command::None
             }
             _ => Command::None,
@@ -2543,6 +2577,19 @@ impl App {
             self.review_detail_scroll = self.review_detail_scroll.saturating_sub((-delta) as usize);
         } else {
             self.review_detail_scroll = self.review_detail_scroll.saturating_add(delta as usize);
+        }
+    }
+
+    /// Scroll the inbox body even while the decision list owns ↑↓.
+    /// `[` `]` are skipped while typing an answer so they stay insertable.
+    fn apply_inbox_detail_scroll(&mut self, key: KeyEvent) -> bool {
+        let typing = self.mode == Mode::Answering;
+        match inbox_detail_scroll_delta(key, typing) {
+            Some(delta) => {
+                self.scroll_review_detail(delta);
+                true
+            }
+            None => false,
         }
     }
 
@@ -3450,6 +3497,24 @@ fn tool_output_preview(value: &serde_json::Value) -> String {
     ellipsize(s.lines().next().unwrap_or(""), 80)
 }
 
+/// Scroll deltas for the inbox detail body. `typing` is true while answering a question
+/// so `[` / `]` stay insertable; PageUp/PageDown / Ctrl+u/d / Shift+↑↓ still scroll.
+fn inbox_detail_scroll_delta(key: KeyEvent, typing: bool) -> Option<isize> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Char('[') if !typing => Some(-3),
+        KeyCode::Char(']') if !typing => Some(3),
+        KeyCode::PageUp => Some(-8),
+        KeyCode::PageDown => Some(8),
+        KeyCode::Char('u') if ctrl => Some(-8),
+        KeyCode::Char('d') if ctrl => Some(8),
+        KeyCode::Up if shift => Some(-3),
+        KeyCode::Down if shift => Some(3),
+        _ => None,
+    }
+}
+
 fn overlay_reserved_char(overlay: Overlay, c: char) -> bool {
     match overlay {
         Overlay::Sessions => matches!(c, 'j' | 'k' | 'g' | 'G' | '?' | 'd' | 'x' | 'c'),
@@ -3827,7 +3892,13 @@ pub fn help_line(app: &App) -> String {
         return " [esc/?] close help   [ctrl-c twice]quit ".to_string();
     }
     match app.mode {
-        Mode::Answering => " [enter] submit   [esc] later   [d]ismiss ".to_string(),
+        Mode::Answering => {
+            if app.inbox_detail_open() {
+                " [enter]submit  [esc]menu  [pgup/pgdn]scroll body ".to_string()
+            } else {
+                " [enter] submit   [esc] later   [d]ismiss ".to_string()
+            }
+        }
         Mode::Prompt => " [enter] save path   [esc] cancel ".to_string(),
         Mode::ConfirmCancel => {
             if app.confirm_delete {
@@ -3842,16 +3913,18 @@ pub fn help_line(app: &App) -> String {
                     .to_string()
             }
             Overlay::Inbox if app.inbox_detail_open() => {
-                if app.mode == Mode::Answering {
-                    " [enter]submit  [esc]menu  scroll [[]/wheel] ".to_string()
+                if app.inbox_detail_focus_body {
+                    " [↑↓]scroll  [enter]act  [tab]decide  [esc]list ".to_string()
                 } else if app.pending_knowledge().is_some() {
-                    " [↑↓]choose  [enter]  [y]/[d]  scroll [[]/wheel]  [esc]list ".to_string()
+                    " [↑↓]choose  [enter]  [y]/[d]  [tab]scroll body  [esc]list ".to_string()
                 } else if app.inbox_question_menu() {
-                    " [↑↓]choose  [enter]  [1-4]  scroll [[]/wheel]  [esc]list ".to_string()
+                    " [↑↓]choose  [enter]  [1-4]  [tab]scroll body  [esc]list ".to_string()
                 } else if app.inbox_experience_menu() {
-                    " [enter]/[1] mark done  [2]/[esc] back ".to_string()
+                    " [enter]/[1] mark done  [tab]scroll  [2]/[esc] back ".to_string()
+                } else if app.pending_hypothesis().is_some() || app.pending_evolution().is_some() {
+                    " [↑↓]choose  [enter]  [tab]scroll body  [esc]list ".to_string()
                 } else {
-                    " scroll [[]/wheel]  [esc]list ".to_string()
+                    " [↑↓]scroll  [pgup/pgdn]  [esc]list ".to_string()
                 }
             }
             Overlay::Inbox => match app.selected_review() {
@@ -3919,6 +3992,51 @@ pub const INBOX_EVOLUTION_CHOICES: &[(&str, &str)] = &[
 mod tests {
     use super::*;
     use crossterm::event::KeyEventKind;
+
+    #[test]
+    fn inbox_detail_scroll_keys_work_during_decision() {
+        assert_eq!(
+            inbox_detail_scroll_delta(
+                KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+                false
+            ),
+            Some(-3)
+        );
+        assert_eq!(
+            inbox_detail_scroll_delta(
+                KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+                false
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            inbox_detail_scroll_delta(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), false),
+            Some(8)
+        );
+        assert_eq!(
+            inbox_detail_scroll_delta(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), false),
+            Some(-8)
+        );
+        assert_eq!(
+            inbox_detail_scroll_delta(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                false
+            ),
+            Some(3)
+        );
+        // typing an answer: [ ] are characters, PageUp still scrolls
+        assert_eq!(
+            inbox_detail_scroll_delta(
+                KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            inbox_detail_scroll_delta(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), true),
+            Some(-8)
+        );
+    }
 
     #[test]
     fn slash_commands_cover_overlays() {

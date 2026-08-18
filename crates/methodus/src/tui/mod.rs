@@ -10,7 +10,7 @@ use std::io::stdout;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyboardEnhancementFlags, KeyEventKind, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
@@ -33,6 +33,7 @@ pub async fn run(
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     stdout().execute(EnableBracketedPaste)?;
+    stdout().execute(EnableMouseCapture)?;
     let _ = stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
             | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,

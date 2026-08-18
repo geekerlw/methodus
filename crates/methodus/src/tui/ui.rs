@@ -3,7 +3,10 @@ use std::cell::RefCell;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -36,7 +39,8 @@ struct LayoutCache {
     rows: Vec<ChatRow>,
 }
 
-/// Cached markdown rendering for inbox detail view.
+/// Cached markdown layout for inbox detail (same idea as LAYOUT_CACHE).
+/// Store wrapped MdLine rows; widgetize only the visible slice each frame.
 #[derive(Default)]
 struct InboxMdCache {
     /// The review_sel index when we last computed.
@@ -874,7 +878,7 @@ fn draw_knowledge_prompt(frame: &mut Frame, area: Rect, app: &App, theme: &Theme
         &header,
         &choices,
         app.knowledge_choice,
-        Style::default().fg(theme.permission),
+        pick_border(app, theme, theme.permission),
         theme,
     );
 }
@@ -891,7 +895,7 @@ fn draw_inbox_question_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Th
         &header,
         INBOX_QUESTION_CHOICES,
         app.inbox_menu_choice,
-        Style::default().fg(theme.warning),
+        pick_border(app, theme, theme.warning),
         theme,
     );
 }
@@ -908,7 +912,7 @@ fn draw_inbox_experience_menu(frame: &mut Frame, area: Rect, app: &App, theme: &
         &header,
         INBOX_EXPERIENCE_CHOICES,
         app.inbox_menu_choice,
-        Style::default().fg(theme.muted),
+        pick_border(app, theme, theme.muted),
         theme,
     );
 }
@@ -929,7 +933,7 @@ fn draw_inbox_evolution_menu(frame: &mut Frame, area: Rect, app: &App, theme: &T
         &header,
         INBOX_EVOLUTION_CHOICES,
         app.inbox_menu_choice,
-        Style::default().fg(theme.permission),
+        pick_border(app, theme, theme.permission),
         theme,
     );
 }
@@ -960,7 +964,7 @@ fn draw_evolution_prompt(frame: &mut Frame, area: Rect, app: &App, theme: &Theme
         &header,
         &choices,
         app.evolution_choice,
-        Style::default().fg(theme.permission),
+        pick_border(app, theme, theme.permission),
         theme,
     );
 }
@@ -988,9 +992,18 @@ fn draw_hypothesis_prompt(frame: &mut Frame, area: Rect, app: &App, theme: &Them
         &header,
         &choices,
         app.hypothesis_choice,
-        Style::default().fg(theme.permission),
+        pick_border(app, theme, theme.permission),
         theme,
     );
+}
+
+/// Decision list is muted while the detail body owns ↑↓.
+fn pick_border(app: &App, theme: &Theme, active: Color) -> Style {
+    if app.inbox_detail_open() && app.inbox_detail_focus_body {
+        theme.muted_border()
+    } else {
+        Style::default().fg(active)
+    }
 }
 
 /// Pi-style SelectList in the composer: header lines + numbered choices.
@@ -1514,40 +1527,42 @@ fn draw_inbox_detail(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         format!("inbox · {title}")
     };
-    let block = panel(&panel_title, true, theme);
+    let block = panel(&panel_title, app.inbox_detail_focus_body, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let preview_w = inner.width.saturating_sub(2) as usize;
     let md_w = preview_w.max(16);
+    // hairline is TOP-only (1 row), not a full box.
+    let inner_h = inner.height.saturating_sub(1) as usize;
 
-    // Cache key: review_sel + inbox item count + width. Avoids re-reading files
-    // and re-parsing markdown on every frame during scrolling.
+    // Cache wrapped markdown (parse + wrap). Widgetize only the viewport,
+    // matching transcript: LAYOUT_CACHE holds rows, draw maps start..end.
     let inbox_count = app.knowledge.len() + app.questions.len()
         + app.hypotheses.len() + app.evolutions.len() + app.experiences.len();
-    let md_lines: Vec<Line> = INBOX_MD_CACHE.with(|cache| {
+    let (visible, scroll, max_scroll) = INBOX_MD_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
-        if c.review_sel == app.review_sel && c.inbox_count == inbox_count && c.width == md_w {
-            // Cache hit — skip file reads entirely.
-            c.lines.iter().map(|l| md_line_widget(l, theme)).collect()
-        } else {
-            // Cache miss — read body and reparse.
+        if c.review_sel != app.review_sel || c.inbox_count != inbox_count || c.width != md_w {
             let body = app.review_detail();
-            let parsed = if body.is_empty() {
+            c.lines = if body.is_empty() {
                 Vec::new()
             } else {
                 render_md(&body, md_w)
             };
-            let result = parsed.iter().map(|l| md_line_widget(l, theme)).collect();
             c.review_sel = app.review_sel;
             c.inbox_count = inbox_count;
             c.width = md_w;
-            c.lines = parsed;
-            result
         }
+        let (scroll, end, max_scroll) =
+            inbox_visible_range(c.lines.len(), inner_h, app.review_detail_scroll);
+        let visible = c.lines[scroll..end]
+            .iter()
+            .map(|l| md_line_widget(l, theme))
+            .collect::<Vec<Line>>();
+        (visible, scroll, max_scroll)
     });
 
-    if md_lines.is_empty() {
+    if visible.is_empty() && scroll == 0 {
         frame.render_widget(
             Paragraph::new("no item selected").style(theme.dim()),
             inner,
@@ -1555,16 +1570,9 @@ fn draw_inbox_detail(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
-    let inner_h = inner.height.saturating_sub(2) as usize;
-    let max_scroll = md_lines.len().saturating_sub(inner_h.max(1));
-    let scroll = app.review_detail_scroll.min(max_scroll);
-    let visible: Vec<Line> = md_lines
-        .into_iter()
-        .skip(scroll)
-        .take(inner_h.max(1))
-        .collect();
     let scroll_hint = if max_scroll > 0 {
-        format!(" scroll {scroll}/{max_scroll} ")
+        let more = if scroll < max_scroll { "  ▼ more" } else { "" };
+        format!(" scroll {scroll}/{max_scroll}{more} ")
     } else {
         String::new()
     };
@@ -1574,6 +1582,27 @@ fn draw_inbox_detail(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             .block(hairline(&scroll_hint, theme.muted_border())),
         inner,
     );
+    if max_scroll > 0 {
+        let mut bar = ScrollbarState::new(max_scroll).position(scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("█"),
+            inner,
+            &mut bar,
+        );
+    }
+}
+
+/// Viewport into a cached layout: `(scroll, end, max_scroll)`.
+fn inbox_visible_range(len: usize, inner_h: usize, requested: usize) -> (usize, usize, usize) {
+    let page = inner_h.max(1);
+    let max_scroll = len.saturating_sub(page);
+    let scroll = requested.min(max_scroll);
+    let end = (scroll + page).min(len);
+    (scroll, end, max_scroll)
 }
 
 fn sel_style(selected: bool, idle: Color, theme: &Theme) -> Style {
@@ -1902,6 +1931,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
         Line::from("  /            commands"),
         Line::from("  /setup       runtime, projects, packs"),
         Line::from("  /inbox       questions + candidate knowledge/skills — Enter to act"),
+        Line::from("  inbox detail ↑↓ scroll body, tab to decide, pgup/pgdn / wheel also scroll"),
         Line::from("  /face        pin a Face (or /face <id>)"),
         Line::from("  /session     pick another conversation"),
         Line::from("  /clear /new  new conversation — does not resume the executor"),
@@ -2138,5 +2168,15 @@ mod tests {
             );
         }
         assert!(rows.iter().any(|r| r.kind == ChatKind::You && !r.is_label));
+    }
+
+    #[test]
+    fn inbox_visible_range_virtualizes_to_page() {
+        assert_eq!(inbox_visible_range(100, 10, 0), (0, 10, 90));
+        assert_eq!(inbox_visible_range(100, 10, 5), (5, 15, 90));
+        assert_eq!(inbox_visible_range(100, 10, 90), (90, 100, 90));
+        assert_eq!(inbox_visible_range(100, 10, 999), (90, 100, 90));
+        assert_eq!(inbox_visible_range(8, 10, 0), (0, 8, 0));
+        assert_eq!(inbox_visible_range(0, 10, 0), (0, 0, 0));
     }
 }

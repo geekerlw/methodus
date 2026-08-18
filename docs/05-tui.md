@@ -137,7 +137,7 @@ pane looks idle (no key/mouse input for ~30s). While you are actively in the pan
 |---------|------|
 | Type | Enter send; Shift-Enter newline; **Shift-Tab** cycle permission (`acceptEdits` → `plan` → `cautious`); `/` palette; `@` files; empty Tab → sessions; empty `[` `]` cycle |
 | Inbox list | ↑↓ select; Enter → full view; type filter; Esc session |
-| Inbox detail | `[` `]` / PgUp PgDn / wheel scroll body; Esc → list; actions in composer |
+| Inbox detail | **↑↓ / j k** scroll body (default); **Tab** focus decide list; `[` `]` / PgUp PgDn / wheel always scroll body; Esc → list; y/d/Enter still act |
 | Pick (permission / knowledge) | ↑↓, Enter, digit / letter shortcuts, Esc later |
 | Ask | type answer, Enter submit, Esc later, empty `d` dismiss |
 | Overlay | type to filter; ↑↓ / j k move; Enter act; Esc clears filter then closes |
@@ -151,7 +151,7 @@ Footer shows **only** what is actionable in the current composer/overlay state.
 Inbox uses **progressive disclosure** so long skill/knowledge/experience bodies do not cram into the list popup:
 
 1. **List + summary** — floating overlay: left column is the filtered queue (Q / K / S / E); right column shows a short `review_summary` (status, path, first lines). No scroll in this pane.
-2. **Enter → detail** — overlay closes; the work area becomes a scrollable full body (`review_detail`). Knowledge conflicts show existing + candidate in one view.
+2. **Enter → detail** — overlay closes; the work area becomes a scrollable full body (`review_detail`). Knowledge conflicts show existing + candidate in one view. Focus starts on the body so ↑↓/j/k/PgUp/PgDn/wheel scroll; **Tab** moves focus to the decision list below.
 3. **Composer actions** — bottom SelectList or answer field:
    - **Question:** Answer / Later / Dismiss / Back
    - **Knowledge / skill draft:** commit / reject (replace when conflicted)
