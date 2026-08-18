@@ -141,7 +141,7 @@ impl SessionStatus {
     /// Returns the list of states this status can legally transition to.
     pub fn transitions(&self) -> Vec<Self> {
         match self {
-            Self::Spawning => vec![Self::Running, Self::Failed],
+            Self::Spawning => vec![Self::Running, Self::Failed, Self::Interrupted],
             Self::Running => vec![
                 Self::WaitingUser,
                 Self::Paused,

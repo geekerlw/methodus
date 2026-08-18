@@ -1752,7 +1752,7 @@ fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
             if let Some(v) = input.get(*key).and_then(|v| v.as_str()) {
                 let t = v.trim();
                 if !t.is_empty() {
-                    return Some(ellipsize_desc(t));
+                    return Some(ellipsize_desc(&strip_workspace_prefix(t)));
                 }
             }
         }
@@ -1765,6 +1765,26 @@ fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
         _ => pick(&["path", "command", "pattern", "query", "url"]),
     }
     .unwrap_or_default()
+}
+
+/// Remove workspace-specific path prefixes from tool arguments so skill
+/// content is portable. Strips patterns like:
+/// - `/Users/.../workspaces/<id>/...` → relative path
+/// - `/home/.../workspaces/<id>/...` → relative path
+fn strip_workspace_prefix(s: &str) -> String {
+    // Look for /workspaces/<task_id>/ and strip everything up to and including it.
+    if let Some(idx) = s.find("/workspaces/") {
+        let rest = &s[idx + "/workspaces/".len()..];
+        // Skip the task_id segment (next path component).
+        if let Some(slash) = rest.find('/') {
+            return rest[slash + 1..].to_string();
+        }
+    }
+    // Also strip ~/.methodus/ prefix if present.
+    if let Some(idx) = s.find("/.methodus/") {
+        return s[idx + "/.methodus/".len()..].to_string();
+    }
+    s.to_string()
 }
 
 pub(crate) fn collect_pitfalls(store: &Store, task_id: &str) -> Vec<String> {

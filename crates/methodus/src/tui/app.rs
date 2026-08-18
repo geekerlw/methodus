@@ -201,6 +201,7 @@ pub struct App {
     pub experiences: Vec<Experience>,
     pub transcript: Vec<ChatLine>,
     pub transcript_offset: usize,
+    pub transcript_version: u64,
     pub session_task_id: Option<String>,
     pub tick: u8,
     pub event_rx: Option<mpsc::Receiver<RuntimeEvent>>,
@@ -294,6 +295,7 @@ impl App {
             experiences: Vec::new(),
             transcript: Vec::new(),
             transcript_offset: 0,
+            transcript_version: 0,
             session_task_id: None,
             tick: 0,
             event_rx: None,
@@ -585,6 +587,7 @@ impl App {
                 kind: ChatKind::Meta,
                 text: question.to_string(),
             });
+            self.transcript_version = self.transcript_version.wrapping_add(1);
             self.set_status(
                 StatusLevel::Info,
                 format!(
@@ -678,6 +681,7 @@ impl App {
                     format!("{label} ready — ↑↓ choose, Enter, or y commit / d reject / Esc later")
                 },
             });
+            self.transcript_version = self.transcript_version.wrapping_add(1);
             self.set_status(
                 StatusLevel::Info,
                 format!("{label} — [↑↓] [enter]  [y]commit  [d]reject  [esc]later"),
@@ -685,93 +689,18 @@ impl App {
         }
     }
 
-    pub fn refresh(&mut self) {
+    /// Lightweight tick: updates spinner, checks timers. Full DB/FS refresh
+    /// happens every 8th tick (~2s) to avoid hammering I/O on every frame.
+    pub fn tick_refresh(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+
+        // Full data refresh every 8 ticks (~2 seconds).
+        if self.tick % 8 == 0 {
+            self.full_refresh();
+        }
+
+        // Lightweight per-tick: spinner status, learning tick.
         let _ = self.engine.tick_learning();
-        self.maybe_spawn_refine_llm();
-        if let Ok(tasks) = self.engine.store().list_tasks() {
-            self.tasks = tasks;
-            if self.task_sel >= self.tasks.len() {
-                self.task_sel = self.tasks.len().saturating_sub(1);
-            }
-        }
-        if let Ok(approvals) = self.engine.store().list_pending_approvals(None) {
-            self.approvals = approvals;
-            let n = self.session_approvals().len();
-            if n == 0 {
-                self.approval_sel = 0;
-            } else if self.approval_sel >= n {
-                self.approval_sel = n - 1;
-            }
-        }
-        self.faces = methodus_core::list_faces(self.engine.home());
-        if self.face_sel >= self.faces.len() {
-            self.face_sel = self.faces.len().saturating_sub(1);
-        }
-        self.questions = self
-            .engine
-            .store()
-            .list_questions(None)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|q| {
-                matches!(
-                    q.status,
-                    QuestionStatus::Pending | QuestionStatus::Asked | QuestionStatus::Snoozed
-                )
-            })
-            .collect();
-        self.knowledge = self
-            .engine
-            .store()
-            .list_knowledge(None)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|k| {
-                matches!(
-                    k.status,
-                    KnowledgeStatus::Candidate | KnowledgeStatus::Conflicted
-                )
-            })
-            .collect();
-        self.hypotheses = self
-            .engine
-            .store()
-            .list_hypotheses(Some(HypothesisStatus::Candidate))
-            .unwrap_or_default();
-        self.evolutions = self
-            .engine
-            .store()
-            .list_evolution(Some(EvolutionStatus::Candidate))
-            .unwrap_or_default();
-        self.experiences = self
-            .engine
-            .store()
-            .list_experiences()
-            .unwrap_or_default()
-            .into_iter()
-            .take(40)
-            .collect();
-        let n = self.review_total();
-        if self.review_sel >= n {
-            self.review_sel = n.saturating_sub(1);
-        }
-        self.packs = list_packs(self.engine.home());
-        self.projects = list_projects(self.engine.home());
-        let roots_sig = mention_roots_sig(&self.projects, self.engine.launch_cwd());
-        if self.mention_root_id.as_deref() != Some(roots_sig.as_str()) {
-            self.mention_cache.clear();
-            self.mention_root_id = None;
-        }
-        self.usage_today = self.engine.usage_summary(true).unwrap_or_default();
-        self.usage_all = self.engine.usage_summary(false).unwrap_or_default();
-        if self.overlay == Overlay::Setup {
-            self.health = health_checks(self.engine.home());
-            let cap = self.setup_list_len();
-            if cap > 0 && self.setup_sel >= cap {
-                self.setup_sel = cap.saturating_sub(1);
-            }
-        }
         if self.busy() {
             self.last_activity = Instant::now();
             let spin = ['|', '/', '-', '\\'][(self.tick as usize) % 4];
@@ -790,9 +719,141 @@ impl App {
         } else {
             self.maybe_idle_prompt();
         }
+        self.maybe_spawn_refine_llm();
         self.maybe_notify_new_knowledge();
     }
 
+    /// Full refresh: called after commands and periodically from tick_refresh.
+    pub fn refresh(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        self.full_refresh();
+        let _ = self.engine.tick_learning();
+        if self.busy() {
+            self.last_activity = Instant::now();
+            let spin = ['|', '/', '-', '\\'][(self.tick as usize) % 4];
+            let id = self.session_task_id.as_deref().unwrap_or("session");
+            self.set_status(StatusLevel::Info, format!("{spin} running {id}"));
+        } else if self.pending_approval().is_some() {
+            let n = self.session_approvals().len();
+            let tool = self
+                .pending_approval()
+                .map(|a| a.tool_name.as_str())
+                .unwrap_or("tool");
+            self.set_status(
+                StatusLevel::Warn,
+                format!("!{n} pending approval: {tool}"),
+            );
+        } else {
+            self.maybe_idle_prompt();
+        }
+        self.maybe_spawn_refine_llm();
+        self.maybe_notify_new_knowledge();
+    }
+
+    /// Full data refresh: only queries what the current UI state actually needs.
+    pub fn full_refresh(&mut self) {
+        // Tasks and approvals: needed when busy or sessions overlay.
+        if self.busy() || self.overlay == Overlay::Sessions {
+            if let Ok(tasks) = self.engine.store().list_tasks() {
+                self.tasks = tasks;
+                if self.task_sel >= self.tasks.len() {
+                    self.task_sel = self.tasks.len().saturating_sub(1);
+                }
+            }
+        }
+        // Approvals: always check — they can arrive at any time during execution.
+        if self.busy() {
+            if let Ok(approvals) = self.engine.store().list_pending_approvals(None) {
+                self.approvals = approvals;
+                let n = self.session_approvals().len();
+                if n == 0 {
+                    self.approval_sel = 0;
+                } else if self.approval_sel >= n {
+                    self.approval_sel = n - 1;
+                }
+            }
+        }
+        // Inbox data: only when inbox overlay is open or for badge counts.
+        if self.overlay == Overlay::Inbox || self.tick % 32 == 0 {
+            self.questions = self
+                .engine
+                .store()
+                .list_questions(None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|q| {
+                    matches!(
+                        q.status,
+                        QuestionStatus::Pending | QuestionStatus::Asked | QuestionStatus::Snoozed
+                    )
+                })
+                .collect();
+            self.knowledge = self
+                .engine
+                .store()
+                .list_knowledge(None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|k| {
+                    matches!(
+                        k.status,
+                        KnowledgeStatus::Candidate | KnowledgeStatus::Conflicted
+                    )
+                })
+                .collect();
+            self.hypotheses = self
+                .engine
+                .store()
+                .list_hypotheses(Some(HypothesisStatus::Candidate))
+                .unwrap_or_default();
+            self.evolutions = self
+                .engine
+                .store()
+                .list_evolution(Some(EvolutionStatus::Candidate))
+                .unwrap_or_default();
+            self.experiences = self
+                .engine
+                .store()
+                .list_experiences()
+                .unwrap_or_default()
+                .into_iter()
+                .take(40)
+                .collect();
+            let n = self.review_total();
+            if self.review_sel >= n {
+                self.review_sel = n.saturating_sub(1);
+            }
+        }
+        // Faces: only when faces overlay is open.
+        if self.overlay == Overlay::Faces {
+            self.faces = methodus_core::list_faces(self.engine.home());
+            if self.face_sel >= self.faces.len() {
+                self.face_sel = self.faces.len().saturating_sub(1);
+            }
+        }
+        // Packs / projects / health: only when setup is open or @ mention active.
+        if self.overlay == Overlay::Setup || self.mention_menu_open() {
+            self.packs = list_packs(self.engine.home());
+            self.projects = list_projects(self.engine.home());
+            let roots_sig = mention_roots_sig(&self.projects, self.engine.launch_cwd());
+            if self.mention_root_id.as_deref() != Some(roots_sig.as_str()) {
+                self.mention_cache.clear();
+                self.mention_root_id = None;
+            }
+        }
+        if self.overlay == Overlay::Setup {
+            self.health = health_checks(self.engine.home());
+            let cap = self.setup_list_len();
+            if cap > 0 && self.setup_sel >= cap {
+                self.setup_sel = cap.saturating_sub(1);
+            }
+        }
+        // Usage: only refresh occasionally (every ~8s) for header display.
+        if self.tick % 32 == 0 {
+            self.usage_today = self.engine.usage_summary(true).unwrap_or_default();
+            self.usage_all = self.engine.usage_summary(false).unwrap_or_default();
+        }
+    }
     pub fn restore_recovered(&mut self) {
         let Some(id) = self.recovered.first().map(|r| r.task_id.clone()) else {
             return;
@@ -1085,6 +1146,7 @@ impl App {
             }
         }
         self.transcript_offset = 0;
+        self.transcript_version = self.transcript_version.wrapping_add(1);
         self.approval_choice = 0;
         self.approval_sel = 0;
     }
@@ -1163,6 +1225,7 @@ impl App {
             let drop_n = self.transcript.len() - MAX;
             self.transcript.drain(0..drop_n);
         }
+        self.transcript_version = self.transcript_version.wrapping_add(1);
         if self.transcript_offset == 0 {
             // stay pinned to bottom
         }
@@ -2405,6 +2468,7 @@ impl App {
         self.session_task_id = None;
         self.transcript.clear();
         self.transcript_offset = 0;
+        self.transcript_version = self.transcript_version.wrapping_add(1);
         self.input.clear();
         self.input_error = None;
         self.slash_sel = 0;
@@ -2921,7 +2985,7 @@ impl App {
     }
 
     pub fn review_detail(&self) -> String {
-        match self.selected_review() {
+        let raw = match self.selected_review() {
             Some(ReviewItem::Question(q)) => {
                 let reason = q.reason.as_deref().unwrap_or("-");
                 format!(
@@ -2942,7 +3006,9 @@ impl App {
                         .unwrap_or_else(|| e.path.clone())
                 }),
             None => String::new(),
-        }
+        };
+        // Strip workspace-specific paths for cleaner display.
+        sanitize_workspace_paths(&raw, self.engine.home())
     }
 
     fn knowledge_review_body(&self, k: &KnowledgeItem) -> String {
@@ -3442,6 +3508,42 @@ pub fn status_counts(tasks: &[Task]) -> (usize, usize, usize, usize) {
         }
     }
     (queued, running, waiting, done)
+}
+
+/// Remove workspace-specific absolute paths from display text.
+/// Replaces patterns like `/Users/x/.methodus/workspaces/task_abc123/foo/bar`
+/// with just `foo/bar`, and `~/.methodus/...` prefixes with relative paths.
+fn sanitize_workspace_paths(text: &str, home: &std::path::Path) -> String {
+    let mut result = text.to_string();
+    // Strip absolute workspace paths: .../workspaces/<task_id>/rest → rest
+    while let Some(start) = result.find("/workspaces/") {
+        // Find the beginning of this absolute path (walk back to whitespace or line start).
+        let path_start = result[..start]
+            .rfind(|c: char| c.is_whitespace() || c == '`' || c == '"' || c == '\'')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let after_ws = &result[start + "/workspaces/".len()..];
+        // Skip task_id segment.
+        if let Some(slash) = after_ws.find('/') {
+            let rest_start = start + "/workspaces/".len() + slash + 1;
+            // Find end of path.
+            let rest = &result[rest_start..];
+            let path_end = rest
+                .find(|c: char| c.is_whitespace() || c == '`' || c == '"' || c == '\'')
+                .map(|i| rest_start + i)
+                .unwrap_or(result.len());
+            let relative = result[rest_start..path_end].to_string();
+            result.replace_range(path_start..path_end, &relative);
+        } else {
+            break; // malformed, stop
+        }
+    }
+    // Strip home prefix: /Users/x/.methodus/... → ~/.methodus/...
+    let home_str = home.to_string_lossy();
+    if result.contains(home_str.as_ref()) {
+        result = result.replace(home_str.as_ref(), "~/.methodus");
+    }
+    result
 }
 
 pub fn ellipsize(s: &str, max: usize) -> String {

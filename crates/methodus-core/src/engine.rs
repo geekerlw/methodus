@@ -407,6 +407,76 @@ impl Engine {
         crate::evolution::review_evolution(&self.store, &self.home, id, approve)
     }
 
+    pub async fn revise_knowledge_with_feedback(
+        &self,
+        id: &str,
+        feedback: &str,
+    ) -> Result<KnowledgeItem, CoreError> {
+        let mut item = self
+            .store
+            .get_knowledge(id)?
+            .ok_or_else(|| CoreError::KnowledgeNotFound(id.to_string()))?;
+        if !matches!(item.status, KnowledgeStatus::Candidate | KnowledgeStatus::Conflicted) {
+            return Err(CoreError::Other(format!(
+                "knowledge {id} is {} — only candidate/conflicted can be optimized",
+                item.status
+            )));
+        }
+        let src = self.home.join(&item.path);
+        let current = fs::read_to_string(&src)
+            .map_err(|e| CoreError::Other(format!("read candidate failed: {e}")))?;
+        let runtime = self.preferred_runtime(None);
+        let adapter = self.adapter(&runtime)?;
+        let prompt = format!(
+            "You are revising a Methodus inbox candidate.\n\
+Return only the full revised markdown content.\n\
+Keep frontmatter keys and metadata unless obviously invalid.\n\
+Do not wrap in code fences.\n\n\
+Reviewer feedback:\n{feedback}\n\n\
+Current candidate markdown:\n\n{current}"
+        );
+        let cwd = self.workspace_root().join("_inbox_feedback");
+        fs::create_dir_all(&cwd)?;
+        let session_id = Uuid::new_v4().to_string();
+        let (handle, rx) = adapter
+            .spawn(SpawnInput {
+                prompt,
+                cwd,
+                session_id,
+                permission_mode: "plan".into(),
+                allowed_tools: Vec::new(),
+                sandbox: Some("read-only".into()),
+                extra_dirs: Vec::new(),
+                model: None,
+            })
+            .await?;
+        let collected = tokio::time::timeout(Duration::from_secs(60), collect_refine_text(rx)).await;
+        let _ = adapter.stop(&handle).await;
+        let revised_raw = match collected {
+            Ok(s) => s,
+            Err(_) => return Err(CoreError::Other("feedback optimize timeout".into())),
+        };
+        let revised = strip_markdown_fences(&revised_raw);
+        if revised.trim().is_empty() {
+            return Err(CoreError::Other("optimizer returned empty content".into()));
+        }
+        fs::write(&src, &revised)
+            .map_err(|e| CoreError::Other(format!("write candidate failed: {e}")))?;
+        item.content_hash = sha256_hex(revised.as_bytes());
+        item.updated_at = Utc::now();
+        self.store.update_knowledge(&item)?;
+        let _ = self.store.insert_event(
+            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
+            "knowledge.feedback_optimized",
+            &Utc::now().to_rfc3339(),
+            None,
+            None,
+            &serde_json::json!({"knowledge_id": id, "feedback": feedback}).to_string(),
+            None,
+        );
+        Ok(item)
+    }
+
     pub fn answer_question(&self, id: &str, answer: &str) -> Result<Question, CoreError> {
         let mut q = self
             .store
@@ -1890,6 +1960,23 @@ async fn collect_refine_text(mut rx: mpsc::Receiver<RuntimeEvent>) -> String {
         }
     }
     last
+}
+
+fn strip_markdown_fences(text: &str) -> String {
+    let t = text.trim();
+    if !t.starts_with("```") {
+        return t.to_string();
+    }
+    let mut lines = t.lines();
+    let _ = lines.next();
+    let mut out = Vec::new();
+    for line in lines {
+        if line.trim_start().starts_with("```") {
+            break;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
 }
 
 fn append_transcript(path: &std::path::Path, line: &str) -> Result<(), std::io::Error> {

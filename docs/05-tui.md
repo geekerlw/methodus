@@ -1,8 +1,8 @@
 # 05 — TUI (agent surface)
 
 How Methodus presents itself in the terminal. Product surface rules live in
-[`00-product.md`](./00-product.md) §8; this document is the **implementation contract**
-for the in-process `ratatui` UI.
+[`00-product.md`](./00-product.md) §8; this document is the implementation contract
+for the in-process UI.
 
 ## 1. Decision: stay on ratatui, copy patterns not stacks
 
@@ -37,11 +37,24 @@ Daily driver = **agent chat**, not a multi-page dashboard.
 
 Rules:
 
+- The daily driver follows Pi's `TuiMainScreen` model: transcript, status, and composer form
+  one forward-growing document in the main terminal buffer. Native terminal/tmux scrollback,
+  search, selection, and copy therefore work without an application-owned viewport.
+- Before the first task, Methodus opens a complete alternate-screen welcome view so the empty
+  state retains the full header, splash, and composer layout. The first running session switches
+  to the main-buffer transcript model.
+- Ratatui enters the alternate screen only for short-lived, dense interaction: slash/mention
+  pickers, Inbox, Setup, Faces, Sessions, help, and confirmation or answer prompts. Closing one
+  returns to the untouched main-buffer document.
+- Main-buffer updates redraw only the transient status/input lines, then append new transcript
+  fragments. They never clear terminal scrollback during ordinary execution.
+- While an executor turn is active, the composer line shows a continuously animated
+  braille spinner and the current running status, so a quiet interval is visibly busy.
 - **One operable surface:** the composer. States: `type` / `pick` / `ask` / `palette`.
 - **Chrome sparingly:** top status strip; composer is a **rounded input well** (Claude
   Code shape). Slash/mention palettes stay hairline lists above the well.
-- **Overlays float** over the transcript (Clear only the popup rect). Do not wipe the
-  whole chat to open Sessions / Faces / Inbox.
+- Modal overlays temporarily take over the visible terminal viewport; the transcript
+  remains in application state and is restored when the overlay closes.
 - **Setup** may use a fuller overlay (more fields); still one outer frame, not four
   nested panels.
 - Esc: close overlay → cancel pick/ask → (done). Empty-input Tab / `/session` opens
@@ -54,7 +67,8 @@ Map Pi concepts → Methodus ratatui pieces. Implement in this order.
 | # | Component | Pi analogue | Methodus role | Status |
 |---|-----------|-------------|---------------|--------|
 | C0 | **StatusStrip** | header / theme bar | runtime, face, `!N`, `▣N`, session id | done (minimal) |
-| C1 | **Transcript** | message list | full-bleed chat; You / Assistant / tool / meta | done (markdown) |
+| C1 | **Transcript** | message list | `>` user / unlabeled assistant markdown; Claude-style `●` tool cards | done |
+| C12 | **Diff / tool card** | diffs, tool widgets | `● Name  arg` then in-place `⎿` result (no start/done log) | done |
 | C2 | **Composer** | `Input` / `Editor` | rounded input well; placeholder; CJK cursor | done |
 | C3 | **Hairline / chrome** | borders as separators | palettes use `Borders::TOP`; composer is a well | done |
 | C4 | **FloatingOverlay** | `overlay: true` | Sessions / Faces / Inbox / Events / Jobs popups | done (Setup full-bleed) |
@@ -65,7 +79,7 @@ Map Pi concepts → Methodus ratatui pieces. Implement in this order.
 | C9 | **Theme tokens** | theme.fg(...) | semantic slots only; respect `NO_COLOR` | partial |
 | C10 | **MarkdownBubble** | `Markdown` | render assistant (and knowledge preview) lightly | done |
 | C11 | **Editor** | multiline `Editor` + IME `Focusable` | Shift-Enter newline; CJK IME cursor | done |
-| C12 | **Diff / tool card** | diffs, tool widgets | compact tool rows + edit snippets | done |
+| C12 | **Diff / tool card** | diffs, tool widgets | `● Name  arg` then in-place `⎿` result | done |
 | C13 | **FuzzySelect** | fuzzy `SelectList` | filter sessions / faces / inbox | done |
 
 Out of scope for the TUI crate: owning session lifecycle (Engine does); mutating
@@ -98,7 +112,7 @@ Out of scope for the TUI crate: owning session lifecycle (Engine does); mutating
 ### Wave D — power user
 
 1. Fuzzy filter on overlay lists. **done**
-2. Richer tool cards / diff snippets when RuntimeEvent carries enough structure. **done**
+2. Tool cards match Claude Code / Pi: `● Tool  arg`, result patches the same row (`⎿`), not `→`/`←` event-log lines. **done**
 
 ## 5. OS notifications
 
@@ -121,7 +135,7 @@ pane looks idle (no key/mouse input for ~30s). While you are actively in the pan
 
 | Context | Keys |
 |---------|------|
-| Type | Enter send; Shift-Enter newline; `/` palette; `@` files; empty Tab → sessions; empty `[` `]` cycle |
+| Type | Enter send; Shift-Enter newline; **Shift-Tab** cycle permission (`acceptEdits` → `plan` → `cautious`); `/` palette; `@` files; empty Tab → sessions; empty `[` `]` cycle |
 | Inbox list | ↑↓ select; Enter → full view; type filter; Esc session |
 | Inbox detail | `[` `]` / PgUp PgDn / wheel scroll body; Esc → list; actions in composer |
 | Pick (permission / knowledge) | ↑↓, Enter, digit / letter shortcuts, Esc later |
@@ -141,7 +155,6 @@ Inbox uses **progressive disclosure** so long skill/knowledge/experience bodies 
 3. **Composer actions** — bottom SelectList or answer field:
    - **Question:** Answer / Later / Dismiss / Back
    - **Knowledge / skill draft:** commit / reject (replace when conflicted)
-   - **Experience:** Mark review done / Back
 4. After an action succeeds, detail closes back to the list (or session if inbox emptied).
 
 Skill drafts from completed tasks land in `/inbox` automatically; use the same detail
@@ -203,6 +216,15 @@ reviews and commits.
 
 Legacy Methods (`repo-survey`, `doc-ingest`, `module-expert-learning`) remain installed;
 `/learn` routes to them automatically.
+
+### Open workspace (`/open`)
+
+```text
+/open   # open the current/selected conversation's workspace directory in Finder / file manager
+        # falls back to the global workspace root if no conversation is selected
+```
+
+Calls `open` (macOS) or `xdg-open` (Linux) and reports the path in the status line.
 
 ### Workspace cleanup (`/cleanup`)
 

@@ -10,7 +10,7 @@ use std::io::stdout;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event,
     EventStream, KeyboardEnhancementFlags, KeyEventKind, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
@@ -32,7 +32,6 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
-    stdout().execute(EnableMouseCapture)?;
     stdout().execute(EnableBracketedPaste)?;
     let _ = stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -47,7 +46,7 @@ pub async fn run(
     disable_raw_mode()?;
     let _ = stdout().execute(PopKeyboardEnhancementFlags);
     stdout().execute(DisableBracketedPaste)?;
-    stdout().execute(DisableMouseCapture)?;
+    let _ = stdout().execute(DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
@@ -74,7 +73,7 @@ async fn run_loop(
         let cmd = if app.event_rx.is_some() {
             tokio::select! {
                 _ = tick.tick() => {
-                    app.refresh();
+                    app.tick_refresh();
                     Command::None
                 }
                 ev = events.next() => key_command(&mut app, ev),
@@ -88,7 +87,7 @@ async fn run_loop(
         } else {
             tokio::select! {
                 _ = tick.tick() => {
-                    app.refresh();
+                    app.tick_refresh();
                     Command::None
                 }
                 ev = events.next() => key_command(&mut app, ev),
@@ -336,7 +335,7 @@ fn key_command(app: &mut App, ev: Option<Result<Event, std::io::Error>>) -> Comm
                     } else if app.mention_menu_open() {
                         app.move_mention_sel(-1);
                     } else {
-                        app.scroll_session(1);
+                        app.scroll_session(3);
                     }
                 }
                 MouseEventKind::ScrollDown => {
@@ -347,7 +346,7 @@ fn key_command(app: &mut App, ev: Option<Result<Event, std::io::Error>>) -> Comm
                     } else if app.mention_menu_open() {
                         app.move_mention_sel(1);
                     } else {
-                        app.scroll_session(-1);
+                        app.scroll_session(-3);
                     }
                 }
                 _ => {}

@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,6 +20,32 @@ use super::util::truncate_display;
 /// Facet mark: a diamond with a center — Methodus holds the method, not the work.
 const MARK: &str = "◈";
 const WORDMARK: &str = "Methodus";
+
+// ─── Layout cache ────────────────────────────────────────────────────────────
+// layout_chat is expensive (markdown parsing + word wrap for every line).
+// Cache the result and only recompute when transcript content or width changes.
+thread_local! {
+    static LAYOUT_CACHE: RefCell<LayoutCache> = RefCell::new(LayoutCache::default());
+    static INBOX_MD_CACHE: RefCell<InboxMdCache> = RefCell::new(InboxMdCache::default());
+}
+
+#[derive(Default)]
+struct LayoutCache {
+    version: u64,
+    width: usize,
+    rows: Vec<ChatRow>,
+}
+
+/// Cached markdown rendering for inbox detail view.
+#[derive(Default)]
+struct InboxMdCache {
+    /// The review_sel index when we last computed.
+    review_sel: usize,
+    /// Number of inbox items at cache time (detects list changes).
+    inbox_count: usize,
+    width: usize,
+    lines: Vec<MdLine>,
+}
 
 struct Theme {
     fg: Color,
@@ -439,7 +467,22 @@ fn draw_at_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, _focused: bool) {
     let inner_w = area.width as usize;
     let inner_h = area.height as usize;
-    let rows = layout_chat(&app.transcript, inner_w.max(8));
+    let layout_w = inner_w.max(8);
+
+    // Use cached layout if transcript hasn't changed and width is the same.
+    let rows = LAYOUT_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if c.version == app.transcript_version && c.width == layout_w {
+            c.rows.clone()
+        } else {
+            let computed = layout_chat(&app.transcript, layout_w);
+            c.version = app.transcript_version;
+            c.width = layout_w;
+            c.rows = computed.clone();
+            computed
+        }
+    });
+
     let visible: Vec<Line> = if rows.is_empty() {
         splash_lines(theme, inner_h >= 10)
     } else {
@@ -1475,19 +1518,43 @@ fn draw_inbox_detail(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let body = app.review_detail();
-    if body.is_empty() {
+    let preview_w = inner.width.saturating_sub(2) as usize;
+    let md_w = preview_w.max(16);
+
+    // Cache key: review_sel + inbox item count + width. Avoids re-reading files
+    // and re-parsing markdown on every frame during scrolling.
+    let inbox_count = app.knowledge.len() + app.questions.len()
+        + app.hypotheses.len() + app.evolutions.len() + app.experiences.len();
+    let md_lines: Vec<Line> = INBOX_MD_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if c.review_sel == app.review_sel && c.inbox_count == inbox_count && c.width == md_w {
+            // Cache hit — skip file reads entirely.
+            c.lines.iter().map(|l| md_line_widget(l, theme)).collect()
+        } else {
+            // Cache miss — read body and reparse.
+            let body = app.review_detail();
+            let parsed = if body.is_empty() {
+                Vec::new()
+            } else {
+                render_md(&body, md_w)
+            };
+            let result = parsed.iter().map(|l| md_line_widget(l, theme)).collect();
+            c.review_sel = app.review_sel;
+            c.inbox_count = inbox_count;
+            c.width = md_w;
+            c.lines = parsed;
+            result
+        }
+    });
+
+    if md_lines.is_empty() {
         frame.render_widget(
             Paragraph::new("no item selected").style(theme.dim()),
             inner,
         );
         return;
     }
-    let preview_w = inner.width.saturating_sub(2) as usize;
-    let md_lines: Vec<Line> = render_md(&body, preview_w.max(16))
-        .iter()
-        .map(|l| md_line_widget(l, theme))
-        .collect();
+
     let inner_h = inner.height.saturating_sub(2) as usize;
     let max_scroll = md_lines.len().saturating_sub(inner_h.max(1));
     let scroll = app.review_detail_scroll.min(max_scroll);
