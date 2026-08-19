@@ -1,208 +1,138 @@
 # 04 — Implementation Roadmap
 
-Revised phased plan. This **reorders the original spec's phasing** based on three
-conclusions from the design discussion:
+The implementation order follows the product bet: first prove that a graph-compiled
+context capsule improves a user's existing Claude Code/Codex workflow. Do not first
+build a replacement agent chat, a full observability system, or autonomous agents.
 
-1. **Walking skeleton first.** Do not build a full observability platform (the
-   original spec's Phase 0: config + full SQLite schema + event bus + 30 event types +
-   doctor + CLI) before proving any value. Build the thinnest end-to-end spine first,
-   then thicken.
-2. **Single always-on process — no daemon/client split.** Persistence comes from
-   keeping the one `methodus` process open (in `tmux`), plus executor-native session
-   resume for restart recovery. The daemon/client split is a deferred, optional
-   refactor enabled by keeping `methodus-core` UI-free (see `02-architecture.md` §0).
-3. **No PTY.** The spike showed all executors expose structured non-interactive modes
-   with resume.
+## Design decisions carried into every milestone
 
-Guiding metric: **the fastest path to something the user runs daily on real work.**
-Sustained personal use is the precondition for the learning loop to ever produce
-value; a beautiful architecture nobody uses accumulates no knowledge.
-
----
+1. **Native handoff is the default.** Methodus creates the context and returns after
+   work; Claude Code/Codex/Cursor keep their own interactive TUI.
+2. **Task Workspace means capsule, not copied repository.** The user project remains
+   the agent `cwd`; Methodus stores an immutable, auditable task package separately.
+3. **Markdown graph first.** SQLite indexes and queries graph files; it does not
+   replace them as the knowledge source of truth.
+4. **Learn is first-class.** A deliberate learning session produces a candidate atomic
+   knowledge item, not an unstructured chat transcript.
+5. **Managed adapters are optional.** JSON events and interactive approval protocols
+   are useful later, but are not the prerequisite for daily value.
 
 ## Spike (done — 2026-08-14)
 
-Verified all three executors support non-interactive structured output + session
-resume, and that no PTY is required. Findings recorded in
-[`01-runtime-adapters.md`](./01-runtime-adapters.md). **This retires the biggest
-technical risk in the original design.**
+Verified that Claude Code, Codex, and Cursor expose structured non-interactive modes
+and resume mechanisms. Findings are retained in
+[`01-runtime-adapters.md`](./01-runtime-adapters.md). This de-risks optional managed
+execution; it does not change the default native-handoff boundary.
 
----
+## M0 — Graph and capsule foundations
 
-## Milestone M0 — Project skeleton & the one hard decision
+**Goal:** compile and inspect a task package without launching an agent.
 
-**Goal:** a compiling Cargo workspace and the store engine decided.
+- Define domain types and state machines for graph nodes, typed edges, task kind,
+  workspace/capsule, context selection, launch, and review.
+- Create the Markdown graph layout and SQLite indexing/migrations from
+  [`03-data-model.md`](./03-data-model.md).
+- Implement stable IDs, frontmatter validation, authored-link indexing, and a small
+  seed graph with Knowledge, a Face lens, a Method, and a Skill.
+- Implement the Workspace Compiler: task brief, selected Execute facets, lazy
+  references, selection rationale, hashes, and a hard context budget.
+- Provide a read-only TUI preview of a graph node and a proposed capsule.
 
-- `cargo` workspace with the crates from `02-architecture.md` (empty but compiling):
-  `methodus-domain`, `methodus-store`, `methodus-runtime`, `methodus-core` (library),
-  and the single `methodus` binary.
-- `methodus-domain`: core enums + `Task`/`Session` structs + state-transition
-  functions (pure, unit-tested).
-- Decide `sqlx` vs `rusqlite`; wire the first migration; first TUI launch creates
-  `~/.methodus/` + `state.db`.
-- CI: `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt --check`.
+**Acceptance:** a task against a sample project resolves to a capsule. The user can
+inspect every injected item, its reason, estimated token size, and the full referenced
+source before anything is launched.
 
-**Acceptance:** first launch of `methodus` on an empty machine creates the home dir + DB;
-`cargo test` passes on the domain state machine; the workspace builds clean.
+## M1 — Native Claude Code handoff
 
----
+**Goal:** prove the main before → native Agent TUI → after loop.
 
-## Milestone M1 — Vertical walking skeleton (Claude Code, single process)
+- Register a project directory and a local Claude Code installation.
+- Launch Claude Code in its normal TUI at the project root, with a concise capsule
+  brief and paths to the immutable Methodus workspace.
+- Implement a reliable handoff target: terminal suspension/restore or a tmux pane.
+  Do not parse ANSI, relay prompts, or re-render the Claude conversation.
+- Record launch/return state; on return present an outcome and short retrospective
+  form, then create an Experience linked to the task and selected context.
+- Preserve all workspaces/capsules for audit; add explicit archive rather than default
+  deletion.
 
-The single most important milestone. Proves the **brain → hands → memory** spine
-end to end, with the least code, inside one process.
+**Acceptance:** a user starts a repository task in Methodus, works entirely in native
+Claude Code, returns, and sees an Experience linked to exactly what context was
+recommended. The source repository did not receive a one-off Methodus configuration
+file.
 
-**Scope:**
+## M2 — Review and deliberate learning
 
-- One `methodus` process runs the core `Engine` in-process (no socket, no daemon).
-  A single-instance lock (`~/.methodus/methodus.lock`) prevents two drivers.
-- `methodus` opens the TUI; type a goal in the session pane → task row; rule resolver picks a single
-  Face (hard-coded/seed is fine) and produces `selected-context.md`.
-- Workspace Builder creates `~/.methodus/workspaces/<task-id>/` with path-safety
-  checks.
-- **Claude Code adapter** implementing base `RuntimeAdapter` via
-  `claude --print --output-format stream-json --verbose --session-id ...`; normalize
-  the JSONL into `RuntimeEvent`; persist events + transcript.
-- The session pane streams `RuntimeEvent`s live while the executor runs.
-- On completion, persist result + a raw `Experience` record (file + index row).
-- **Persistence check:** run the process in `tmux`; detach the terminal; the run
-  continues; re-attach the `tmux` window and see it still going / completed.
-- **Restart recovery (minimal):** capture and persist the Claude `session_id`; after a
-  process kill+restart, reconcile via `claude agents --json` and offer `--resume`.
+**Goal:** make knowledge acquisition a daily workflow, not only passive distillation.
 
-**Deliberately excluded:** learning loop, curiosity, multi-Face, Codex/Cursor,
-rich TUI, fine-grained approval (use `plan`/`acceptEdits` for now).
+- Add `Learn` task kind: topic, source attachments/URLs, desired depth, and selected
+  learning Skill.
+- Resolve prerequisite and neighbor graph nodes into a learning capsule.
+- On return, parse/import the candidate output into an atomic knowledge file template
+  with Learn (5W2H), Decide, Execute, Evidence, and typed-link sections.
+- Add review actions: commit, revise, reject, defer, and connect to an existing node.
+- Detect conflicts without overwriting committed Knowledge.
 
-**Acceptance (maps to `00-product.md` §12 scenarios A + D):** submit a task; Methodus drives Claude
-Code in an isolated workspace; detach the `tmux` window and reattach later to see the
-still-running/completed session; view transcript + result + the Experience record.
-Kill and restart the `methodus` process mid-run and confirm it reconciles the session
-(reattach or offer `--resume`).
+**Acceptance:** the user learns a concept through native Claude Code or Codex, reviews
+a candidate 5W2H Knowledge node, adds a prerequisite link, commits it, and can browse
+the link in Methodus.
 
----
+## M3 — Graph and task-control TUI
 
-## Milestone M2 — Persistence hardening, policy & approval, second executor
+**Goal:** make Methodus comfortable as a knowledge/task control plane, not a second
+agent chat.
 
-Thicken the spine into a dependable system and prove executor-agnosticism.
+- Graph search and node detail: title/summary, facets, typed backlinks, sources, and
+  recent task use.
+- Task/learn composer and context-inspection flow; launch mode and runtime choice.
+- Review inbox for candidate nodes, graph-edge proposals, and returned task outcomes.
+- History view for capsules, selections, launch state, and follow-up creation.
+- Setup for projects, packs, runtimes, budgets, and terminal handoff targets.
 
-**Scope:**
+**Acceptance:** all before/after work—create task, inspect context, launch, return,
+review, and browse the resulting graph—is possible without Methodus impersonating an
+agent chat.
 
-- Full event log + append-only guarantees + idempotent handlers (visible in the TUI).
-- Crash-recovery reconciliation per `02-architecture.md` §6 (Claude `agents --json`;
-  `--resume`).
-- **Policy engine + guarded approval loop** for Claude Code: `--permission-mode
-  manual` → structured `permission_denials` → an in-process `approval.requested`
-  event → user decides (`once|session|deny|abort`) → resume with widened
-  `--allowed-tools`. (`00-product.md` §12 scenario B.)
-- **Codex adapter** (base contract) via `codex exec --json` + `codex exec resume`,
-  proving the `RuntimeAdapter` trait holds across executors.
-- Resolver reads real seed Faces/Methods/Skills from `resources/` + `~/.methodus/`;
-  records rationale + confidence; low-confidence choices surfaced to the user.
-- Skill scanner covers Methodus-owned dirs (`~/.methodus/skills`, pack/project
-  overlays). Executor user dirs are not scanned.
+## M4 — Context quality feedback
 
-**Acceptance:** a task requiring a risky action pauses in `waiting_user` with a clear
-scope; approve → continues, deny → safe return, both logged. The same task type runs
-on Codex by switching `--runtime`. Process restart during a session recovers state.
+**Goal:** improve recommendations based on evidence rather than growing prompts.
 
----
+- Record context outcome as useful, unused, misleading, or unknown during return/review.
+- Use explicit tags, typed links, scope, task results, and selection history for the
+  first deterministic resolver; add semantic ranking only as a bounded helper.
+- Detect recurring Experience patterns, contradictions, and missing links; propose
+  candidate Knowledge/Skill/Method/Face-lens changes for review.
+- Add per-task and per-day context/model budgets, injection-use reports, and lazy
+  reference metrics.
 
-## Milestone M3 — First-class TUI
+**Acceptance:** after several related tasks, Methodus can explain why it selected a
+knowledge facet, show whether it helped, and avoid repeatedly injecting items marked
+unused or misleading.
 
-Make the daily-driver UI real so dogfooding is pleasant (this is what drives
-knowledge accumulation). The TUI is part of the **same process** as the Engine.
+## M5+ — Optional managed execution and scale
 
-**Scope:** `ratatui` agent chat (see [`05-tui.md`](./05-tui.md)) — transcript + composer
-(multiline, lightweight markdown), floating overlays (`/session` `/face` `/inbox`
-`/setup`) with type-to-filter, permission/knowledge picks in the composer. Not a
-multi-page dashboard; not Ink/pi-tui. Because UI and Engine share a process, "the TUI
-is the app"; keep it open in `tmux` to keep Methodus running.
+Only after native handoff is a daily habit, add optional capabilities where they solve
+a demonstrated problem:
 
-**Acceptance:** the full task loop (create → resolve → run → approve → view result) is
-completable from the TUI; detaching the `tmux` window keeps sessions running; overlays
-do not wipe the conversation underneath.
+- Managed Claude structured execution for a non-interactive workflow.
+- Codex `exec` and, later, app-server integration for structured approvals/interrupt.
+- Automatic outcome extraction from stable artifacts (diff, tests, task template),
+  always with review.
+- FTS/semantic retrieval, graph visualization, pack sharing conventions, and richer
+  source import.
+- A daemon/client split only if work must continue without an open Methodus process or
+  multiple clients must control one graph.
 
-> **Dogfood gate:** from M3 on, use Methodus for real work (e.g. NXM/embedded tasks).
-> This produces the Experience corpus that M4 depends on.
+## Explicitly deferred
 
----
+- A Methodus-hosted agent transcript/composer or terminal screen scraping.
+- Autonomous cron/RSS/heartbeat calls to an executor.
+- Automatic global skill/knowledge writes.
+- A cloud collaboration product, desktop shell, or mandatory vector database.
 
-## Milestone M4 — Controlled learning & curiosity (the actual bet)
+## Definition of done
 
-Only now, and only with a real Experience corpus from dogfooding.
-
-**Scope (the Learning + Curiosity loops, `00-product.md` §4.2–4.3):** Learning Queue + scheduler (event/threshold/idle);
-`extract_experience` → `detect_gaps` → `propose_knowledge` / `propose_refinement` / `propose_skill`; Question state machine +
-valuation; candidate Knowledge with conflict detection; Candidate Skills land in
-`skills/.candidates/` and promote only on Review commit; TUI `/inbox` overlay.
-Team **packs** as Methodus-format folders: register paths in `packs.yaml`,
-focus / enable / disable; resolution overlays personal home on packs. Copying folders
-(git, USB, shared drive) is outside Methodus — no pull/push/commit in the product.
-No unbounded loops — every job is budgeted, retryable, cancelable, and recoverable. The scheduler
-runs inside the always-on process; background work happens while the process is open.
-
-**Acceptance (`00-product.md` §12 scenario C):** task completion enqueues learning jobs; committed
-knowledge is never silently overwritten; a high-value repeated unknown surfaces as a
-Question; when the user is idle the TUI asks it; answering it produces sourced candidate Knowledge.
-Claude Code is the default runtime; Cursor and Codex remain adapters.
-
-> **Revisit the daemon/client split here.** If, and only if, "Methodus must do
-> background work with no window open at all" becomes a hard requirement, evaluate
-> promoting the process to a detached background service. `methodus-core` being
-> UI-free makes this a wrapping change, not a rewrite. Until then, stay single-process.
-
----
-
-## Milestone M5+ — Deferred (unchanged from spec)
-
-Multi-Face composition & dynamic Methods; Evolution with human-approved
-versioned upgrades; pack promote / PR-style contribution back to a team folder
-(still not git inside Methodus); repo-survey as a Method that writes **project**
-knowledge (not global Faces); Codex **app-server** full `InteractiveRuntime`
-(real-time approval + interrupt + steer); advanced collaboration and research.
-
-The Codex app-server client is enabled by the architecture (structured event
-streams, UI-free core) but is **not** MVP. The optional daemon/client split is
-revisited only if unattended service or multiple clients becomes a hard requirement
-(see M4 note).
-
-### Explicitly dropped (2026-08)
-
-**Desktop app (Tauri)** — removed. The ratatui TUI is the delivery shell; a second
-GUI duplicated TUI parity without adding product value for the primary user
-(user-triggered work in `tmux`). Do not reintroduce without a new audience or
-surface requirement.
-
-**Autonomous scheduled executor** — cron/RSS/interval triggers that call
-`run_task` without human confirmation are out of scope. They mirror the
-always-on agent pattern (high token burn, low trust) that the market has moved
-away from. Allowed instead:
-
-- **Post-task learning** — event-driven, budgeted jobs after the user finishes work.
-- **Curiosity** — idle promotion of a Question to the composer; OS notify when away.
-- **Human-gated hooks** — file/git events may enqueue *reminders* or Inbox items,
-  not silent executor runs.
-
-Optional future: user-confirmed reminders ("survey this repo?") with a daily cap —
-not auto-execution.
-
----
-
-## Definition of Done (per feature)
-
-A feature is done only when it has: an explicit data model + state transitions;
-success/failure/cancel/restart-recovery paths; events + logs; a policy boundary +
-error handling; at least one unit test and one integration/e2e test where applicable;
-structured executor output that is parsed and validated (never format-by-luck); no
-mutation of the user's global executor config; and UI state decoupled from session
-lifecycle (the UI observing the Engine, not owning sessions directly).
-
-## Sequencing rationale (summary)
-
-| Spec order | Revised order | Why |
-|------------|---------------|-----|
-| Phase 0: full platform first | M0 minimal + M1 vertical slice | prove value before breadth |
-| Persistent daemon (`methodusd`) | Single always-on process (kept in tmux) | simpler; executor resume covers restart recovery; daemon split deferred |
-| PTY adapter | No PTY; SDK/JSON adapters | spike showed structured modes exist |
-| Learning in Phase 2 | Learning in M4, after dogfooding | needs a real corpus to be meaningful |
-| One executor then expand | Claude Code (M1) → Codex (M2) | vertical depth before abstraction breadth |
+A feature is done only when it has: explicit file schema and domain transitions;
+success/failure/cancel/recovery behavior; a bounded context/token policy; a review and
+evidence boundary for durable graph writes; integration coverage against at least one
+real runtime handoff where relevant; and no mutation of global Agent configuration.

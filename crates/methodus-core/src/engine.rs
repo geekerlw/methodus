@@ -21,9 +21,31 @@ use crate::lock::process_is_alive;
 use crate::policy;
 use crate::resolution::{self, Resolution};
 use crate::scheduler;
-use crate::workspace::WorkspaceBuilder;
+use crate::workspace::{CapsuleSelection, CapsuleSpec, WorkspaceBuilder};
 
 const MAX_AUTO_TURNS: u32 = 12;
+
+fn graph_score(node: &GraphNode, request: &str) -> f64 {
+    let haystack = format!("{} {} {}", node.title, node.summary.as_deref().unwrap_or(""), node.scope.as_deref().unwrap_or("")).to_ascii_lowercase();
+    let matches = request.split(|c: char| !c.is_alphanumeric())
+        .filter(|term| term.len() >= 3)
+        .filter(|term| haystack.contains(*term))
+        .count() as f64;
+    matches + node.confidence.unwrap_or(0.0)
+}
+
+fn native_command(runtime: &str, brief: &str) -> (String, Vec<String>) {
+    match runtime {
+        "claude-code" => ("claude".into(), vec![brief.into()]),
+        "codex" => ("codex".into(), vec![brief.into()]),
+        "cursor" => ("cursor".into(), vec!["agent".into(), brief.into()]),
+        other => (other.into(), vec![brief.into()]),
+    }
+}
+
+fn yaml_quote(value: &str) -> String {
+    value.replace('"', "'").replace('\n', " ").trim().to_string()
+}
 
 /// User decision on a candidate / conflicted knowledge or skill draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +73,27 @@ pub struct RecoveredSession {
     pub session_id: String,
     pub executor_sid: Option<String>,
     pub still_live: bool,
+}
+
+/// A native interactive launch prepared by Methodus. The caller owns terminal
+/// suspension/pane creation; no Agent TUI output is parsed or proxied.
+#[derive(Debug, Clone)]
+pub struct NativeHandoffPlan {
+    pub task_id: String,
+    pub runtime: String,
+    pub cwd: PathBuf,
+    pub program: String,
+    pub args: Vec<String>,
+    pub capsule_root: PathBuf,
+    pub brief: String,
+}
+
+/// Result of the short-lived, read-only context-planning Agent call that precedes
+/// native handoff. The planner never executes the user's task.
+#[derive(Debug, Clone)]
+pub struct ContextPlan {
+    pub selected_node_ids: Vec<String>,
+    pub rationale: String,
 }
 
 impl Engine {
@@ -129,6 +172,177 @@ impl Engine {
     /// Root directory for per-task executor sandboxes (Claude/Codex cwd).
     pub fn workspace_root(&self) -> PathBuf {
         UserConfig::load(&self.home).resolve_workspace_root(&self.home)
+    }
+
+    /// Re-index independent Markdown graph nodes. This is deliberately separate from
+    /// the legacy Face catalog and can run before every graph/task-control refresh.
+    pub fn sync_graph(&self) -> Result<usize, CoreError> {
+        crate::graph::sync_graph(&self.store, &self.home)
+    }
+
+    pub fn list_graph_nodes(&self, query: Option<&str>) -> Result<Vec<GraphNode>, CoreError> {
+        Ok(self.store.list_graph_nodes(query)?)
+    }
+
+    pub fn graph_edges_for(&self, node_id: &str) -> Result<Vec<GraphEdge>, CoreError> {
+        Ok(self.store.graph_edges_for(node_id)?)
+    }
+
+    /// Compile a compact graph-backed Task Workspace without starting a runtime.
+    /// This is the default pre-launch step for both native handoff and optional managed
+    /// execution. The user's project remains the runtime cwd.
+    pub fn compile_capsule(&self, task_id: &str, context_budget_tokens: i64) -> Result<NativeHandoffPlan, CoreError> {
+        self.compile_capsule_with_nodes(task_id, context_budget_tokens, &[])
+    }
+
+    /// Compile against explicit planner choices. An empty list retains the local
+    /// deterministic ranking as an offline fallback.
+    pub fn compile_capsule_with_nodes(&self, task_id: &str, context_budget_tokens: i64, preferred_node_ids: &[String]) -> Result<NativeHandoffPlan, CoreError> {
+        let task = self.store.get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        self.sync_graph()?;
+        let runtime = self.preferred_runtime(task.runtime.as_deref());
+        let launch_cwd = task.project_id.as_ref()
+            .and_then(|id| crate::project::list_projects(&self.home).into_iter().find(|project| project.id == *id))
+            .map(|project| project.root)
+            .unwrap_or_else(|| self.launch_cwd.clone());
+        let roots = self.context_roots().into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+        let (request, _) = crate::mentions::prepare_prompt(&task.request, &roots);
+        let request_terms = request.to_ascii_lowercase();
+        let mut candidates = self.store.list_graph_nodes(None)?;
+        candidates.sort_by(|left, right| graph_score(right, &request_terms).total_cmp(&graph_score(left, &request_terms)));
+        let mut selections = Vec::new();
+        for node in candidates.into_iter()
+            .filter(|node| node.node_type == "knowledge" || node.node_type == "skill" || node.node_type == "experience")
+            .filter(|node| preferred_node_ids.is_empty() || preferred_node_ids.iter().any(|id| id == &node.id))
+            .take(12) {
+            let source = self.home.join(&node.path);
+            let Ok(document) = crate::graph::read_graph_document(&self.home, &source) else { continue };
+            let content = crate::graph::facet(&document.body, "Execute")
+                .or_else(|| node.summary.clone())
+                .unwrap_or_else(|| document.body.lines().take(8).collect::<Vec<_>>().join("\n"));
+            if content.trim().is_empty() { continue; }
+            let priority = graph_score(&node, &request_terms);
+            selections.push(CapsuleSelection {
+                node_id: node.id.clone(), title: node.title.clone(), facet: "Execute".into(),
+                content, reference_path: source, rationale: format!("graph match score {:.1}", priority), priority,
+            });
+        }
+        let skill_files = selections.iter()
+            .filter(|selection| selection.node_id.starts_with("skill/"))
+            .filter_map(|selection| selection.reference_path.parent().map(|parent| (selection.title.clone(), parent.join("SKILL.md"))))
+            .filter(|(_, path)| path.is_file())
+            .collect();
+        let spec = CapsuleSpec {
+            task_id: task.id.clone(), title: task.title.clone(), request,
+            runtime: runtime.clone(), launch_cwd: launch_cwd.clone(), context_budget_tokens,
+            selections: selections.clone(), skills: skill_files,
+        };
+        let compiled = WorkspaceBuilder::build_capsule(&self.workspace_root(), &spec)?;
+        let workspace_id = format!("ws_{}", task.id);
+        let now = Utc::now();
+        self.store.insert_task_workspace(&TaskWorkspace {
+            id: workspace_id.clone(), task_id: task.id.clone(), root_path: compiled.root.display().to_string(),
+            launch_cwd: launch_cwd.display().to_string(), status: "compiled".into(),
+            manifest_hash: compiled.manifest_hash, context_budget_tokens, created_at: now, updated_at: now,
+        })?;
+        self.store.update_task_workspace(&task.id, &workspace_id)?;
+        let mut consumed = 0i64;
+        let selected = selections.into_iter().map(|selection| {
+            let estimate = crate::graph::estimated_tokens(&selection.content);
+            let disposition = if consumed + estimate <= context_budget_tokens {
+                consumed += estimate;
+                "injected"
+            } else { "lazy" };
+            ContextSelection {
+                id: format!("ctx_{}", Uuid::new_v4()), workspace_id: workspace_id.clone(), node_id: selection.node_id,
+                facet: selection.facet, rationale: selection.rationale, priority: Some(selection.priority),
+                estimated_tokens: estimate, disposition: disposition.into(), outcome: None, created_at: now, updated_at: now,
+            }
+        }).collect::<Vec<_>>();
+        self.store.replace_context_selections(&workspace_id, &selected)?;
+        self.emit_simple("workspace.compiled", Some(&task.id), &serde_json::json!({
+            "workspace_id": workspace_id, "path": compiled.root, "estimated_tokens": compiled.estimated_tokens,
+            "budget_tokens": context_budget_tokens,
+        }).to_string());
+        let (program, args) = native_command(&runtime, &compiled.brief);
+        Ok(NativeHandoffPlan { task_id: task.id, runtime, cwd: launch_cwd, program, args, capsule_root: compiled.root, brief: compiled.brief })
+    }
+
+    /// Ask a disposable read-only runtime session to select graph node IDs. The
+    /// response is intentionally a tiny JSON contract; file reads and task work
+    /// remain outside this planning call. If it cannot provide valid selections,
+    /// callers can safely fall back to `compile_capsule`'s local ranker.
+    pub async fn plan_context(&self, task_id: &str) -> Result<ContextPlan, CoreError> {
+        let task = self.store.get_task(task_id)?.ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        self.sync_graph()?;
+        let mut nodes = self.store.list_graph_nodes(None)?;
+        nodes.retain(|node| matches!(node.node_type.as_str(), "knowledge" | "skill" | "experience"));
+        nodes.sort_by(|a, b| graph_score(b, &task.request).total_cmp(&graph_score(a, &task.request)));
+        nodes.truncate(24);
+        let catalog = nodes.iter().map(|node| format!("- {} | {} | {}", node.id, node.node_type, node.summary.as_deref().unwrap_or(""))).collect::<Vec<_>>().join("\n");
+        let prompt = format!(
+            "You are Methodus's disposable context planner. Do not solve the task, use tools, or explain the task. Select at most 8 relevant IDs from the catalog for the goal. Return ONLY JSON: {{\"selected_node_ids\":[...],\"rationale\":\"...\"}}.\n\nGoal:\n{}\n\nCatalog:\n{}",
+            task.request, catalog
+        );
+        let runtime = self.preferred_runtime(task.runtime.as_deref());
+        let adapter = self.adapter(&runtime)?;
+        let cwd = self.workspace_root().join("_context_planner");
+        fs::create_dir_all(&cwd)?;
+        let (handle, rx) = adapter.spawn(SpawnInput {
+            prompt, cwd, session_id: format!("planner_{}", Uuid::new_v4()), permission_mode: "plan".into(),
+            allowed_tools: Vec::new(), sandbox: Some("read-only".into()), extra_dirs: Vec::new(), model: None,
+        }).await?;
+        let text = tokio::time::timeout(Duration::from_secs(45), collect_refine_text(rx)).await
+            .map_err(|_| CoreError::Other("context planner timed out".into()))?;
+        let _ = adapter.stop(&handle).await;
+        let value: serde_json::Value = serde_json::from_str(text.trim())
+            .map_err(|_| CoreError::Other("context planner returned invalid JSON".into()))?;
+        let valid = nodes.iter().map(|node| node.id.as_str()).collect::<std::collections::HashSet<_>>();
+        let selected_node_ids = value.get("selected_node_ids").and_then(serde_json::Value::as_array)
+            .into_iter().flatten().filter_map(serde_json::Value::as_str)
+            .filter(|id| valid.contains(*id)).take(8).map(str::to_string).collect::<Vec<_>>();
+        if selected_node_ids.is_empty() { return Err(CoreError::Other("context planner selected no usable graph nodes".into())); }
+        Ok(ContextPlan { selected_node_ids, rationale: value.get("rationale").and_then(serde_json::Value::as_str).unwrap_or("runtime-selected graph context").to_string() })
+    }
+
+    /// Persist the fact that the user was handed into their native Agent TUI. The
+    /// caller must use `NativeHandoffPlan` with an inherited terminal; Methodus does
+    /// not capture or interpret that UI.
+    pub fn record_native_handoff(&self, plan: &NativeHandoffPlan) -> Result<String, CoreError> {
+        if let Some(task) = self.store.get_task(&plan.task_id)? {
+            match task.status {
+                TaskStatus::Queued => self.transition_task(&task, TaskStatus::Planning)?,
+                TaskStatus::Planning | TaskStatus::Running => {}
+                // A returned task can be continued from the Sessions panel.
+                // Review is the task's outcome-capture phase, not a terminal
+                // state and never a session lifecycle state.
+                TaskStatus::Reviewing => self.transition_task(&task, TaskStatus::Running)?,
+                other => return Err(CoreError::TaskNotRunnable(plan.task_id.clone(), other.to_string())),
+            }
+        }
+        let task = self.store.get_task(&plan.task_id)?.ok_or_else(|| CoreError::TaskNotFound(plan.task_id.clone()))?;
+        if task.status == TaskStatus::Planning {
+            self.transition_task(&task, TaskStatus::Running)?;
+        }
+        let command = std::iter::once(plan.program.as_str()).chain(plan.args.iter().map(String::as_str)).collect::<Vec<_>>().join(" ");
+        let id = self.store.record_launch(&plan.task_id, &plan.runtime, "native_handoff", &command)?;
+        self.emit_simple("launch.started", Some(&plan.task_id), &serde_json::json!({"launch_id": id, "runtime": plan.runtime, "cwd": plan.cwd, "capsule": plan.capsule_root}).to_string());
+        Ok(id)
+    }
+
+    /// Return from native Agent interaction into Methodus's review surface. The exit
+    /// code is lifecycle evidence only; it never decides whether learned knowledge is
+    /// trustworthy or whether the task actually met its acceptance criteria.
+    pub fn record_native_return(&self, launch_id: &str, task_id: &str, exit_status: &str) -> Result<(), CoreError> {
+        self.store.complete_launch(launch_id, exit_status)?;
+        if let Some(task) = self.store.get_task(task_id)? {
+            if task.status == TaskStatus::Running {
+                self.transition_task(&task, TaskStatus::Reviewing)?;
+            }
+        }
+        self.emit_simple("launch.returned", Some(task_id), &serde_json::json!({"launch_id": launch_id, "exit_status": exit_status}).to_string());
+        Ok(())
     }
 
     /// Drain due learning jobs (extract → detect → propose). Budgeted, no LLM.
@@ -610,6 +824,95 @@ Current candidate markdown:\n\n{current}"
         self.store.insert_task(&task)?;
         self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": title}).to_string());
         Ok(task)
+    }
+
+    /// Create a graph-control task without resolving a Face or starting a managed
+    /// executor. This is the product's default task entry point: the runtime is
+    /// selected only when the capsule is compiled and then owns its native TUI.
+    pub fn create_control_task(
+        &self,
+        title: &str,
+        mode: &str,
+        runtime: Option<&str>,
+    ) -> Result<Task, CoreError> {
+        let now = Utc::now();
+        let id_raw = Uuid::new_v4().to_string().replace('-', "");
+        let task = Task {
+            id: format!("task_{}", &id_raw[..12]),
+            title: title.trim().to_string(),
+            request: title.trim().to_string(),
+            project_id: crate::project::focus_project(&self.home).map(|p| p.id),
+            status: TaskStatus::Queued,
+            runtime: Some(self.preferred_runtime(runtime)),
+            workspace_id: None,
+            resolution: Some(serde_json::json!({"mode": mode, "control_plane": "graph"}).to_string()),
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        if task.title.is_empty() {
+            return Err(CoreError::Other("task title cannot be empty".into()));
+        }
+        self.store.insert_task(&task)?;
+        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": title, "mode": mode}).to_string());
+        Ok(task)
+    }
+
+    /// Close a native handoff with a human-authored outcome. Work tasks become
+    /// experience nodes; learn tasks additionally create an explicitly-reviewable
+    /// 5W2H knowledge candidate. Neither path asks Methodus to parse the Agent UI.
+    pub fn finalize_control_task(&self, task_id: &str, outcome: &str) -> Result<(), CoreError> {
+        let task = self.store.get_task(task_id)?
+            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
+        if task.status == TaskStatus::Reviewing {
+            self.transition_task(&task, TaskStatus::Completed)?;
+        }
+        let is_learn = task.resolution.as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| value.get("mode").and_then(|value| value.as_str()).map(str::to_string))
+            .as_deref() == Some("learn");
+        let slug = task.id.trim_start_matches("task_");
+        let now = Utc::now();
+        let links = task.workspace_id.as_deref()
+            .map(|id| self.store.list_context_selections(id))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter().map(|s| s.node_id).collect::<Vec<_>>();
+        let related = if links.is_empty() { "[]".to_string() } else { format!("[{}]", links.iter().map(|id| format!("\"{id}\"")).collect::<Vec<_>>().join(", ")) };
+        let experience_path = self.home.join("graph/experiences").join(format!("{slug}.md"));
+        fs::create_dir_all(experience_path.parent().expect("experience parent"))?;
+        fs::write(&experience_path, format!(
+            "---\nid: experience/{slug}\ntitle: \"{}\"\nnode_type: experience\nstatus: committed\nsummary: \"{}\"\nlinks:\n  learned_from: {related}\n---\n\n## Outcome\n\n{}\n\n## Evidence\n\n- Native runtime: {}\n- Capsule: {}\n",
+            yaml_quote(&task.title), yaml_quote(outcome), outcome.trim(), task.runtime.as_deref().unwrap_or("unknown"), task.workspace_id.as_deref().unwrap_or("none")
+        ))?;
+        if is_learn {
+            let knowledge_path = self.home.join("graph/knowledge").join(format!("candidate-{slug}.md"));
+            fs::create_dir_all(knowledge_path.parent().expect("knowledge parent"))?;
+            fs::write(&knowledge_path, format!(
+                "---\nid: knowledge/candidate-{slug}\ntitle: \"{}\"\nnode_type: knowledge\nstatus: candidate\nsummary: \"{}\"\nlinks:\n  derived_from: [\"experience/{slug}\"]\n---\n\n# 5W2H\n\n## What\n\n{}\n\n## Why\n\n待复盘确认其适用价值。\n\n## Who\n\n面向后续相关任务的 Agent 与操作者。\n\n## When\n\n当任务目标与本主题匹配时。\n\n## Where\n\n由 Methodus graph capsule 选择后注入。\n\n## How\n\n根据证据和复盘补充为可执行步骤。\n\n## How much\n\n按 capsule token 预算按需注入。\n\n## Evidence\n\n- experience/{slug}\n",
+                yaml_quote(&task.title), yaml_quote(outcome), outcome.trim()
+            ))?;
+        }
+        self.sync_graph()?;
+        self.emit_simple("task.reviewed", Some(task_id), &serde_json::json!({"outcome": outcome, "learn": is_learn, "at": now}).to_string());
+        Ok(())
+    }
+
+    /// Promote a Markdown graph candidate after an explicit review. The Markdown
+    /// file remains the source of truth; SQLite is refreshed only as its index.
+    pub fn promote_graph_candidate(&self, node_id: &str) -> Result<(), CoreError> {
+        let node = self.store.graph_node(node_id)?
+            .ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
+        let path = self.home.join(&node.path);
+        let raw = fs::read_to_string(&path)?;
+        let updated = raw.replacen("status: candidate", "status: committed", 1);
+        if updated == raw {
+            return Err(CoreError::Other(format!("{node_id} is not a candidate")));
+        }
+        fs::write(path, updated)?;
+        self.sync_graph()?;
+        self.emit_simple("graph.promoted", None, &serde_json::json!({"node_id": node_id}).to_string());
+        Ok(())
     }
 
     /// Ingest docs/standards into the focus project's knowledge corpus.
@@ -2175,6 +2478,33 @@ mod tests {
             live: vec![],
         });
         (Engine::new(store, adapter, dir.path().to_path_buf()), dir)
+    }
+
+    #[test]
+    fn graph_control_learn_task_returns_experience_and_5w2h_candidate() {
+        let (engine, dir) = engine_with(vec![]);
+        fs::create_dir_all(dir.path().join("graph/knowledge")).unwrap();
+        fs::write(dir.path().join("graph/knowledge/retries.md"), "---\nid: knowledge/retries\ntitle: Retry safety\nnode_type: knowledge\nstatus: committed\nsummary: Retry with idempotency keys\n---\n\n## Execute\nUse a stable key.\n").unwrap();
+        let task = engine.create_control_task("Learn retry safety", "learn", Some("claude-code")).unwrap();
+        let plan = engine.compile_capsule(&task.id, 1600).unwrap();
+        let launch = engine.record_native_handoff(&plan).unwrap();
+        engine.record_native_return(&launch, &task.id, "exit 0").unwrap();
+        engine.finalize_control_task(&task.id, "Validated an idempotency-key approach.").unwrap();
+        let nodes = engine.list_graph_nodes(None).unwrap();
+        assert!(nodes.iter().any(|node| node.id == format!("experience/{}", task.id.trim_start_matches("task_"))));
+        assert!(nodes.iter().any(|node| node.status.as_deref() == Some("candidate")));
+        assert_eq!(engine.store().get_task(&task.id).unwrap().unwrap().status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn context_planner_accepts_only_catalog_node_ids() {
+        let (engine, dir) = engine_with(vec![ok_result(r#"{"selected_node_ids":["knowledge/retries","outside/catalog"],"rationale":"retry task"}"#)]);
+        fs::create_dir_all(dir.path().join("graph/knowledge")).unwrap();
+        fs::write(dir.path().join("graph/knowledge/retries.md"), "---\nid: knowledge/retries\ntitle: Retry safety\nnode_type: knowledge\nstatus: committed\nsummary: Retry with idempotency keys\n---\n\n## Execute\nUse a stable key.\n").unwrap();
+        let task = engine.create_control_task("Handle retries", "work", Some("claude-code")).unwrap();
+        let plan = engine.plan_context(&task.id).await.unwrap();
+        assert_eq!(plan.selected_node_ids, vec!["knowledge/retries"]);
+        assert_eq!(plan.rationale, "retry task");
     }
 
     #[tokio::test]

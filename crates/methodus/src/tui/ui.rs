@@ -199,7 +199,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let runtime = app.runtime.as_deref().unwrap_or("claude-code");
-    let face = app.default_face.as_deref().unwrap_or("auto");
+    let face = match (
+        app.default_face.as_deref(),
+        app.context_faces.as_slice(),
+    ) {
+        (None | Some(""), []) => "auto".to_string(),
+        (Some(d), []) => d.to_string(),
+        (Some(d), ctx) if !d.is_empty() => format!("{d}+{}", ctx.join("+")),
+        (_, ctx) => format!("auto+{}", ctx.join("+")),
+    };
     let wait_mark = if app.approvals.is_empty() {
         String::new()
     } else {
@@ -227,6 +235,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Overlay::Setup => "  setup",
         Overlay::Inbox => "  inbox",
         Overlay::Faces => "  faces",
+        Overlay::Handoff => "  handoff",
+        Overlay::Returned => "  returned",
         Overlay::Sessions => "  sessions",
         Overlay::None => "",
     };
@@ -260,8 +270,55 @@ fn draw_overlay(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             frame.render_widget(Clear, area);
             draw_setup(frame, area, app, theme);
         }
+        Overlay::Handoff => draw_handoff(frame, area, app, theme),
+        Overlay::Returned => draw_returned(frame, area, app, theme),
         Overlay::None => {}
     }
+}
+
+fn draw_handoff(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let popup = floating_popup(area, 82, 62);
+    frame.render_widget(Clear, popup);
+    let block = panel(" native Agent handoff  ·  enter launch  ·  esc cancel ", true, theme);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines = match app.handoff_plan.as_ref() {
+        Some(plan) => vec![
+            Line::from(Span::styled("Methodus will now leave the conversation path.", theme.label())),
+            Line::from(""),
+            Line::from(format!("runtime      {}", plan.runtime)),
+            Line::from(format!("project cwd  {}", plan.cwd.display())),
+            Line::from(format!("capsule      {}", plan.capsule_root.display())),
+            Line::from(format!("command      {} {}", plan.program, plan.args.first().map(String::as_str).unwrap_or(""))),
+            Line::from(""),
+            Line::from(Span::styled("The agent will use its normal TUI and permission prompts.", theme.dim())),
+            Line::from(Span::styled("Methodus records only launch/return; it does not parse the conversation.", theme.dim())),
+            Line::from(""),
+            Line::from(Span::styled("Enter  Launch native runtime     Esc  Cancel", theme.label())),
+        ],
+        None => vec![Line::from("No compiled handoff plan.")],
+    };
+    frame.render_widget(Paragraph::new(lines).style(theme.text()).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_returned(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let popup = floating_popup(area, 72, 42);
+    frame.render_widget(Clear, popup);
+    let block = panel(" native runtime returned  ·  enter review ", true, theme);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let root = app.handoff_plan.as_ref().map(|plan| plan.capsule_root.display().to_string()).unwrap_or_else(|| "task capsule".into());
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("You are back in Methodus.", theme.label())),
+            Line::from(""),
+            Line::from("Open the capsule outcome.md to record the result, evidence, and which context helped."),
+            Line::from(format!("capsule: {root}")),
+            Line::from(""),
+            Line::from(Span::styled("Enter  Open review inbox", theme.label())),
+        ]).style(theme.text()).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// Floating card over the live transcript (Pi-style overlay: clear popup only).
@@ -1198,6 +1255,14 @@ fn composer_view(input: &str, cursor: usize, width: usize, max_rows: usize) -> (
     (vis, cur_col, cur_row)
 }
 
+fn list_state_for(vis: &[usize], sel: usize) -> ListState {
+    let mut state = ListState::default();
+    if let Some(i) = vis.iter().position(|&idx| idx == sel) {
+        state.select(Some(i));
+    }
+    state
+}
+
 fn overlay_filter_title(base: &str, filter: &str, matches: usize, total: usize) -> String {
     if filter.is_empty() {
         format!(" {base}  ·  type to filter  ·  esc ")
@@ -1313,14 +1378,25 @@ fn draw_faces(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let popup = floating_popup(area, 72, 60);
     frame.render_widget(Clear, popup);
     let vis = app.visible_face_indices();
-    let title = overlay_filter_title("faces", &app.overlay_filter, vis.len(), app.faces.len());
+    let pin = app.default_face.as_deref().unwrap_or("auto");
+    let ctx = if app.context_faces.is_empty() {
+        String::new()
+    } else {
+        format!(" + {}", app.context_faces.join(" + "))
+    };
+    let title = overlay_filter_title(
+        &format!("faces  ·  {pin}{ctx}"),
+        &app.overlay_filter,
+        vis.len(),
+        app.faces.len(),
+    );
     let block = panel(&title, true, theme);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     if app.faces.is_empty() {
         frame.render_widget(
-            Paragraph::new("no faces yet")
+            Paragraph::new("no faces yet\n\n/setup → packs → a to register a pack.yaml folder")
                 .style(theme.dim())
                 .alignment(Alignment::Center),
             inner,
@@ -1329,14 +1405,16 @@ fn draw_faces(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
     let vis = app.visible_face_indices();
     let items: Vec<ListItem> = if vis.is_empty() {
-        vec![ListItem::new("  no matches").style(theme.dim())]
+        vec![ListItem::new("  no matches — backspace to clear filter").style(theme.dim())]
     } else {
-        vis.into_iter()
-            .map(|i| {
+        vis.iter()
+            .map(|&i| {
                 let f = &app.faces[i];
                 let mark = if i == app.face_sel { ">" } else { " " };
-                let pin = if app.default_face.as_deref() == Some(f.id.as_str()) {
+                let role = if app.default_face.as_deref() == Some(f.id.as_str()) {
                     "  [default]"
+                } else if app.context_faces.iter().any(|c| c == &f.id) {
+                    "  [ctx]"
                 } else {
                     ""
                 };
@@ -1346,7 +1424,7 @@ fn draw_faces(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     theme.text()
                 };
                 ListItem::new(format!(
-                    "{mark} {} — {}{pin}\n    [{}] {}",
+                    "{mark} {} — {}{role}\n    [{}] {}",
                     f.id,
                     f.name,
                     f.source,
@@ -1356,7 +1434,8 @@ fn draw_faces(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             })
             .collect()
     };
-    frame.render_widget(List::new(items).style(theme.text()), inner);
+    let mut state = list_state_for(&vis, app.face_sel);
+    frame.render_stateful_widget(List::new(items).style(theme.text()), inner, &mut state);
 }
 
 fn inbox_knowledge_title(source: &str) -> &'static str {
@@ -1405,17 +1484,30 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(" Q ask  K know  S skill  P patch  N note  H hyp  F face  E exp")
+            .style(theme.dim()),
+        rows[0],
+    );
+
+    let left_w = (rows[1].width / 2).clamp(38, 56);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(34), Constraint::Min(18)])
-        .split(inner);
+        .constraints([Constraint::Length(left_w), Constraint::Min(18)])
+        .split(rows[1]);
 
     let vis = app.visible_review_indices();
+    let title_w = (cols[0].width as usize).saturating_sub(16).max(12);
     let mut items: Vec<ListItem> = Vec::new();
     if vis.is_empty() {
-        items.push(ListItem::new("  no matches").style(theme.dim()));
+        items.push(ListItem::new("  no matches — backspace to clear filter").style(theme.dim()));
     }
-    for idx in vis {
+    for idx in &vis {
+        let idx = *idx;
         let mark = if idx == app.review_sel { ">" } else { " " };
         if idx < app.questions.len() {
             let q = &app.questions[idx];
@@ -1424,7 +1516,7 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 ListItem::new(format!(
                     "{mark} Q  {:<8}  {}",
                     q.status,
-                    ellipsize(&q.question, 18)
+                    ellipsize(&q.question, title_w)
                 ))
                 .style(style),
             );
@@ -1439,7 +1531,7 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 ListItem::new(format!(
                     "{mark} {kind}  {:<8}  {}",
                     k.status,
-                    ellipsize(&k.path, 18)
+                    ellipsize(&k.path, title_w)
                 ))
                 .style(style),
             );
@@ -1453,7 +1545,7 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 ListItem::new(format!(
                     "{mark} H  {:<8}  {}",
                     h.status,
-                    ellipsize(&h.path, 18)
+                    ellipsize(&h.path, title_w)
                 ))
                 .style(style),
             );
@@ -1467,7 +1559,7 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 ListItem::new(format!(
                     "{mark} F  {:<8}  {}",
                     ev.status,
-                    ellipsize(&format!("face:{}", ev.target_id), 18)
+                    ellipsize(&format!("face:{}", ev.target_id), title_w)
                 ))
                 .style(style),
             );
@@ -1480,13 +1572,14 @@ fn draw_review(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 ListItem::new(format!(
                     "{mark} E  {:<8}  {}",
                     outcome,
-                    ellipsize(exp.summary.as_deref().unwrap_or(&exp.id), 18)
+                    ellipsize(exp.summary.as_deref().unwrap_or(&exp.id), title_w)
                 ))
                 .style(style),
             );
         }
     }
-    frame.render_widget(List::new(items).style(theme.text()), cols[0]);
+    let mut state = list_state_for(&vis, app.review_sel);
+    frame.render_stateful_widget(List::new(items).style(theme.text()), cols[0], &mut state);
 
     let body = app.review_summary();
     let title = match app.selected_review() {
@@ -1910,7 +2003,7 @@ fn draw_prompt_modal(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let popup = centered(area, 72, 32);
+    let popup = centered(area, 72, 34);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(vec![
@@ -1936,6 +2029,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
         Line::from("  /session     pick another conversation"),
         Line::from("  /clear /new  new conversation — does not resume the executor"),
         Line::from("  /learn       @paths/URLs → knowledge (auto pipeline)"),
+        Line::from("  /open        current conversation workspace in Finder / file manager"),
         Line::from("  /retry       retry the open conversation"),
         Line::from("  /cancel      cancel a running task"),
         Line::from("  /delete      delete a finished task"),
@@ -2178,5 +2272,14 @@ mod tests {
         assert_eq!(inbox_visible_range(100, 10, 999), (90, 100, 90));
         assert_eq!(inbox_visible_range(8, 10, 0), (0, 8, 0));
         assert_eq!(inbox_visible_range(0, 10, 0), (0, 0, 0));
+    }
+
+    #[test]
+    fn list_state_selects_visible_index() {
+        let vis = vec![2, 5, 9];
+        let state = list_state_for(&vis, 5);
+        assert_eq!(state.selected(), Some(1));
+        let empty = list_state_for(&vis, 0);
+        assert_eq!(empty.selected(), None);
     }
 }

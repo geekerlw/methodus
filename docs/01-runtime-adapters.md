@@ -17,13 +17,32 @@ All three executors expose a **non-interactive, structured-output mode** with:
   invocations), and
 - some form of **permission control**.
 
-Therefore Methodus drives executors as **SDK-style subprocesses / protocol clients**,
-not as terminal puppets. This removes the single biggest engineering risk in the
-original design
-(ANSI parsing, "is it waiting for input?" heuristics) and simplifies the
-`RuntimeAdapter` implementations dramatically.
+Therefore Methodus can drive executors as **SDK-style subprocesses / protocol clients**
+when a task explicitly needs managed execution. It must not drive an interactive CLI
+as a terminal puppet: parsing ANSI or guessing whether Claude/Codex is waiting for a
+human is still out of scope.
 
-## 2. Capability matrix
+The default product path is now **native handoff**: Methodus compiles a Task Workspace,
+launches the user's normal Claude Code/Codex/Cursor TUI with a concise brief, and
+steps out of the conversational path. Structured adapters remain valuable for optional
+headless/managed tasks, health checks, and future automation; they are not required to
+make the graph and learning loops useful.
+
+## 2. Two launch modes
+
+| Mode | Methodus does | Agent runtime does | Use when |
+|---|---|---|---|
+| **Native handoff (default)** | compile capsule, start terminal/TUI, record launch and return, collect outcome | owns all interactive conversation, tools, approval UI, and session persistence | normal daily coding or learning work |
+| **Managed execution (optional)** | spawn structured process, consume JSON events, apply Methodus policy, persist session | executes non-interactive or protocol-driven turns | automation, replayable batch work, or a deliberately managed flow |
+
+Both modes consume the same `manifest.yaml`, `brief.md`, selected context, skills,
+and outcome format. The difference is only the transport and degree of control.
+
+Native handoff must not modify a repository's permanent `CLAUDE.md`, `AGENTS.md`, or
+global runtime configuration. The launch brief points to the generated capsule, while
+the runtime's working directory remains the user-selected project.
+
+## 3. Capability matrix
 
 | Capability | Claude Code | Codex CLI | Cursor Agent |
 |------------|:-----------:|:---------:|:------------:|
@@ -44,13 +63,25 @@ near-parity + best interrupt/approval granularity) > Cursor (usable baseline, co
 permissions, no daemon). **Default runtime is Claude Code**; Cursor and Codex
 remain selectable. The matrix above is capability, not a ranking of daily use.
 
-## 3. The `RuntimeAdapter` trait
+## 4. The adapter boundary
 
-Core logic depends **only** on this trait. Executor-specific quirks live behind it.
+Core logic depends only on an adapter boundary. Executor-specific quirks live behind
+it. A production API has two entry points: `handoff` for the default native terminal
+launch, and `spawn`/`resume` for optional structured managed execution.
 
 ```rust
 /// Identifies a concrete executor implementation.
 pub enum RuntimeKind { ClaudeCode, Codex, Cursor }
+
+pub enum LaunchMode { NativeHandoff, Managed }
+
+pub struct HandoffInput {
+    pub runtime: RuntimeKind,
+    pub launch_cwd: PathBuf,       // user project root
+    pub capsule_path: PathBuf,     // immutable Methodus task package
+    pub brief: String,             // bounded startup context + capsule reference
+    pub terminal: TerminalTarget,  // current terminal, tmux pane, or configured terminal
+}
 
 /// Minimum common contract — all three executors satisfy this.
 #[async_trait]
@@ -62,6 +93,9 @@ pub trait RuntimeAdapter: Send + Sync {
 
     /// Static capability declaration (drives resolver + policy decisions).
     fn capabilities(&self) -> RuntimeCapabilities;
+
+    /// Launch the runtime's ordinary interactive UI. No conversation/event parsing.
+    async fn handoff(&self, input: HandoffInput) -> Result<NativeLaunch>;
 
     /// Start a new session for a task. Returns a handle + an event stream.
     async fn spawn(&self, input: SpawnInput) -> Result<(SessionHandle, EventStream)>;
@@ -95,9 +129,10 @@ Supporting types (normalized across executors):
 ```rust
 pub struct SpawnInput {
     pub prompt: String,
-    pub cwd: PathBuf,                 // task workspace root
+    pub cwd: PathBuf,                 // user project root; capsule is referenced separately
+    pub capsule_path: PathBuf,         // immutable Task Workspace
     pub session_id: Option<Uuid>,    // caller-assigned when supported
-    pub permission: PermissionMode,   // mapped per-adapter (see §7)
+    pub permission: PermissionMode,   // mapped per-adapter (see §8)
     pub allowed_tools: Vec<String>,   // Claude Code honors precisely
     pub extra_dirs: Vec<PathBuf>,     // always the launch cwd ∪ registered projects (`claude --add-dir`); source is read in place, not copied into cwd
     pub model: Option<String>,
@@ -125,17 +160,26 @@ pub enum RuntimeEvent {
 pub enum ApprovalDecision { Accept, AcceptForSession, Decline, Cancel }
 ```
 
-Each adapter's job is: **spawn the right process/protocol, and translate its native
-event stream into `RuntimeEvent`.** Nothing more. Policy, persistence, and scheduling
-stay in the core.
+For managed execution, each adapter's job is: **spawn the right process/protocol, and
+translate its native event stream into `RuntimeEvent`.** For native handoff it only
+constructs the safe launch command and records return status. Policy, graph resolution,
+capsule compilation, persistence, and review stay in the core.
 
 ---
 
-## 4. Claude Code adapter
+## 5. Claude Code adapter
 
 **Binary:** `claude` (2.1.220). Auth via existing login/keychain.
 
-### 4.1 Non-interactive execution + event stream
+### 5.1 Native handoff (default)
+
+The launcher starts `claude` in the project `cwd` and passes a short task brief that
+points to the capsule's `brief.md`, `context.md`, and `references.md`. Methodus yields
+the terminal (or opens a configured tmux pane), waits only for process return, and
+then restores its graph/review TUI. It does not use `claude attach` or parse TUI output
+to supervise a normal interactive session.
+
+### 5.2 Non-interactive execution + event stream
 
 ```bash
 claude --print --output-format stream-json --verbose \
@@ -168,7 +212,7 @@ claude --print --output-format stream-json --verbose \
  "terminal_reason":"completed","usage":{...}}
 ```
 
-### 4.2 Session persistence + resume (verified)
+### 5.3 Session persistence + resume (verified)
 
 - Pass a caller-generated UUID via `--session-id`. Persisted unless
   `--no-session-persistence`.
@@ -176,7 +220,7 @@ claude --print --output-format stream-json --verbose \
   Confirmed: context is fully retained across separate process invocations
   (a secret stored in turn 1 was recalled after resume in turn 2).
 
-### 4.3 Permission model (verified)
+### 5.4 Permission model (verified)
 
 `--permission-mode` values: `acceptEdits`, `auto`, `bypassPermissions`, `manual`,
 `dontAsk`, `plan`.
@@ -192,9 +236,9 @@ claude --print --output-format stream-json --verbose \
 **Approval flow in `--print` mode:** a turn runs to completion; denied tools appear in
 `permission_denials`. Methodus policy inspects them, and if approved, issues a
 **resume turn** with the widened `--allowed-tools`. (For truly interactive,
-mid-turn approval, use the background/`--input-format stream-json` path — see §4.4.)
+mid-turn approval, use the background/`--input-format stream-json` path — see §5.5.)
 
-### 4.4 Persistent background daemon (verified)
+### 5.5 Persistent background daemon (verified)
 
 Claude Code ships its **own** background agent manager:
 
@@ -211,13 +255,13 @@ claude stop <id>                           # stop the session
 - `logs` output is **full-screen ANSI TUI** — do **not** parse it. Use `--print`/
   `stream-json` for machine-readable output; use `--bg` only for lifecycle.
 
-### 4.5 Streaming multi-turn input
+### 5.6 Streaming multi-turn input
 
 `--input-format stream-json` accepts realtime streamed user messages on **stdin kept
 open**. Closing stdin ends the session. This is the path for true interactive
 takeover (mid-turn approval, steering) without process restarts.
 
-### 4.6 Integration strategy
+### 5.7 Integration strategy
 
 - **Short tasks:** `--print --output-format stream-json --verbose` one-shot; parse the
   JSONL; capture `result`.
@@ -230,11 +274,18 @@ takeover (mid-turn approval, steering) without process restarts.
 
 ---
 
-## 5. Codex adapter
+## 6. Codex adapter
 
 **Binary:** `codex` (0.146.1).
 
-### 5.1 Simple path — `exec` + `exec resume` (verified)
+### 6.1 Native handoff (default)
+
+Launch the user's normal `codex` TUI in the project directory with the bounded
+capsule brief. The full context is available by path; Methodus does not interpose on
+the conversation. `codex exec` below is a managed-execution path, not the daily
+interactive default.
+
+### 6.2 Simple managed path — `exec` + `exec resume` (verified)
 
 ```bash
 codex exec --json [--sandbox <mode>] [-C <cwd>] [--ephemeral] "<prompt>"
@@ -260,7 +311,7 @@ Clean JSONL event stream (verified):
 - **Limitation:** `codex exec` has **no** `--ask-for-approval`; permission is only the
   coarse sandbox level, and each resume is a fresh process (~100ms startup).
 
-### 5.2 Full path — `app-server` JSON-RPC (verified protocol)
+### 6.3 Full managed path — `app-server` JSON-RPC (verified protocol)
 
 Codex exposes a complete app-server protocol (stdio / `unix://` / `ws://`):
 
@@ -307,7 +358,7 @@ Server → client **notifications** (the event stream) include:
 structured, per-command approval; `turn/interrupt` mid-turn; a persistent daemon
 connection with no per-turn process restart.
 
-### 5.3 Integration strategy
+### 6.4 Integration strategy
 
 - **Phase 1 (simple):** `codex exec --json` + `codex exec resume` — trivial to
   implement, matches the common `spawn`/`resume` contract.
@@ -319,11 +370,11 @@ connection with no per-turn process restart.
 
 ---
 
-## 6. Cursor adapter
+## 7. Cursor adapter
 
 **Binary:** `cursor agent` (Cursor 3.14.7).
 
-### 6.1 Execution + event stream (verified)
+### 7.1 Native handoff and managed execution
 
 ```bash
 cursor agent --print --output-format stream-json \
@@ -349,7 +400,7 @@ Event stream (verified):
   effectively bypassed — there is **no structured denial + re-grant loop** like
   Claude Code's.
 
-### 6.2 Permission model (coarse)
+### 7.2 Permission model (coarse)
 
 - Default `--print`: writes/shell run without prompting.
 - `--plan` / `--mode plan`: read-only planning, no edits.
@@ -364,7 +415,7 @@ Event stream (verified):
 (choose `--plan` vs full run, restrict workspace, use OS sandbox), not via mid-turn
 approval. No background daemon; long runs stay attached to the process.
 
-### 6.3 Integration strategy
+### 7.3 Integration strategy
 
 - Implement base `spawn` / `resume` / `stop` via `cursor agent --print
   --output-format stream-json`.
@@ -374,7 +425,7 @@ approval. No background daemon; long runs stay attached to the process.
 
 ---
 
-## 7. Permission mode mapping
+## 8. Permission mode mapping
 
 Methodus has a single internal `PermissionMode`; each adapter maps it:
 
@@ -389,7 +440,7 @@ Where a cell is ⚠️, the executor cannot honor guarded approval; Methodus mus
 downgrade to read-only, pre-authorize a bounded scope, or route the task to an
 executor that supports guarding (Claude Code / Codex app-server).
 
-## 8. Verification probes (re-run on version bump)
+## 9. Verification probes (re-run on version bump)
 
 Keep these as throwaway checks; they are how every claim above was established.
 
@@ -413,16 +464,18 @@ cursor agent --print --output-format stream-json --resume <id> "..."
 cursor agent --print --output-format stream-json --plan "<write attempt>"   # planning only
 ```
 
-## 9. Open questions
+## 10. Open questions
 
-1. **Claude Code driving surface:** settle on `--print` + `--input-format stream-json`
-   (stdin held open) as the *primary* programmatic path vs `--bg`/`agents` for
-   unattended long runs. Prototype both in the walking skeleton; pick one primary.
-2. **Codex app-server stability:** it is experimental. Decide whether Phase 1 ships
+1. **Native terminal transfer:** settle on terminal suspension versus a new tmux pane
+   as the default handoff target. It must return to Methodus reliably without parsing
+   the agent TUI.
+2. **Managed Claude surface:** settle on `--print` + `--input-format stream-json`
+   versus `--bg`/`agents` only for optional managed/unattended runs.
+3. **Codex app-server stability:** it is experimental. Decide whether Phase 1 ships
    only the `exec`/`exec resume` path and defers app-server to Phase 2.
-3. **Cursor guarded approval:** confirm there is truly no programmatic approval
+4. **Cursor guarded approval:** confirm there is truly no programmatic approval
    callback in a headless mode (only `--print`/`--plan`/`--force`/`--auto-review`
    were found). If confirmed, Cursor stays base-contract only.
-4. **Session id ownership:** Claude Code accepts a caller UUID (`--session-id`);
+5. **Session id ownership:** Claude Code accepts a caller UUID (`--session-id`);
    Codex and Cursor mint their own. The core must store the executor-issued id from
    the `SessionStarted` event and not assume it can pre-assign for all executors.

@@ -9,7 +9,6 @@ use methodus_core::{ensure_home, methodus_home, Engine, InstanceLock};
 use methodus_runtime::{ClaudeCodeAdapter, CodexAdapter, CursorAdapter, RuntimeAdapter};
 use methodus_store::Store;
 
-mod notify;
 mod tui;
 
 #[derive(Parser)]
@@ -18,7 +17,7 @@ mod tui;
     version,
     about = "Persistent Personal Expert System",
     long_about = "Opens the Methodus TUI. Keep this process running (e.g. in tmux).\n\
-                  First launch creates ~/.methodus. Projects, packs, and settings live in /setup."
+                  First launch creates ~/.methodus. Runtime and permission controls are available in the launcher."
 )]
 struct Cli {}
 

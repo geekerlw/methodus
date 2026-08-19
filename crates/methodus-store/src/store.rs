@@ -661,6 +661,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn workspace_path_for_task(&self, task_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
+        let mut stmt = conn.prepare("SELECT root_path FROM workspaces WHERE task_id = ?1")?;
+        let mut rows = stmt.query(params![task_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Remove a task and its sessions / events / approvals / workspace rows.
     /// Returns workspace directories the caller should delete from disk.
     pub fn delete_task(&self, id: &str) -> Result<Vec<String>, StoreError> {
@@ -1178,6 +1191,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+        assert_eq!(
+            store.workspace_path_for_task("t-001").unwrap().as_deref(),
+            Some("/tmp/workspace")
+        );
+        assert_eq!(store.workspace_path_for_task("missing").unwrap(), None);
     }
 
     #[test]

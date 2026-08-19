@@ -6,26 +6,27 @@ data model, TUI, and the learning loop. There is no separate spec file
 
 | # | Document | What it covers |
 |---|----------|----------------|
-| — | [`architecture.svg`](./architecture.svg) / [`.png`](./architecture.png) | System diagram: Execution loop + human-gated Learning loop |
-| 00 | [`00-product.md`](./00-product.md) | **Product contract** (*what & why*): Faces, Methods, Skills, Knowledge, the three loops, events, permissions, TUI surface, out of scope |
-| 01 | [`01-runtime-adapters.md`](./01-runtime-adapters.md) | Verified Claude Code / Codex / Cursor capabilities and the `RuntimeAdapter` trait |
-| 02 | [`02-architecture.md`](./02-architecture.md) | Rust stack, crate layout, **single-process** runtime (no daemon/client split), crash recovery |
-| 03 | [`03-data-model.md`](./03-data-model.md) | SQLite schema, on-disk files, source-of-truth split |
-| 04 | [`04-roadmap.md`](./04-roadmap.md) | Milestones and acceptance criteria |
-| 05 | [`05-tui.md`](./05-tui.md) | In-process ratatui TUI contract |
-| 07 | [`07-learning-vs-refine.md`](./07-learning-vs-refine.md) | Learning loop vs Prime Agent `/refine` — comparison and what we shipped |
+| — | [`architecture.svg`](./architecture.svg) / [`.png`](./architecture.png) | Legacy system diagram; update after the graph/capsule implementation spike |
+| 00 | [`00-product.md`](./00-product.md) | **Product contract**: Markdown-first knowledge graph, context capsules, native agent handoff, deliberate learning |
+| 01 | [`01-runtime-adapters.md`](./01-runtime-adapters.md) | Verified runtime capabilities; default native handoff vs optional managed adapters |
+| 02 | [`02-architecture.md`](./02-architecture.md) | Rust stack, graph/workspace compiler modules, single-process control plane |
+| 03 | [`03-data-model.md`](./03-data-model.md) | Graph files, typed-edge index, task capsules, context-selection and review state |
+| 04 | [`04-roadmap.md`](./04-roadmap.md) | Graph-first delivery milestones and acceptance criteria |
+| 05 | [`05-tui.md`](./05-tui.md) | Ratatui graph/task/review control plane; explicitly not an agent chat |
+| 07 | [`07-learning-vs-refine.md`](./07-learning-vs-refine.md) | Graph evolution and deliberate learning compared with Prime Agent `/refine` |
 
 `00-product.md` wins for product intent; `01`–`05` win for implementation detail.
 
 ## Decisions that stick
 
 1. **Language is Rust**, not TypeScript (`02-architecture.md`).
-2. **No PTY layer.** Executors are driven through structured JSON/JSONL (`01-runtime-adapters.md`).
-3. **One always-on process**, not a daemon/client split. Keep `methodus` open in `tmux`
+2. **Native handoff first.** Claude Code/Codex/Cursor own their interactive TUI;
+   structured JSON/JSONL is an optional managed-execution path (`01-runtime-adapters.md`).
+3. **One always-on control-plane process**, not a daemon/client split. Keep `methodus` open in `tmux`
    (`02-architecture.md` §0).
 4. **User-triggered execution.** Background work is post-task learning and idle Curiosity.
    No cron auto-run of executors (`04-roadmap.md`).
-5. **Prompt is not the database.** Policy, promotion, and conflict checks live in Rust.
-   Candidates land in `/inbox`; nothing silent-commits to live skills.
+5. **Markdown graph is the knowledge source.** SQLite indexes it; prompts receive only
+   selected facets and lazy references. Nothing silently commits to live knowledge or skills.
 
 Open questions sit at the bottom of each document.

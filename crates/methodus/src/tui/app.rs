@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use methodus_core::{
     at_query, filter_candidates, health_checks, list_from_roots, list_packs, list_projects, Engine,
     FaceSummary, HealthCheck, HypothesisReviewAction, KnowledgeReviewAction, MentionCandidate,
-    PackInfo, ProjectInfo, RecoveredSession, UserConfig,
+    NativeHandoffPlan, PackInfo, ProjectInfo, RecoveredSession, UserConfig,
 };
 use methodus_domain::{
     Approval, ApprovalDecision, EvolutionCandidate, EvolutionStatus, Experience, Hypothesis,
@@ -33,6 +34,8 @@ pub enum Overlay {
     Inbox,
     Sessions,
     Faces,
+    Handoff,
+    Returned,
 }
 
 impl Overlay {
@@ -159,6 +162,8 @@ pub enum Command {
         sources: Vec<String>,
         face: Option<String>,
     },
+    PrepareHandoff { goal: String },
+    LaunchHandoff,
 }
 
 pub struct App {
@@ -196,6 +201,8 @@ pub struct App {
     pub answering_id: Option<String>,
     pub confirm_task_id: Option<String>,
     pub confirm_delete: bool,
+    /// Setup unregister: (Projects|Packs, id). Distinct from task cancel/delete.
+    pub confirm_drop: Option<(SetupSection, String)>,
     pub questions: Vec<Question>,
     pub knowledge: Vec<KnowledgeItem>,
     pub hypotheses: Vec<Hypothesis>,
@@ -204,6 +211,7 @@ pub struct App {
     pub transcript: Vec<ChatLine>,
     pub transcript_offset: usize,
     pub transcript_version: u64,
+    pub handoff_plan: Option<NativeHandoffPlan>,
     pub session_task_id: Option<String>,
     pub tick: u8,
     pub event_rx: Option<mpsc::Receiver<RuntimeEvent>>,
@@ -291,6 +299,7 @@ impl App {
             answering_id: None,
             confirm_task_id: None,
             confirm_delete: false,
+            confirm_drop: None,
             questions: Vec::new(),
             knowledge: Vec::new(),
             hypotheses: Vec::new(),
@@ -299,6 +308,7 @@ impl App {
             transcript: Vec::new(),
             transcript_offset: 0,
             transcript_version: 0,
+            handoff_plan: None,
             session_task_id: None,
             tick: 0,
             event_rx: None,
@@ -354,6 +364,7 @@ impl App {
             self.answering_id = None;
             self.confirm_task_id = None;
             self.confirm_delete = false;
+            self.confirm_drop = None;
         }
         self.set_status(StatusLevel::Warn, "ctrl-c again to quit");
         Command::None
@@ -1268,6 +1279,8 @@ impl App {
             Overlay::Inbox => return self.handle_inbox_key(key),
             Overlay::Faces => return self.handle_faces_key(key),
             Overlay::Sessions => return self.handle_sessions_key(key),
+            Overlay::Handoff => return self.handle_handoff_key(key),
+            Overlay::Returned => return self.handle_returned_key(key),
             Overlay::None => {}
         }
         self.handle_session_key(key)
@@ -1417,6 +1430,7 @@ impl App {
             Overlay::Faces => self.visible_face_indices(),
             Overlay::Inbox => self.visible_review_indices(),
             Overlay::Setup => (0..self.setup_list_len()).collect(),
+            Overlay::Handoff | Overlay::Returned => Vec::new(),
             Overlay::None => Vec::new(),
         }
     }
@@ -1771,6 +1785,10 @@ impl App {
     }
 
     fn handle_faces_key(&mut self, key: KeyEvent) -> Command {
+        if matches!(key.code, KeyCode::Char(' ')) {
+            self.toggle_face_context();
+            return Command::None;
+        }
         if self.overlay_consume_filter_key(key) {
             return Command::None;
         }
@@ -1837,12 +1855,48 @@ impl App {
 
     fn pin_selected_face(&mut self) {
         if let Some(face) = self.faces.get(self.face_sel) {
-            self.default_face = Some(face.id.clone());
+            let id = face.id.clone();
+            self.default_face = Some(id.clone());
+            self.context_faces.retain(|c| c != &id);
             match self.persist_config() {
-                Ok(()) => self.set_status(
-                    StatusLevel::Ok,
-                    format!("default face `{}`", face.id),
-                ),
+                Ok(()) => {
+                    let ctx = if self.context_faces.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" + {}", self.context_faces.join(" + "))
+                    };
+                    self.set_status(
+                        StatusLevel::Ok,
+                        format!("default face `{id}{ctx}`"),
+                    );
+                }
+                Err(e) => self.set_status(StatusLevel::Error, e),
+            }
+        }
+    }
+
+    fn toggle_face_context(&mut self) {
+        let Some(face) = self.faces.get(self.face_sel) else {
+            return;
+        };
+        let id = face.id.clone();
+        if self.default_face.as_deref() == Some(id.as_str()) {
+            self.set_status(
+                StatusLevel::Info,
+                format!("`{id}` is already the default — Space adds other faces as context"),
+            );
+            return;
+        }
+        if let Some(pos) = self.context_faces.iter().position(|c| c == &id) {
+            self.context_faces.remove(pos);
+            match self.persist_config() {
+                Ok(()) => self.set_status(StatusLevel::Ok, format!("removed context `{id}`")),
+                Err(e) => self.set_status(StatusLevel::Error, e),
+            }
+        } else {
+            self.context_faces.push(id.clone());
+            match self.persist_config() {
+                Ok(()) => self.set_status(StatusLevel::Ok, format!("context + `{id}`")),
                 Err(e) => self.set_status(StatusLevel::Error, e),
             }
         }
@@ -2063,6 +2117,30 @@ impl App {
         }
     }
 
+    fn handle_handoff_key(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('l') => Command::LaunchHandoff,
+            KeyCode::Esc | KeyCode::Char('c') => {
+                self.handoff_plan = None;
+                self.overlay = Overlay::None;
+                self.set_status(StatusLevel::Info, "handoff cancelled");
+                Command::None
+            }
+            _ => Command::None,
+        }
+    }
+
+    fn handle_returned_key(&mut self, key: KeyEvent) -> Command {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => {
+                self.overlay = Overlay::Inbox;
+                self.set_status(StatusLevel::Info, "review the outcome and any candidate knowledge");
+                Command::None
+            }
+            _ => Command::None,
+        }
+    }
+
     fn handle_help_key(&mut self, key: KeyEvent) -> Command {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') => {
@@ -2079,10 +2157,18 @@ impl App {
                 self.mode = Mode::Normal;
                 self.confirm_task_id = None;
                 self.confirm_delete = false;
+                self.confirm_drop = None;
                 self.set_status(StatusLevel::Info, "kept");
                 Command::None
             }
             KeyCode::Enter | KeyCode::Char('y') => {
+                if let Some((section, id)) = self.confirm_drop.take() {
+                    self.mode = Mode::Normal;
+                    self.confirm_task_id = None;
+                    self.confirm_delete = false;
+                    self.drop_setup_id(section, &id);
+                    return Command::None;
+                }
                 let id = self.confirm_task_id.clone().unwrap_or_default();
                 let delete = self.confirm_delete;
                 self.mode = Mode::Normal;
@@ -2271,10 +2357,7 @@ impl App {
                 self.toggle_selected_pack();
                 Command::None
             }
-            KeyCode::Char('d') | KeyCode::Char('x') => {
-                self.remove_selected_setup();
-                Command::None
-            }
+            KeyCode::Char('d') | KeyCode::Char('x') => self.begin_setup_drop(),
             KeyCode::Enter => {
                 self.activate_setup_row();
                 Command::None
@@ -2385,32 +2468,56 @@ impl App {
         }
     }
 
-    fn remove_selected_setup(&mut self) {
-        let home = self.engine.home().to_path_buf();
-        match self.setup_section {
-            SetupSection::Settings => {}
+    fn begin_setup_drop(&mut self) -> Command {
+        let (kind, id) = match self.setup_section {
+            SetupSection::Settings => {
+                self.set_status(StatusLevel::Info, "nothing to drop here — tab to projects or packs");
+                return Command::None;
+            }
             SetupSection::Projects => {
-                if let Some(p) = self.projects.get(self.setup_sel) {
-                    match methodus_core::project::remove_project(&home, &p.id) {
-                        Ok(()) => {
-                            self.refresh();
-                            self.set_status(StatusLevel::Ok, "project unregistered");
-                        }
-                        Err(e) => self.set_status(StatusLevel::Error, e.to_string()),
-                    }
-                }
+                let Some(p) = self.projects.get(self.setup_sel) else {
+                    self.set_status(StatusLevel::Info, "no project selected — a to add");
+                    return Command::None;
+                };
+                ("project", p.id.clone())
             }
             SetupSection::Packs => {
-                if let Some(p) = self.packs.get(self.setup_sel) {
-                    match methodus_core::pack::remove_pack(&home, &p.id) {
-                        Ok(()) => {
-                            self.refresh();
-                            self.set_status(StatusLevel::Ok, "pack unregistered");
-                        }
-                        Err(e) => self.set_status(StatusLevel::Error, e.to_string()),
-                    }
-                }
+                let Some(p) = self.packs.get(self.setup_sel) else {
+                    self.set_status(StatusLevel::Info, "no pack selected — a to add");
+                    return Command::None;
+                };
+                ("pack", p.id.clone())
             }
+        };
+        self.mode = Mode::ConfirmCancel;
+        self.confirm_drop = Some((self.setup_section, id.clone()));
+        self.confirm_task_id = None;
+        self.confirm_delete = false;
+        self.set_status(
+            StatusLevel::Warn,
+            format!("unregister {kind} `{id}`? [y]es  [n]/esc no"),
+        );
+        Command::None
+    }
+
+    fn drop_setup_id(&mut self, section: SetupSection, id: &str) {
+        let home = self.engine.home().to_path_buf();
+        match section {
+            SetupSection::Settings => {}
+            SetupSection::Projects => match methodus_core::project::remove_project(&home, id) {
+                Ok(()) => {
+                    self.refresh();
+                    self.set_status(StatusLevel::Ok, format!("project `{id}` unregistered"));
+                }
+                Err(e) => self.set_status(StatusLevel::Error, e.to_string()),
+            },
+            SetupSection::Packs => match methodus_core::pack::remove_pack(&home, id) {
+                Ok(()) => {
+                    self.refresh();
+                    self.set_status(StatusLevel::Ok, format!("pack `{id}` unregistered"));
+                }
+                Err(e) => self.set_status(StatusLevel::Error, e.to_string()),
+            },
         }
     }
 
@@ -2555,7 +2662,7 @@ impl App {
             Overlay::Faces => self.face_sel,
             Overlay::Inbox => self.review_sel,
             Overlay::Setup => self.setup_sel,
-            Overlay::None => 0,
+            Overlay::Handoff | Overlay::Returned | Overlay::None => 0,
         }
     }
 
@@ -2568,7 +2675,7 @@ impl App {
                 self.review_detail_scroll = 0;
             }
             Overlay::Setup => self.setup_sel = sel,
-            Overlay::None => {}
+            Overlay::Handoff | Overlay::Returned | Overlay::None => {}
         }
     }
 
@@ -2786,7 +2893,7 @@ impl App {
         let matches = matching_slash(&self.input);
         if matches.is_empty() {
             self.input_error =
-                Some("unknown command — try /help /setup /inbox /face /quit".to_string());
+                Some("unknown command — try /help /setup /inbox /open /quit".to_string());
             return Command::None;
         }
         let cmd = matches[self.slash_sel.min(matches.len() - 1)];
@@ -2885,6 +2992,22 @@ impl App {
                     face: self.default_face.clone(),
                 }
             }
+            "handoff" => {
+                self.input.clear();
+                self.slash_sel = 0;
+                if rest.trim().is_empty() {
+                    self.input_error = Some("usage: /handoff <task goal>".into());
+                    Command::None
+                } else {
+                    Command::PrepareHandoff { goal: rest.trim().to_string() }
+                }
+            }
+            "open" => {
+                self.input.clear();
+                self.slash_sel = 0;
+                self.open_current_workspace();
+                Command::None
+            }
             "cleanup" => {
                 self.input.clear();
                 self.slash_sel = 0;
@@ -2899,6 +3022,32 @@ impl App {
                 self.input_error = Some("unknown command".to_string());
                 Command::None
             }
+        }
+    }
+
+    fn open_current_workspace(&mut self) {
+        let task_id = self.session_task_id.clone();
+        let root = self.engine.workspace_root();
+        let stored = task_id.as_deref().and_then(|id| {
+            self.engine
+                .store()
+                .workspace_path_for_task(id)
+                .ok()
+                .flatten()
+        });
+        let path = resolve_open_workspace_path(&root, task_id.as_deref(), stored.as_deref());
+        if !path.exists() {
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                self.set_status(
+                    StatusLevel::Error,
+                    format!("cannot create {}: {e}", path.display()),
+                );
+                return;
+            }
+        }
+        match spawn_file_manager(&path) {
+            Ok(()) => self.set_status(StatusLevel::Info, format!("opened {}", path.display())),
+            Err(e) => self.set_status(StatusLevel::Error, e),
         }
     }
 
@@ -3518,9 +3667,9 @@ fn inbox_detail_scroll_delta(key: KeyEvent, typing: bool) -> Option<isize> {
 fn overlay_reserved_char(overlay: Overlay, c: char) -> bool {
     match overlay {
         Overlay::Sessions => matches!(c, 'j' | 'k' | 'g' | 'G' | '?' | 'd' | 'x' | 'c'),
-        Overlay::Faces => matches!(c, 'j' | 'k' | '?'),
+        Overlay::Faces => matches!(c, 'j' | 'k' | '?' | ' '),
         Overlay::Inbox => matches!(c, 'j' | 'k' | 'g' | 'G' | '?' | 'y' | 'd' | 'x' | 'z'),
-        Overlay::Setup | Overlay::None => true,
+        Overlay::Setup | Overlay::Handoff | Overlay::Returned | Overlay::None => true,
     }
 }
 
@@ -3785,6 +3934,11 @@ pub const SLASH_COMMANDS: &[SlashCmd] = &[
         summary: "pin a Face, or open the Face list",
     },
     SlashCmd {
+        name: "handoff",
+        aliases: &["task"],
+        summary: "compile a context capsule, inspect it, then launch native Agent TUI",
+    },
+    SlashCmd {
         name: "help",
         aliases: &[],
         summary: "keyboard and commands",
@@ -3798,6 +3952,11 @@ pub const SLASH_COMMANDS: &[SlashCmd] = &[
         name: "learn",
         aliases: &[],
         summary: "learn from @paths/URLs — agent picks pipeline and archives",
+    },
+    SlashCmd {
+        name: "open",
+        aliases: &[],
+        summary: "open the current conversation workspace in Finder / file manager",
     },
     SlashCmd {
         name: "inbox",
@@ -3870,6 +4029,60 @@ pub fn matching_slash(input: &str) -> Vec<&'static SlashCmd> {
         .collect()
 }
 
+/// Prefer the current task workspace when it exists under `root`; otherwise `root`.
+fn resolve_open_workspace_path(
+    root: &Path,
+    task_id: Option<&str>,
+    stored: Option<&str>,
+) -> PathBuf {
+    if let Some(stored) = stored {
+        let p = PathBuf::from(stored);
+        if p.is_dir() && path_is_under(&p, root) {
+            return p;
+        }
+    }
+    if let Some(id) = task_id.filter(|id| !id.is_empty()) {
+        let p = root.join(id);
+        if p.is_dir() && path_is_under(&p, root) {
+            return p;
+        }
+    }
+    root.to_path_buf()
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(p), Ok(r)) => p.starts_with(&r),
+        _ => path.starts_with(root),
+    }
+}
+
+fn spawn_file_manager(path: &Path) -> Result<(), String> {
+    let mut cmd = file_manager_command(path);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open {}: {e}", path.display()))
+}
+
+fn file_manager_command(path: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(file_manager_bin());
+    cmd.arg(path);
+    cmd
+}
+
+fn file_manager_bin() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    }
+}
+
 fn slash_rest(input: &str) -> String {
     let t = input.trim_start();
     let Some(rest) = t.strip_prefix('/') else {
@@ -3901,7 +4114,9 @@ pub fn help_line(app: &App) -> String {
         }
         Mode::Prompt => " [enter] save path   [esc] cancel ".to_string(),
         Mode::ConfirmCancel => {
-            if app.confirm_delete {
+            if app.confirm_drop.is_some() {
+                " [y]es unregister   [n]/[esc] keep ".to_string()
+            } else if app.confirm_delete {
                 " [y]es delete task   [n]/[esc] keep ".to_string()
             } else {
                 " [y]es cancel task   [n]/[esc] keep ".to_string()
@@ -3934,12 +4149,15 @@ pub fn help_line(app: &App) -> String {
                 None => " type to filter  [esc]session  [?]help ".to_string(),
             },
             Overlay::Faces => {
-                " [enter] pin  type to filter  [esc] session ".to_string()
+                " [↑↓]select  [enter]default  [space]context  type filter  [esc]session "
+                    .to_string()
             }
             Overlay::Sessions => {
                 " [enter] open  [d]elete  [c]ancel  type to filter  [tab]/[esc] back "
                     .to_string()
             }
+            Overlay::Handoff => " [enter] launch native Agent TUI   [esc] cancel ".to_string(),
+            Overlay::Returned => " [enter] review outcome and knowledge candidates ".to_string(),
             Overlay::None => {
                 if slash_menu_open(&app.input) {
                     " [↑↓ j k]choose  [tab]complete  [enter]run  [esc]clear ".to_string()
@@ -4044,9 +4262,13 @@ mod tests {
             .iter()
             .map(|c| c.name)
             .collect();
-        for need in ["setup", "inbox", "face", "session", "clear", "help", "quit", "learn", "cleanup"] {
+        for need in [
+            "setup", "inbox", "face", "session", "clear", "help", "quit", "learn", "cleanup",
+            "open", "handoff",
+        ] {
             assert!(names.contains(&need), "missing /{need} in {names:?}");
         }
+        assert_eq!(matching_slash("/task")[0].name, "handoff");
         assert_eq!(
             matching_slash("/setup")
                 .iter()
@@ -4067,12 +4289,60 @@ mod tests {
                 .any(|c| c.name == "learn")
         );
         assert_eq!(
+            matching_slash("/open")
+                .iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>(),
+            vec!["open"]
+        );
+        assert_eq!(
             matching_slash("/new")
                 .iter()
                 .map(|c| c.name)
                 .collect::<Vec<_>>(),
             vec!["clear"]
         );
+    }
+
+    #[test]
+    fn open_workspace_prefers_task_dir_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let task = root.join("task-abc");
+        std::fs::create_dir(&task).unwrap();
+        assert_eq!(
+            resolve_open_workspace_path(root, Some("task-abc"), None),
+            task
+        );
+        assert_eq!(
+            resolve_open_workspace_path(root, None, None),
+            root.to_path_buf()
+        );
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_open_workspace_path(
+                root,
+                Some("task-abc"),
+                Some(outside.path().to_str().unwrap())
+            ),
+            task
+        );
+        assert_eq!(
+            resolve_open_workspace_path(root, Some("missing-task"), None),
+            root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn file_manager_bin_matches_os() {
+        let bin = file_manager_bin();
+        if cfg!(target_os = "macos") {
+            assert_eq!(bin, "open");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(bin, "explorer");
+        } else {
+            assert_eq!(bin, "xdg-open");
+        }
     }
 
     #[test]

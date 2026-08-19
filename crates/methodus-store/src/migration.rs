@@ -62,6 +62,12 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         mark_applied(conn, 8)?;
     }
 
+    // V9: Markdown-first graph index + immutable task context capsule metadata.
+    if !is_applied(conn, 9)? {
+        apply_v9(conn)?;
+        mark_applied(conn, 9)?;
+    }
+
     Ok(())
 }
 
@@ -351,6 +357,77 @@ fn apply_v8(conn: &Connection) -> Result<(), StoreError> {
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL
         );
+        ",
+    )?;
+    Ok(())
+}
+
+fn apply_v9(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "
+        CREATE TABLE graph_nodes (
+            id           TEXT PRIMARY KEY,
+            node_type    TEXT NOT NULL,
+            title        TEXT NOT NULL,
+            path         TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            status       TEXT,
+            summary      TEXT,
+            scope        TEXT,
+            confidence   REAL,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        );
+        CREATE INDEX idx_graph_nodes_type_status ON graph_nodes(node_type, status);
+        CREATE INDEX idx_graph_nodes_path ON graph_nodes(path);
+
+        CREATE TABLE graph_edges (
+            id            TEXT PRIMARY KEY,
+            from_id       TEXT NOT NULL,
+            relation      TEXT NOT NULL,
+            to_id         TEXT NOT NULL,
+            source        TEXT NOT NULL,
+            confidence    REAL,
+            evidence_refs TEXT NOT NULL DEFAULT '[]',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            UNIQUE(from_id, relation, to_id)
+        );
+        CREATE INDEX idx_graph_edges_from ON graph_edges(from_id, relation);
+        CREATE INDEX idx_graph_edges_to ON graph_edges(to_id, relation);
+
+        CREATE TABLE context_selections (
+            id               TEXT PRIMARY KEY,
+            workspace_id     TEXT NOT NULL,
+            node_id          TEXT NOT NULL,
+            facet            TEXT NOT NULL,
+            rationale        TEXT NOT NULL,
+            priority         REAL,
+            estimated_tokens INTEGER NOT NULL DEFAULT 0,
+            disposition      TEXT NOT NULL,
+            outcome          TEXT,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL
+        );
+        CREATE INDEX idx_context_selection_workspace ON context_selections(workspace_id);
+        CREATE INDEX idx_context_selection_node ON context_selections(node_id);
+
+        CREATE TABLE launches (
+            id                  TEXT PRIMARY KEY,
+            task_id             TEXT NOT NULL,
+            runtime             TEXT NOT NULL,
+            mode                TEXT NOT NULL,
+            executor_session_id TEXT,
+            command_summary     TEXT,
+            started_at          TEXT NOT NULL,
+            returned_at         TEXT,
+            exit_status         TEXT
+        );
+        CREATE INDEX idx_launches_task ON launches(task_id, started_at);
+
+        ALTER TABLE workspaces ADD COLUMN launch_cwd TEXT;
+        ALTER TABLE workspaces ADD COLUMN manifest_hash TEXT;
+        ALTER TABLE workspaces ADD COLUMN context_budget_tokens INTEGER;
         ",
     )?;
     Ok(())

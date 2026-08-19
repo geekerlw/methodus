@@ -157,3 +157,67 @@ pub struct EvolutionCandidate {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// A file-backed node in Methodus's Markdown-first knowledge graph.
+///
+/// `node_type` intentionally remains a string at this boundary so graph packs can add
+/// compatible node kinds without a database migration. Built-ins include knowledge,
+/// experience, artifact, face, method, and skill.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct GraphNode {
+    pub id: String,
+    pub node_type: String,
+    pub title: String,
+    pub path: String,
+    pub content_hash: String,
+    pub status: Option<String>,
+    pub summary: Option<String>,
+    pub scope: Option<String>,
+    pub confidence: Option<f64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A typed, directed relationship between two graph nodes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct GraphEdge {
+    pub id: String,
+    pub from_id: String,
+    pub relation: String,
+    pub to_id: String,
+    pub source: String,
+    pub confidence: Option<f64>,
+    pub evidence_refs: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A selected graph fragment and the decision that put it into (or behind) a task capsule.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ContextSelection {
+    pub id: String,
+    pub workspace_id: String,
+    pub node_id: String,
+    pub facet: String,
+    pub rationale: String,
+    pub priority: Option<f64>,
+    pub estimated_tokens: i64,
+    pub disposition: String,
+    pub outcome: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The durable metadata for an immutable task context capsule.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TaskWorkspace {
+    pub id: String,
+    pub task_id: String,
+    pub root_path: String,
+    pub launch_cwd: String,
+    pub status: String,
+    pub manifest_hash: String,
+    pub context_budget_tokens: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

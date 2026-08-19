@@ -7,6 +7,7 @@ pub mod curiosity;
 pub mod engine;
 pub mod error;
 pub mod face_util;
+pub mod graph;
 pub mod hypothesis;
 pub mod ingest;
 pub mod evolution;
@@ -26,10 +27,11 @@ pub mod workspace;
 
 pub use config::UserConfig;
 pub use curiosity::MODULE_EXPERT_METHOD_ID;
-pub use engine::{Engine, KnowledgeReviewAction, RecoveredSession};
+pub use engine::{Engine, KnowledgeReviewAction, NativeHandoffPlan, RecoveredSession};
 pub use hypothesis::HypothesisReviewAction;
 pub use error::CoreError;
 pub use home::{ensure_home, health_checks, methodus_home, HealthCheck};
+pub use graph::{estimated_tokens, facet, read_graph_document, sync_graph, GraphDocument};
 pub use lock::InstanceLock;
 pub use multi_face::parse_face_pin;
 pub use mentions::{

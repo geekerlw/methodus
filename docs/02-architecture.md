@@ -7,9 +7,11 @@ is [`architecture.svg`](./architecture.svg).
 
 ## 0. Process model decision: single always-on process (no daemon/client split)
 
-Methodus runs as **one long-lived process** that holds core state, executor sessions,
-the scheduler, the store, and the UI together. You keep it open (e.g. in a `tmux`
-window) — that *is* the "persistent" part.
+Methodus runs as **one long-lived process** that holds graph state, task compilation,
+the scheduler, the store, and its graph/review UI together. You keep it open (e.g. in
+a `tmux` window) — that is the "persistent" part. Normal Agent interaction does not
+run inside this process: Methodus launches the chosen native Agent TUI and receives the
+user back when that process exits or the user explicitly returns.
 
 **We explicitly do NOT build a detached background daemon + thin client + socket
 IPC.** The daemon/client split's only real benefit is decoupling the always-on "brain"
@@ -54,7 +56,7 @@ meant to be maintained and trusted over years.
 | SQLite | `sqlx` (async, compile-time-checked) or `rusqlite` (sync + pool) | see §7; leaning `sqlx` for async + migrations |
 | Migrations | `sqlx::migrate!` (or `refinery` if `rusqlite`) | versioned, embedded |
 | Serialization | `serde` + `serde_json` + `serde_yaml` | events, executor I/O, YAML domain files |
-| Subprocess | `tokio::process::Command` | drive executor CLIs |
+| Subprocess | `tokio::process::Command` | native terminal handoff and optional managed executor CLIs |
 | Codex app-server | JSON-RPC client over `unix://` | later milestone; this is a *client* to Codex's daemon, not our own daemon |
 | TUI | `ratatui` + `crossterm` | the always-on UI, in-process |
 | Logging/events | `tracing` + `tracing-subscriber` | structured; bridges to event log |
@@ -80,10 +82,10 @@ methodus/
 │   │   └── (no I/O, no tokio; just data + transition logic + validation)
 │   ├── methodus-store/        # SQLite repositories + migrations + file-content store
 │   │   └── (depends on domain)
-│   ├── methodus-runtime/      # RuntimeAdapter trait + ClaudeCode/Codex/Cursor impls
-│   │   └── (depends on domain; owns subprocess + Codex app-server client)
-│   ├── methodus-core/         # orchestration LIBRARY: resolver, policy, scheduler,
-│   │   │                        loops, session manager, event bus — no UI, no main()
+│   ├── methodus-runtime/      # native-launch + optional managed adapters
+│   │   └── (depends on domain; owns terminal subprocess + Codex app-server client)
+│   ├── methodus-core/         # graph resolver/compiler, policy, scheduler,
+│   │   │                        learning/review loops, launch manager, event bus — no UI, no main()
 │   │   └── (depends on domain, store, and the runtime trait)
 │   └── methodus/              # THE binary: opens the TUI, runs core in-proc
 │       └── (depends on core, store, runtime)
@@ -109,16 +111,17 @@ Notes vs the earlier daemon design:
 
 ```text
 methodus-core/src/
-├── resolution/     # Task Resolver (rule-based v1; LLM resolver interface reserved)
+├── graph/          # file indexing, typed-edge queries, graph search
+├── resolution/     # Task Resolver (rule-based v1; LLM ranker interface reserved)
 ├── policy/         # permission decisions, approval routing, budgets
-├── session/        # Session Manager: lifecycle over RuntimeAdapter, event fan-out
-├── workspace/      # Workspace Builder + path-safety validation
+├── launch/         # native handoff lifecycle + optional managed runtime sessions
+├── workspace/      # Workspace Compiler: capsule, budget, adapter rendering, path safety
 ├── pack.rs         # team pack folders: packs.yaml registry, focus, overlay roots
 ├── project.rs      # project directories: projects.yaml registry + focus
 ├── home.rs         # first-launch seed + health checks
 ├── events/         # event bus (in-proc broadcast) + append-only persistence hook
 ├── scheduler/      # job queue driver (event/threshold/idle triggers)
-├── learning.rs     # extract_experience, detect_gaps, propose_knowledge, propose_skill jobs
+├── learning.rs     # deliberate learn sessions + experience/distillation jobs
 ├── refine.rs       # propose_refinement + budgeted LLM polish of note/patch drafts
 ├── curiosity/      # knowledge-gap → question valuation
 └── engine.rs       # top-level orchestrator tying the Execution Loop together;
@@ -131,29 +134,30 @@ methodus-core/src/
 ┌─────────────────────── methodus (one long-lived process; kept open in tmux) ──────────┐
 │  tokio runtime                                                                         │
 │    ├── Engine (methodus-core)                                                          │
-│    │     ├── Session Manager   (owns M executor sessions; each = task + adapter stream)│
+│    │     ├── Graph + Workspace Compiler (selects facets under a budget)                │
+│    │     ├── Launch Manager    (native handoff; managed stream only when requested)    │
 │    │     ├── Scheduler         (learning/curiosity jobs; budgeted; cancelable)         │
 │    │     ├── Event bus         (tokio broadcast; fans events to store + UI)            │
 │    │     └── Store             (SQLite pool + file content store)                      │
-│    └── UI (ratatui, same process)                                                      │
+│    └── UI (ratatui, same process): graph / task compile / review / history             │
 │          subscribes to the event bus; issues commands to the Engine via direct calls   │
 └────────────────────────────────────────────────────────────────────────────────────┘
-        │ spawns / resumes
+        │ native handoff (default) / structured management (optional)
         ▼
-   Executor CLIs (claude / codex / cursor) — each with its OWN session persistence
+   Executor native TUIs (claude / codex / cursor) — each owns its conversation/session
 ```
 
 - The Engine and the TUI live in **one process**; the TUI talks to the Engine through
   **direct in-process calls** and subscribes to the in-memory event bus. No socket, no
   serialization boundary.
-- **Executor sessions are kept alive by the executors themselves** (Claude `--bg` /
-  Codex app-server / session ids + `--resume`). So even though Methodus is a single
-  process, the *executor* work is not fatally coupled to it: if Methodus is restarted,
-  it reconciles and resumes (see §6).
-- **"Attach/detach" is reframed.** Within the single process the TUI is always
-  attached to the live Engine. Cross-terminal persistence ("close the terminal, come
-  back later") is achieved by running the process in `tmux`/`screen`, plus
-  executor-session resume for recovery after a real restart.
+- **Native handoff:** the executor owns the interactive session and its persistence.
+  Methodus records only the launch metadata and task capsule; it never attempts to
+  reconstruct an interactive transcript.
+- **Managed execution:** only this optional mode consumes structured events and stores
+  an executor-issued session ID for resume/recovery.
+- **Terminal handoff:** the launcher either suspends/restores the Methodus terminal or
+  creates a configured tmux/terminal target. The graph UI returns after the native
+  process exits, without interpreting its screen output.
 
 ### No second-terminal CLI
 
@@ -164,16 +168,18 @@ process in `tmux`. Scripting subcommands are out of v1.
 ## 5. Async, concurrency & single-instance
 
 - One **`tokio` multi-thread runtime**.
-- Each executor session runs as a supervised task that owns its `EventStream` (from
-  `RuntimeAdapter`), normalizes native events into `RuntimeEvent`, publishes them to
-  the event bus, and persists them (append-only) via the store.
+- A native launch is a supervised child-process/terminal-handoff lifecycle; it stores
+  only launch/return facts and never consumes an interactive transcript. A managed
+  executor session (when explicitly selected) owns its `EventStream`, normalizes
+  `RuntimeEvent`s, and persists them via the store.
 - The **event bus** is a `tokio::sync::broadcast`; the store subscriber is durable, the
   UI subscriber is best-effort (bounded; a slow UI cannot stall a session — drop-oldest
   with a "lagged" marker).
 - **Cancellation** uses `tokio_util::sync::CancellationToken` per session and per job,
   so `cancel`/`kill` and shutdown are clean.
-- **Backpressure:** executor stdout is read line-by-line; parsing is streaming. Large
-  tool outputs go to the session transcript file, with only a summary in SQLite.
+- **Backpressure:** applies only to managed executor stdout, which is read and parsed
+  line-by-line. Large managed tool outputs go to artifact files with a summary in
+  SQLite; native TUI output is not captured.
 - **Single-instance guard:** since state lives in `state.db`, hold an advisory
   lock/lockfile (`~/.methodus/methodus.lock`) so two full instances don't drive
   sessions or the scheduler concurrently.
@@ -182,10 +188,12 @@ process in `tmux`. Scripting subcommands are out of v1.
 
 The process must recover after being killed or restarted. Mechanism:
 
-1. All task/session/job lifecycle lives in SQLite (see `03-data-model.md`); events are
+1. All task/workspace/review/job lifecycle lives in SQLite (see `03-data-model.md`); events are
    append-only. Nothing critical lives only in memory.
-2. On startup, scan for sessions in a non-terminal state and reconcile against the
-   executor's own persistence:
+2. On startup, native-handoff launches left in `launched` state are marked as needing a
+   user return/outcome check; Methodus does not claim to reattach to their TUI. For the
+   optional managed mode, scan for sessions in a non-terminal state and reconcile against
+   the executor's own persistence:
    - **Claude Code:** query `claude agents --json`; if the background agent still
      exists, reattach; otherwise mark `interrupted` and offer resume via
      `--resume <session_id>`.
@@ -193,15 +201,15 @@ The process must recover after being killed or restarted. Mechanism:
      `thread/resume`.
    - **Cursor:** stored `session_id` allows `--resume`, but an in-flight turn is lost;
      mark `interrupted`.
-3. In-flight **turns** are not assumed to survive; the *session/context* survives via
-   the executor's own persistence. Methodus records the "last known turn" so the user
-   can resume or cancel.
+3. In-flight managed **turns** are not assumed to survive; their session/context may
+   survive via the executor's own persistence. The task capsule always survives and can
+   be used to launch a fresh native follow-up.
 4. Learning/curiosity **jobs** are durable queue rows with `attempts`/`not_before`; the
    scheduler re-picks them on startup.
 
-**Corollary for `RuntimeAdapter`:** always capture and persist the executor-issued
-session id from the first `SessionStarted` event — it is the recovery key. This is what
-lets a single-process Methodus survive its own restarts without losing executor work.
+**Corollary for managed adapters:** capture and persist the executor-issued session ID
+from the first `SessionStarted` event. Native handoff instead persists a launch record,
+the capsule manifest hash, and the result-review state.
 
 ## 7. Store engine decision (open)
 

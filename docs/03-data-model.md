@@ -1,382 +1,254 @@
 # 03 — Data Model
 
-SQLite schema (DDL), on-disk file layout, and the source-of-truth split. This
-realizes the entities and event model in
-[`00-product.md`](./00-product.md) §3 (domain abstractions) and §6 (event model).
+The data model makes Methodus a Markdown-first knowledge graph with an auditable task
+context compiler. It implements the product contract in [`00-product.md`](./00-product.md).
 
-## 1. Source-of-truth rule
+## 1. Source of truth
 
 Two stores, one clear split:
 
-- **SQLite (`state.db`)** is authoritative for **lifecycle, indexing, events, and
-  queues**: task/session status, event log, job queue, approvals, resolved indexes,
-  hashes, and cross-references. Fast to query, transactional, recoverable.
-- **Files (YAML/Markdown)** are authoritative for **human-readable domain content**:
-  a Face's identity/knowledge, a Method's procedure, Skill packages, Knowledge
-  entries. Humans read and edit these; Methodus indexes them into SQLite.
+- **Markdown/YAML files** are authoritative for durable, human-readable graph
+  content: Knowledge, Experience, Face lenses, Methods, Skills, and source records.
+  A user must be able to browse, edit, back up, and git-sync these files without
+  Methodus.
+- **SQLite** is authoritative for lifecycle and derived state: task/capsule history,
+  graph indexes, parsed edges, search indexes, context-selection decisions, review
+  state, and job/event logs.
 
-Rule of thumb: **entity *body* → files; entity *lifecycle/index/relations* → SQLite.**
-When re-indexing, SQLite rows for file-backed entities are derived and carry the
-source `path` + content `hash`; the file wins on conflict, and a hash mismatch
-triggers a re-index (never a silent overwrite of the file).
+The file always wins over a derived SQLite row. A changed hash causes re-indexing;
+Methodus never silently overwrites a graph file.
 
 ## 2. On-disk layout
 
 ```text
 ~/.methodus/
-├── config.yaml                 # user config (executors, budgets, policy defaults)
-├── state.db                    # SQLite: lifecycle, events, queue, indexes
-├── methodus.lock               # single-instance advisory lock (runtime; gitignored)
-├── faces/                      # <face>/face.yaml + knowledge/*.md, experiences/*.md ...
-│   └── network/
-│       ├── face.yaml
-│       ├── knowledge/*.md
-│       ├── experiences/*.md
-│       ├── hypotheses/*.md
-│       └── notes/*.md          # harness notes (cheap Face memory; promote to skill at 3 hits)
-├── methods/                    # <method>.yaml (procedure definitions)
-├── skills/                     # global Methodus-owned skills (SKILL.md packages)
-├── packs.yaml                  # registered team packs + focus (paths only)
-├── packs/                      # optional local copies of team packs
-├── projects.yaml               # registered project directories + focus
-├── projects/                   # <project>/ : repo map, module notes — not global Faces
-├── workspaces/                 # one isolated dir per task (see §5)
-│   └── <task-id>/
-└── queue/                      # (optional) durable job artifacts too big for SQLite
-```
-
-Domain-content roots (`faces/`, `methods/`, `skills/`, `projects/`) are the file
-source-of-truth. `state.db` indexes them.
-
-A **pack** is a Methodus-format folder Methodus loads by path (it does not clone or
-push). `packs.yaml` only records `id`, `path`, `active`, and `focus`. Sharing the
-folder is an organizational choice.
-
-```text
-<pack>/
-├── pack.yaml                   # required: id (and optional name, description)
-├── faces/<id>/face.yaml
-├── faces/<id>/knowledge/*.md   # Face-scoped notes
+├── config.yaml
+├── state.db
+├── methodus.lock
+├── graph/
+│   ├── knowledge/<id>.md       # independent atomic knowledge nodes
+│   ├── experiences/<id>.md
+│   ├── artifacts/<id>.md       # source/evidence descriptors, not large copied files
+│   ├── faces/<id>.yaml         # domain lenses / graph entry queries
+│   ├── methods/<id>.yaml
+│   └── candidates/             # reviewable graph-node drafts
 ├── skills/<name>/SKILL.md
-└── knowledge/*.md              # pack-level notes (any Face)
+├── packs.yaml                  # registered Markdown-first graph/skill packs
+├── projects.yaml               # user repositories, never cloned by Methodus
+├── workspaces/<task-id>/       # immutable task or learning capsules
+└── queue/                      # optional large durable job payloads
 ```
+
+A pack follows the same shape (a `pack.yaml`, optional `graph/` and `skills/`).
+Personal graph content overlays active packs. Methodus records paths; synchronizing a
+folder is an external organizational choice.
+
+## 3. Graph files
+
+Every graph node has a stable ID, title, kind, status, summary, source/evidence, and
+typed links. Links may appear in frontmatter or body; frontmatter is the canonical
+machine-readable form.
 
 ```yaml
-# ~/.methodus/packs.yaml
-focus: team-x
-packs:
-  - id: team-x
-    path: /path/to/team-x          # absolute, or relative to Methodus home
-    active: true
+---
+id: knowledge/payment-idempotency
+title: Payment callback idempotency
+node_type: knowledge
+kind: concept
+status: committed
+summary: Deduplicate callbacks using a stable provider event ID.
+scope: At-least-once payment callbacks
+confidence: 0.9
+tags: [payment, reliability]
+links:
+  requires: [knowledge/database-unique-constraint]
+  contrasts: [knowledge/request-id-deduplication]
+  used_by: [skill/payment-change-checklist]
+  applied_by: [experience/payment-webhook-2026-08]
+sources: [artifact/stripe-webhook-docs]
+---
+
+## Learn (5W2H)
+## Decide
+## Execute
+## Evidence
 ```
 
-Optional local copies may live under `~/.methodus/packs/<id>/`; dropping a folder
-with `pack.yaml` there is enough for discovery. Personal `faces/` and `skills/`
-overlay every pack (same id/name: personal wins). Among active packs, the focus pack
-is searched first.
+Knowledge body headings are facets. `Learn` is normally 5W2H; `Execute` is the compact
+agent-facing content. If an item has no dedicated Execute heading, the compiler may
+derive a candidate excerpt for review, but does not rewrite the source item silently.
 
-A **project** is a directory on disk (the user's repo). `projects.yaml` records `id`,
-`name`, `path`, and `focus`. New tasks pick up the focus project. Register paths from
-the TUI `/setup` overlay — Methodus does not clone or pull.
+A Face is a **lens**, not a container:
 
 ```yaml
-# ~/.methodus/projects.yaml
-focus: methodus
-projects:
-  - id: methodus
-    name: methodus
-    path: /path/to/methodus
+id: face/payment-reliability
+title: Payment reliability
+intent_tags: [payment, webhook, consistency]
+entry_queries:
+  - tags_any: [payment, reliability]
+preferred_methods: [method/failure-mode-review]
+quality_checks: [skill/payment-change-checklist]
 ```
 
-## 3. SQLite schema (DDL)
+## 4. SQLite schema
 
-Conventions: every table has `id TEXT PRIMARY KEY`, `created_at`, `updated_at`
-(ISO-8601 UTC text). Mutable entities add `status` and `version`. Events are
-append-only. File-backed entities carry `path` + `content_hash`.
+SQLite mirrors files and records decisions that cannot be reconstructed from content
+alone. The DDL below is logical; migrations may split it for compatibility.
 
 ```sql
--- ---------- Tasks ----------
+CREATE TABLE graph_nodes (
+    id TEXT PRIMARY KEY,
+    node_type TEXT NOT NULL,       -- knowledge|experience|artifact|face|method|skill
+    title TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    status TEXT,
+    summary TEXT,
+    scope TEXT,
+    confidence REAL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_nodes_type_status ON graph_nodes(node_type, status);
+
+CREATE TABLE graph_edges (
+    id TEXT PRIMARY KEY,
+    from_id TEXT NOT NULL REFERENCES graph_nodes(id),
+    relation TEXT NOT NULL,        -- requires|extends|contrasts|uses|applied_by|...
+    to_id TEXT NOT NULL REFERENCES graph_nodes(id),
+    source TEXT NOT NULL,          -- authored|imported|candidate|derived
+    confidence REAL,
+    evidence_refs TEXT,            -- JSON node IDs
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(from_id, relation, to_id)
+);
+CREATE INDEX idx_edges_from ON graph_edges(from_id, relation);
+CREATE INDEX idx_edges_to ON graph_edges(to_id, relation);
+
 CREATE TABLE tasks (
-    id            TEXT PRIMARY KEY,
-    title         TEXT NOT NULL,
-    request       TEXT NOT NULL,            -- raw user request
-    project_id    TEXT REFERENCES projects(id),
-    status        TEXT NOT NULL,            -- queued|planning|running|waiting_user|
-                                            -- reviewing|completed|failed|cancelled
-    runtime       TEXT,                     -- claude-code|codex|cursor
-    workspace_id  TEXT,
-    resolution    TEXT,                     -- JSON: SelectedFaces/Methods/Skills + rationale
-    version       INTEGER NOT NULL DEFAULT 1,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,            -- work|learn
+    title TEXT NOT NULL,
+    request TEXT NOT NULL,
+    project_id TEXT,
+    runtime TEXT,
+    execution_mode TEXT NOT NULL,  -- native_handoff|managed
+    status TEXT NOT NULL,          -- drafting|ready|launched|returned|reviewing|completed|...
+    workspace_id TEXT,
+    result_summary TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 CREATE INDEX idx_tasks_status ON tasks(status);
 
--- ---------- Sessions ----------
-CREATE TABLE sessions (
-    id             TEXT PRIMARY KEY,        -- Methodus session id
-    task_id        TEXT NOT NULL REFERENCES tasks(id),
-    runtime        TEXT NOT NULL,           -- executor kind
-    executor_sid   TEXT,                    -- executor-issued id (uuid/thread_id) — recovery key
-    transport      TEXT NOT NULL,           -- subprocess|app-server|background
-    pid            INTEGER,
-    cwd            TEXT NOT NULL,
-    status         TEXT NOT NULL,           -- spawning|running|waiting_user|paused|
-                                            -- exited|interrupted|failed
-    last_turn      TEXT,                    -- summary of last injected turn
-    started_at     TEXT NOT NULL,
-    ended_at       TEXT,
-    updated_at     TEXT NOT NULL
-);
-CREATE INDEX idx_sessions_task ON sessions(task_id);
-CREATE INDEX idx_sessions_status ON sessions(status);
-
--- ---------- Events (append-only, unified log) ----------
-CREATE TABLE events (
-    id           TEXT PRIMARY KEY,
-    type         TEXT NOT NULL,             -- e.g. session.output, task.completed
-    occurred_at  TEXT NOT NULL,
-    task_id      TEXT,
-    session_id   TEXT,
-    payload      TEXT NOT NULL,             -- JSON
-    redaction    TEXT NOT NULL DEFAULT 'none',
-    seq          INTEGER                     -- monotonic per (session) for ordering
-);
-CREATE INDEX idx_events_task ON events(task_id, occurred_at);
-CREATE INDEX idx_events_session ON events(session_id, seq);
-
--- Executor token / cost (one row per Result that reported usage)
-CREATE TABLE usage_rolls (
-    id                  TEXT PRIMARY KEY,
-    task_id             TEXT,
-    session_id          TEXT,
-    runtime             TEXT,
-    input_tokens        INTEGER NOT NULL DEFAULT 0,
-    output_tokens       INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
-    cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
-    cost_usd            REAL,
-    occurred_at         TEXT NOT NULL
-);
-CREATE INDEX idx_usage_occurred ON usage_rolls(occurred_at);
-CREATE INDEX idx_usage_task ON usage_rolls(task_id);
-CREATE INDEX idx_events_type ON events(type);
-
--- ---------- Workspaces ----------
 CREATE TABLE workspaces (
-    id          TEXT PRIMARY KEY,
-    task_id     TEXT NOT NULL REFERENCES tasks(id),
-    root_path   TEXT NOT NULL,
-    status      TEXT NOT NULL,              -- created|active|cleaned
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    root_path TEXT NOT NULL,
+    launch_cwd TEXT NOT NULL,      -- usually the user's repository, not root_path
+    status TEXT NOT NULL,          -- compiled|launched|returned|archived
+    manifest_hash TEXT NOT NULL,
+    context_budget_tokens INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
--- ---------- Projects ----------
-CREATE TABLE projects (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    root_path   TEXT NOT NULL,
-    path        TEXT,                        -- project.yaml path
-    content_hash TEXT,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+CREATE TABLE context_selections (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    node_id TEXT NOT NULL REFERENCES graph_nodes(id),
+    facet TEXT NOT NULL,           -- base|execute|skill|experience|lazy_reference
+    rationale TEXT NOT NULL,
+    priority REAL,
+    estimated_tokens INTEGER,
+    disposition TEXT,              -- injected|lazy|removed
+    outcome TEXT,                  -- useful|unused|misleading|unknown
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_context_workspace ON context_selections(workspace_id);
+
+CREATE TABLE launches (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    runtime TEXT NOT NULL,
+    mode TEXT NOT NULL,            -- native_handoff|managed
+    executor_session_id TEXT,
+    command_summary TEXT,
+    started_at TEXT NOT NULL,
+    returned_at TEXT,
+    exit_status TEXT
 );
 
--- ---------- File-backed domain entities (indexed from disk) ----------
-CREATE TABLE faces (
-    id           TEXT PRIMARY KEY,          -- e.g. "network"
-    name         TEXT NOT NULL,
-    path         TEXT NOT NULL,             -- faces/<id>/face.yaml
-    content_hash TEXT NOT NULL,
-    intent_tags  TEXT,                      -- JSON array (for resolver matching)
-    version      INTEGER NOT NULL DEFAULT 1,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+CREATE TABLE reviews (
+    id TEXT PRIMARY KEY,
+    task_id TEXT REFERENCES tasks(id),
+    node_id TEXT REFERENCES graph_nodes(id),
+    decision TEXT NOT NULL,        -- commit|revise|reject|defer
+    rationale TEXT,
+    created_at TEXT NOT NULL
 );
 
-CREATE TABLE methods (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    path          TEXT NOT NULL,
-    content_hash  TEXT NOT NULL,
-    intent_tags   TEXT,                     -- JSON array
-    version       TEXT,                     -- semver from the file
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+CREATE TABLE events (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,            -- task.*|workspace.*|launch.*|graph.*|review.*
+    task_id TEXT,
+    payload TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
 );
-
-CREATE TABLE skills (
-    id            TEXT PRIMARY KEY,         -- skill name
-    source        TEXT NOT NULL,            -- user-explicit|project|global|builtin|generated
-    path          TEXT NOT NULL,            -- SKILL.md path
-    content_hash  TEXT NOT NULL,
-    version       TEXT,
-    compat        TEXT,                     -- JSON: runtime/skill compatibility
-    conflict      TEXT,                     -- null | JSON conflict descriptor
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
-);
-
--- ---------- Knowledge / Experience / Hypothesis / Question ----------
--- Bodies live in files under faces/<face>/... ; these rows index + track lifecycle.
-CREATE TABLE knowledge_items (
-    id           TEXT PRIMARY KEY,
-    face_id      TEXT REFERENCES faces(id),
-    project_id   TEXT REFERENCES projects(id),
-    path         TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    source       TEXT NOT NULL,             -- experience|user_answer|doc|research (URL/path in body)
-    confidence   REAL,
-    scope        TEXT,                      -- applicability
-    status       TEXT NOT NULL,             -- candidate|committed|conflicted|rejected
-    conflict_of  TEXT REFERENCES knowledge_items(id),
-    version      INTEGER NOT NULL DEFAULT 1,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-CREATE INDEX idx_knowledge_status ON knowledge_items(status);
-
-CREATE TABLE experiences (
-    id           TEXT PRIMARY KEY,
-    task_id      TEXT REFERENCES tasks(id),
-    face_id      TEXT REFERENCES faces(id),
-    path         TEXT NOT NULL,             -- structured record on disk
-    content_hash TEXT NOT NULL,
-    outcome      TEXT,                      -- success|partial|failed
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-
-CREATE TABLE hypotheses (
-    id           TEXT PRIMARY KEY,
-    face_id      TEXT REFERENCES faces(id),
-    path         TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    confidence   REAL,
-    status       TEXT NOT NULL,             -- open|validated|rejected
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-
-CREATE TABLE questions (
-    id           TEXT PRIMARY KEY,
-    question     TEXT NOT NULL,
-    reason       TEXT,
-    task_id      TEXT REFERENCES tasks(id),
-    face_id      TEXT REFERENCES faces(id),
-    importance   REAL, frequency REAL, impact REAL, uncertainty REAL,
-    value        REAL,                      -- computed priority
-    status       TEXT NOT NULL,            -- pending|asked|answered|snoozed|dismissed
-    not_before   TEXT,                     -- cooldown
-    answer       TEXT,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-CREATE INDEX idx_questions_status ON questions(status);
-
--- ---------- Evolution ----------
-CREATE TABLE evolution_candidates (
-    id           TEXT PRIMARY KEY,
-    target_kind  TEXT NOT NULL,             -- face|method|skill|knowledge
-    target_id    TEXT NOT NULL,
-    diff         TEXT NOT NULL,             -- proposed change
-    rationale    TEXT,
-    source       TEXT,
-    status       TEXT NOT NULL,             -- candidate|approved|rejected|active
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-
--- ---------- Learning queue ----------
-CREATE TABLE learning_jobs (
-    id                TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,        -- extract_experience|detect_gaps|propose_knowledge|propose_skill|propose_refinement|...
-    priority          INTEGER NOT NULL DEFAULT 0,
-    dedupe_key        TEXT,                 -- UNIQUE-ish to collapse duplicates
-    input_refs        TEXT NOT NULL,        -- JSON refs to source entities
-    status            TEXT NOT NULL,        -- queued|running|done|failed|cancelled
-    attempts          INTEGER NOT NULL DEFAULT 0,
-    not_before        TEXT,                 -- scheduled/backoff time
-    budget            TEXT,                 -- JSON: token/cost cap
-    requires_approval INTEGER NOT NULL DEFAULT 0,
-    created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL
-);
-CREATE INDEX idx_jobs_status_notbefore ON learning_jobs(status, not_before);
-CREATE UNIQUE INDEX idx_jobs_dedupe ON learning_jobs(dedupe_key) WHERE dedupe_key IS NOT NULL;
-
--- ---------- Approvals ----------
-CREATE TABLE approvals (
-    id           TEXT PRIMARY KEY,
-    session_id   TEXT REFERENCES sessions(id),
-    subject      TEXT NOT NULL,             -- what is being approved
-    scope        TEXT NOT NULL,             -- once|session|...
-    decision     TEXT,                      -- approve|deny|abort (null while pending)
-    actor        TEXT,                      -- user|policy
-    requested_at TEXT NOT NULL,
-    resolved_at  TEXT
-);
-CREATE INDEX idx_approvals_session ON approvals(session_id);
 ```
 
-## 4. Enumerations (mirror Rust `enum`s in `methodus-domain`)
+Task graphs are not inferred from a vague embedding match alone. Retrieval may rank
+candidates, but the persisted `context_selections` table records the final rationale,
+budget, and outcome.
 
-Status/kind columns are `TEXT` in SQLite but map to exhaustive Rust enums. The enum is
-the real state machine; the DB stores its serialized name. Transitions are validated
-in `methodus-domain`, never inferred from natural language.
-
-- `TaskStatus`: `queued → planning → running → {waiting_user, reviewing} → {completed, failed, cancelled}`
-- `SessionStatus`: `spawning → running → {waiting_user, paused} → {exited, interrupted, failed}`
-- `KnowledgeStatus`: `candidate → {committed, conflicted, rejected}`
-- `QuestionStatus`: `pending → {asked → answered, snoozed, dismissed}`
-- `JobStatus`: `queued → running → {done, failed, cancelled}`
-
-Event names follow `00-product.md` §6 (`task.*`, `session.*`, `workspace.*`, `knowledge.*`,
-`question.*`, `approval.*`, …). Event handlers must be **idempotent** (keyed on event
-`id`) so a replayed event never double-commits knowledge or repeats a side effect.
-
-## 5. Workspace layout (per task)
+## 5. Task Workspace / context capsule
 
 ```text
 ~/.methodus/workspaces/<task-id>/
-├── .methodus/
-│   ├── task.yaml            # snapshot of the resolved task
-│   ├── plan.md              # execution plan
-│   ├── selected-context.md  # the ONLY resolved context handed to the executor
-│   └── session.json         # session handle(s) + executor session ids
-├── face-context/            # minimal, task-relevant face material (read-only copies)
-├── project-context/         # minimal project material
-├── artifacts/               # outputs produced by the run
-└── transcript/              # full executor event transcript (JSONL) + large tool outputs
+├── manifest.yaml               # immutable task, resolver, and launch snapshot
+├── brief.md                    # small startup prompt handed to the runtime
+├── context.md                  # selected execute facets and rationale
+├── references.md               # lazy absolute/path references to full graph nodes
+├── skills/                     # links or materialized task-specific skill packages
+├── adapters/
+│   ├── claude-code.md          # launch-specific native instruction rendering
+│   └── codex.md
+├── outcome.md                  # result + retrospective template, completed on return
+└── artifacts/                  # task-local output/evidence pointers
 ```
 
-The user's repos are **not** copied into this tree. `selected-context.md` lists readable
-directory roots (launch cwd ∪ registered projects) and any `@` attachments as absolute
-paths; Claude Code is given those roots with `--add-dir` and reads them in place.
+`workspaces/<task-id>` is a package, **not automatically a source checkout**. The
+default native launcher starts Claude Code/Codex in `launch_cwd` (the project root)
+and gives it the concise `brief.md` plus paths to the capsule. This avoids mutating the
+repository's permanent `CLAUDE.md`/`AGENTS.md` files for a one-off task.
 
-Rules (from `00-product.md` §9): Face/Project memory is **not** written back through workspace
-temp files; workspaces are retained by default for audit; global skills/MCP stay
-visible while task-specific context is only additive; writes to the user's project
-dir are bounded by the project root and gated by policy; never copy the entire
-knowledge base into the workspace — inject only the minimal resolved context.
+The compiler must:
 
-## 6. Migrations
+1. enforce a context budget before launch;
+2. render only selected facets into `context.md`;
+3. retain full graph notes as lazy references;
+4. snapshot all selected versions/hashes in `manifest.yaml`; and
+5. preserve the workspace for audit until explicit archival/cleanup.
 
-- Versioned SQL files under `migrations/`, embedded into `methodus-store` and applied
-  on process startup before the Engine serves any task.
-- Forward-only for MVP; each migration is idempotent-safe to re-check.
-- First TUI launch creates `~/.methodus/`, writes a default `config.yaml`, and runs
-  migrations to create `state.db`.
+## 6. State machines
+
+- `TaskStatus`: `drafting → ready → launched → returned → reviewing → completed`, with
+  `cancelled`/`failed` exits from launch or review.
+- `WorkspaceStatus`: `compiled → launched → returned → archived`.
+- `KnowledgeStatus`: `candidate → committed | conflicted | rejected`.
+- `LaunchMode`: `native_handoff | managed`.
+- `ContextOutcome`: `useful | unused | misleading | unknown`.
+
+All state transitions are validated by domain code, not guessed from natural language.
+Events are append-only and idempotent by event ID.
 
 ## 7. Open questions
 
-1. **FTS** — add SQLite FTS5 for knowledge/experience search now, or defer until there
-   is content volume? Lean defer (Phase 2), but reserve a `knowledge_fts` virtual
-   table name.
-2. **Event payload size** — cap inline `payload` JSON size; spill large tool outputs
-   to `transcript/` files and store only a pointer + summary. Define the threshold
-   (proposed: 40 KB, matching Cursor's `fileOutputThresholdBytes`).
-3. **Historical import** — whether to offer a one-shot importer for old
-   `workflow_patterns` JSON into `experiences`. Defer until someone actually has
-   that file.
+1. Do graph edges authored in Markdown body require explicit frontmatter promotion, or
+   is a body-link parser sufficient for v1?
+2. Should SQLite FTS5 ship in the first graph-browser milestone, or can title/tag/link
+   search establish the initial UX?
+3. Which native handoff should be primary on each OS: terminal suspension, a new tmux
+   pane, or a configured terminal command?

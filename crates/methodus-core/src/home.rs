@@ -19,6 +19,8 @@ const WORKSPACE_SKILL_MD: &str =
 const MODULE_EXPERT_SKILL_MD: &str =
     include_str!("../../../resources/skills/module-expert-learning/SKILL.md");
 const DEFAULT_CONFIG: &str = include_str!("../../../resources/config.yaml");
+const CAPSULE_KNOWLEDGE: &str = "---\nid: knowledge/context-capsule\ntitle: Task context capsule\nnode_type: knowledge\nstatus: committed\nsummary: Give an agent a small, auditable task brief plus lazy references instead of the whole knowledge base.\nscope: Any Methodus native handoff\nconfidence: 1.0\ntags: [methodus, context, token-efficiency]\nlinks:\n  used_by: [skill/learning]\n---\n\n## Learn (5W2H)\nA context capsule packages the task goal, selected knowledge facets, skills, and references for one agent run.\n\n## Decide\nUse a capsule whenever the task would otherwise need repeated background explanation or project-specific constraints.\n\n## Execute\nRead `context.md` first. Use `references.md` only for deeper evidence. Keep the initial task context bounded.\n\n## Evidence\nMethodus task workspace manifest and outcome review.\n";
+const LEARNING_SKILL: &str = "---\nid: skill/learning\ntitle: Active learning session\nnode_type: skill\nstatus: committed\nsummary: Explain a concept, test understanding, then draft one atomic 5W2H knowledge note with evidence and links.\nscope: Methodus Learn tasks\nconfidence: 1.0\nlinks:\n  uses: [knowledge/context-capsule]\n---\n\n## Execute\nClarify the learner's goal and prior knowledge. Teach with examples, ask retrieval questions, distinguish facts from inferences, and write one candidate knowledge note with Learn, Decide, Execute, and Evidence facets.\n";
 
 #[derive(Debug, Clone)]
 pub struct HealthCheck {
@@ -45,6 +47,7 @@ pub fn ensure_home(home: &Path) -> Result<(), CoreError> {
     seed_home(home)?;
     let store = Store::open(&home.join("state.db"))?;
     let _ = crate::catalog::sync_catalog(&store, home)?;
+    let _ = crate::graph::sync_graph(&store, home)?;
     Ok(())
 }
 
@@ -56,6 +59,12 @@ fn seed_home(home: &Path) -> Result<(), CoreError> {
         "projects",
         "packs",
         "workspaces",
+        "graph/knowledge",
+        "graph/experiences",
+        "graph/artifacts",
+        "graph/faces",
+        "graph/candidates",
+        "graph/skills/learning",
         "faces/general",
         "faces/general/experiences",
         "faces/general/knowledge",
@@ -86,6 +95,8 @@ fn seed_home(home: &Path) -> Result<(), CoreError> {
         MODULE_EXPERT_SKILL_MD,
     )?;
     write_if_missing(home.join("config.yaml"), DEFAULT_CONFIG)?;
+    write_if_missing(home.join("graph/knowledge/context-capsule.md"), CAPSULE_KNOWLEDGE)?;
+    write_if_missing(home.join("graph/skills/learning/SKILL.md"), LEARNING_SKILL)?;
     write_if_missing(
         home.join("packs.yaml"),
         "# Team baseline packs (Methodus-format folders).\n\

@@ -343,9 +343,21 @@ fn join_under(root: &Path, rel: &str, raw: &str) -> Option<Mention> {
 
 fn resolve_one(raw: &str, roots: &[(String, PathBuf)]) -> Option<Mention> {
     let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.starts_with("~/" ) || trimmed == "~" {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let rel = trimmed.trim_start_matches('~').trim_start_matches('/');
+        let candidate = home.join(rel);
+        let abs = candidate.canonicalize().ok()?;
+        return Some(Mention { raw: raw.to_string(), abs, is_dir: candidate.is_dir() || raw.ends_with('/') });
+    }
     let rel = trimmed.trim_start_matches("./");
-    if rel.contains('\0') || Path::new(rel).is_absolute() {
+    if rel.contains('\0') {
         return None;
+    }
+    if Path::new(rel).is_absolute() {
+        let candidate = PathBuf::from(rel);
+        let abs = candidate.canonicalize().ok()?;
+        return Some(Mention { raw: raw.to_string(), abs, is_dir: candidate.is_dir() || raw.ends_with('/') });
     }
     if rel.is_empty() || rel == "." {
         let (_, root) = roots.first()?;
