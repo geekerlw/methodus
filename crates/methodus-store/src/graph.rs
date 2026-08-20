@@ -1,4 +1,4 @@
-//! SQLite index operations for Markdown-first graph files and task capsules.
+//! SQLite projection operations for the Markdown-first graph.
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
@@ -9,20 +9,33 @@ use methodus_domain::{ContextSelection, GraphEdge, GraphNode, TaskWorkspace};
 use crate::{Store, StoreError};
 
 impl Store {
+    /// Remove the derived graph projection before a full Markdown rebuild.
+    /// Canonical files remain untouched; the next sync repopulates the index.
+    pub fn clear_graph_index(&self) -> Result<(), StoreError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM graph_edges", [])?;
+        tx.execute("DELETE FROM graph_nodes", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn upsert_graph_node(&self, node: &GraphNode) -> Result<(), StoreError> {
         let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO graph_nodes
-             (id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             (id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at,visibility,tags)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(id) DO UPDATE SET
              node_type=excluded.node_type,title=excluded.title,path=excluded.path,
              content_hash=excluded.content_hash,status=excluded.status,summary=excluded.summary,
-             scope=excluded.scope,confidence=excluded.confidence,updated_at=excluded.updated_at",
+             scope=excluded.scope,confidence=excluded.confidence,updated_at=excluded.updated_at,
+             visibility=excluded.visibility,tags=excluded.tags",
             params![
                 node.id, node.node_type, node.title, node.path, node.content_hash,
                 node.status, node.summary, node.scope, node.confidence,
                 node.created_at.to_rfc3339(), node.updated_at.to_rfc3339(),
+                node.visibility, serde_json::to_string(&node.tags).unwrap_or_else(|_| "[]".into()),
             ],
         )?;
         Ok(())
@@ -52,11 +65,11 @@ impl Store {
         let conn = self.lock_conn()?;
         let pattern = query.map(|q| format!("%{}%", q.trim().to_lowercase()));
         let mut stmt = if pattern.is_some() {
-            conn.prepare("SELECT id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at
+            conn.prepare("SELECT id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at,visibility,tags
                           FROM graph_nodes WHERE lower(title) LIKE ?1 OR lower(coalesce(summary,'')) LIKE ?1
                           ORDER BY updated_at DESC, title COLLATE NOCASE")?
         } else {
-            conn.prepare("SELECT id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at
+            conn.prepare("SELECT id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at,visibility,tags
                           FROM graph_nodes ORDER BY updated_at DESC, title COLLATE NOCASE")?
         };
         let rows = if let Some(pattern) = pattern {
@@ -70,7 +83,7 @@ impl Store {
     pub fn graph_node(&self, id: &str) -> Result<Option<GraphNode>, StoreError> {
         let conn = self.lock_conn()?;
         conn.query_row(
-            "SELECT id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at
+            "SELECT id,node_type,title,path,content_hash,status,summary,scope,confidence,created_at,updated_at,visibility,tags
              FROM graph_nodes WHERE id = ?1",
             [id],
             graph_node_from_row,
@@ -167,6 +180,7 @@ fn graph_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphNode> {
         content_hash: row.get(4)?, status: row.get(5)?, summary: row.get(6)?,
         scope: row.get(7)?, confidence: row.get(8)?,
         created_at: parse_time(row.get(9)?)?, updated_at: parse_time(row.get(10)?)?,
+        visibility: row.get(11)?, tags: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(12)?).unwrap_or_default(),
     })
 }
 
@@ -210,6 +224,7 @@ mod tests {
             id: "knowledge/idempotency".into(), node_type: "knowledge".into(), title: "Idempotency".into(),
             path: "graph/knowledge/idempotency.md".into(), content_hash: "hash".into(), status: Some("committed".into()),
             summary: Some("Prevent duplicate effects".into()), scope: None, confidence: Some(0.9), created_at: now, updated_at: now,
+            visibility: "personal".into(), tags: Vec::new(),
         }).unwrap();
         store.replace_graph_edges("knowledge/idempotency", &[GraphEdge {
             id: "edge_1".into(), from_id: "knowledge/idempotency".into(), relation: "requires".into(), to_id: "knowledge/unique-key".into(),

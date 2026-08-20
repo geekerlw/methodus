@@ -1,7 +1,7 @@
-//! Methodus control-plane TUI.
+//! Methodus maintainer studio TUI.
 //!
-//! It compiles a capsule, gives the terminal to the native Agent, then returns
-//! only for outcome capture and graph review.
+//! The TUI owns deliberate learning and graph curation. Ordinary coding sessions
+//! remain in the user's native Agent runtime and are never handed off here.
 
 mod control;
 
@@ -15,10 +15,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use methodus_core::{Engine, InstanceLock, RecoveredSession};
+use methodus_core::{Engine, InstanceLock};
 use ratatui::prelude::{CrosstermBackend, Terminal};
 
-pub async fn run(engine: Engine, _lock: InstanceLock, _recovered: Vec<RecoveredSession>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(engine: Engine, _lock: InstanceLock) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     stdout().execute(EnableBracketedPaste)?;

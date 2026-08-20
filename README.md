@@ -1,65 +1,173 @@
 # Methodus
 
-Methodus is a local, Markdown-first **knowledge graph and context compiler** for
-Claude Code, Codex, and Cursor. It is deliberately not another coding-agent chat
-surface: Methodus prepares the right context before a task, hands the terminal to
-the runtime's native TUI, then returns to record results and improve the graph.
+Methodus is a local-first engineering knowledge studio for teams that use Claude
+Code, Codex, Cursor, or another native agent runtime.
+
+Maintainers use the TUI to investigate a learning goal, challenge assumptions, verify
+evidence, and review durable Knowledge, Method, and Experience candidates. Developers
+stay in their preferred agent runtime and receive reviewed context through a small,
+read-only Methodus CLI connector.
+
+![Methodus architecture](docs/architecture.svg)
+
+## Product boundary
+
+Methodus owns the moments around agent work:
 
 ```text
-Graph (Knowledge · Skill · Experience · Artifact)
-  → select compact facets under a token budget
-  → compile a Task Workspace capsule
-  → native Claude Code / Codex / Cursor TUI
-  → return outcome → Experience + reviewable Knowledge candidate
+maintainer goal
+  → focused Learn conversation
+  → evidence and counterexample checks
+  → CandidateSet proposal
+  → maintainer review
+  → Personal / Team Markdown knowledge
 ```
 
-## What is implemented
+For ordinary development work:
 
-- Markdown graph nodes under `~/.methodus/graph/`, with typed frontmatter links and
-  a SQLite index for search, selection, context provenance, and launch history.
-- Token-bounded task capsules containing an execution brief, selected context,
-  lazy references, runtime adapter notes, and copied `SKILL.md` packages.
-- A native TUI handoff: Methodus temporarily exits its alternate screen and gives
-  the terminal directly to the selected runtime. It neither proxies nor parses the
-  agent conversation.
-- A conversation-first TUI: send a goal like an Agent message, then Methodus plans
-  context and automatically switches the terminal to the selected native runtime.
-- Slash-command management panels: `/knowledge`, `/skill`, `/experience`, `/session`,
-  and `/review` keep durable state available without displacing the task composer.
-- Learning tasks that return as an Experience plus a reviewable 5W2H Knowledge
-  candidate; review promotes the candidate by changing its Markdown status.
+```text
+developer in Claude Code / Codex / Cursor
+  → official connector Skill
+  → methodus agent (read-only)
+  → bounded Method / Knowledge / Experience context
+  → native runtime continues the task
+```
 
-## Start
+Methodus is not a coding-agent replacement, MCP server, task workspace manager,
+runtime handoff layer, generic Skill manager, Face system, or automatic graph writer.
+Native coding sessions and runtime permissions remain owned by the user and the
+selected agent runtime.
+
+## Quick start
+
+Run the maintainer studio:
 
 ```bash
 cargo run -p methodus
 ```
 
-The first run creates `~/.methodus`. In the task conversation:
+The first launch creates `~/.methodus/` and seeds the local Markdown graph. Install
+the read-only connector Skill for the runtimes you use:
 
-- Write a goal and press `Enter`; Methodus creates a short-lived, read-only
-  planner runtime to choose graph context, compiles a capsule, then automatically
-  hands the terminal to Claude Code, Codex, or Cursor.
-- Use `/knowledge`, `/skill`, `/experience`, `/session`, and `/review` to manage state.
-- Use `/runtime` to switch the native runtime; press `Shift+Tab` to cycle permission mode.
-- Type `/` for the command palette; use `↑`/`↓` and `Tab` to select and complete.
-- `/open` opens the current capsule, while `/quit` or `/exit` closes Methodus.
-  A plain `q` remains ordinary input; pressing `Ctrl+C` twice within three seconds
-  is the keyboard escape hatch.
-- Use `/learn`, then send a topic beginning with `学习：` to create a learning task.
-- After the native runtime exits, write an outcome and press `Enter` to feed it
-  back into the experience/knowledge loop.
+```bash
+cargo run -p methodus -- setup --runtime all
+cargo run -p methodus -- doctor
+```
 
-The composer supports bracketed paste, multiline input (`Shift+Enter`), UTF-8 cursor
-editing, and correct double-width cursor placement for Chinese/CJK text. Task-launch
-messages are cached and can be scrolled with `PageUp`/`PageDown`.
+`setup` is ownership-aware. It only updates a Methodus-owned connector and refuses to
+overwrite an unrelated Skill. Use `--force` only to replace a connector that already
+belongs to Methodus. Uninstall is explicit:
 
-The task's repository remains the native runtime working directory. The generated
-capsule lives in Methodus storage and contains the concise startup brief plus all
-auditable context decisions.
+```bash
+cargo run -p methodus -- setup --runtime claude-code --uninstall
+```
 
-## Design
+## Maintainer workflow
 
-The current product contract and technical shape are documented in
-[`docs/00-product.md`](docs/00-product.md), [`docs/03-data-model.md`](docs/03-data-model.md),
-and [`docs/05-tui.md`](docs/05-tui.md).
+The default TUI is a focused Learn conversation. Type an ordinary message to start or
+continue the current learning goal. Use `@` to attach a repository, directory, file,
+or other local source path.
+
+- `/runtime` opens the Claude Code, Codex, and Cursor picker. `/runtime codex` selects
+  one directly.
+- `Shift+Tab` cycles `Read-only plan`, `Cautious execution`, and `Auto-edit`. The
+  choice is visible beside the composer and persisted with the Learn run.
+- `/new` closes the current learning context. The next ordinary input creates a new
+  Learn run.
+- `/quit` exits Methodus. An active Learn run remains resumable after restart; a run
+  waiting for Review does not resume as a Runtime conversation.
+- `/knowledge`, `/method`, `/experience`, `/review`, `/graph`, `/team`, and `/health`
+  open the maintenance panels.
+- `/help` shows the complete command and keyboard reference.
+
+When the Runtime returns a structured CandidateSet, Methodus writes the research
+record under `runs/` and review-only candidates under `personal/candidates/`. Nothing
+becomes consumer-visible until a maintainer approves it.
+
+## Agent connector
+
+The connector Skill is intentionally small and runtime-neutral. It teaches an agent to
+call the local read-only protocol for substantial work:
+
+```bash
+methodus agent prepare --goal "Diagnose abnormal device shutdown" --budget 1200
+methodus agent search --query "previous shutdown reason" --type knowledge,experience
+methodus agent get knowledge/previous-shutdown-reason --facet execute
+methodus agent related knowledge/previous-shutdown-reason
+methodus agent status
+```
+
+The CLI returns bounded Markdown by default or JSON with `--format json`. It never
+writes the graph, starts a Runtime, reads an ordinary coding transcript, or blocks a
+developer task when Methodus is unavailable.
+
+## Storage model
+
+Markdown/YAML is canonical for Knowledge, Method, Experience, typed relations, and
+source references. SQLite is a rebuildable search/index projection. Learn and Review
+operational state is file-backed:
+
+```text
+~/.methodus/
+├── config.yaml
+├── state.db
+├── methodus.lock
+├── personal/
+│   ├── knowledge/
+│   ├── methods/
+│   ├── experiences/
+│   └── candidates/
+├── teams/<team-id>/
+│   ├── knowledge/
+│   ├── methods/
+│   └── experiences/
+├── runs/
+│   ├── reviews.jsonl
+│   └── <learn-run>/
+│       ├── state.yaml
+│       ├── events.jsonl
+│       ├── assistant.md
+│       └── sources.yaml
+└── connectors/
+```
+
+Personal and Team content are separate roots. Team content remains ordinary Markdown
+and Git; Methodus can validate it, show status and diff, and write a local publish
+plan, but it does not silently commit, push, merge, or discard changes.
+
+## Architecture and documentation
+
+The architecture diagram is available as [SVG](docs/architecture.svg) and [PNG](docs/architecture.png).
+The design source of truth is organized as follows:
+
+- [Product contract](docs/00-product.md) — positioning, workflows, graph semantics,
+  trust, and permanent boundaries.
+- [Runtime adapters](docs/01-runtime-adapters.md) — focused Learn integration and
+  connector behavior.
+- [Architecture](docs/02-architecture.md) — processes, storage, indexing, and
+  security boundaries.
+- [Data model](docs/03-data-model.md) — Markdown nodes, evidence, lifecycle, and
+  freshness.
+- [Roadmap](docs/04-roadmap.md) — implementation status and remaining evaluation.
+- [TUI](docs/05-tui.md) — maintainer interaction and keyboard behavior.
+- [Agent CLI](docs/06-agent-cli.md) — stable read-only protocol.
+- [Learning protocol](docs/07-learning-vs-refine.md) — deliberate learning and
+  candidate generation.
+- [Development contract](docs/08-development-contract.md) — invariants and change
+  checklist.
+- [Decisions](docs/09-decisions.md) — locked product and architecture decisions.
+
+## Development
+
+Run focused tests while iterating, then verify the workspace:
+
+```bash
+cargo test -p methodus --all-targets
+cargo test --workspace
+cargo check --workspace
+git diff --check
+```
+
+The active implementation intentionally stays small: the TUI is the maintainer write
+surface, `methodus agent` is the read-only consumer surface, and Markdown plus Git
+remain open and inspectable. New features should preserve those boundaries.

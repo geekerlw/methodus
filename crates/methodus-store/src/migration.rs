@@ -67,6 +67,14 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         apply_v9(conn)?;
         mark_applied(conn, 9)?;
     }
+    if !is_applied(conn, 10)? {
+        apply_v10(conn)?;
+        mark_applied(conn, 10)?;
+    }
+    if !is_applied(conn, 11)? {
+        apply_v11(conn)?;
+        mark_applied(conn, 11)?;
+    }
 
     Ok(())
 }
@@ -430,5 +438,20 @@ fn apply_v9(conn: &Connection) -> Result<(), StoreError> {
         ALTER TABLE workspaces ADD COLUMN context_budget_tokens INTEGER;
         ",
     )?;
+    Ok(())
+}
+
+fn apply_v10(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "ALTER TABLE graph_nodes ADD COLUMN visibility TEXT NOT NULL DEFAULT 'personal';
+         ALTER TABLE graph_nodes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+         CREATE INDEX idx_graph_nodes_visibility ON graph_nodes(visibility, node_type, status);",
+    )?;
+    Ok(())
+}
+
+/// Face was retired in favor of graph tags, scope, and visibility.
+fn apply_v11(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("DROP TABLE IF EXISTS faces;")?;
     Ok(())
 }

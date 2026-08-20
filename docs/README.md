@@ -1,32 +1,44 @@
 # Methodus documentation
 
-This directory is the **source of truth** for Methodus: product contract, architecture,
-data model, TUI, and the learning loop. There is no separate spec file
-(`PROJECT_SPEC.md` is folded into `00-product.md`).
+This directory is the product and engineering source of truth for Methodus.
 
-| # | Document | What it covers |
-|---|----------|----------------|
-| — | [`architecture.svg`](./architecture.svg) / [`.png`](./architecture.png) | Legacy system diagram; update after the graph/capsule implementation spike |
-| 00 | [`00-product.md`](./00-product.md) | **Product contract**: Markdown-first knowledge graph, context capsules, native agent handoff, deliberate learning |
-| 01 | [`01-runtime-adapters.md`](./01-runtime-adapters.md) | Verified runtime capabilities; default native handoff vs optional managed adapters |
-| 02 | [`02-architecture.md`](./02-architecture.md) | Rust stack, graph/workspace compiler modules, single-process control plane |
-| 03 | [`03-data-model.md`](./03-data-model.md) | Graph files, typed-edge index, task capsules, context-selection and review state |
-| 04 | [`04-roadmap.md`](./04-roadmap.md) | Graph-first delivery milestones and acceptance criteria |
-| 05 | [`05-tui.md`](./05-tui.md) | Ratatui graph/task/review control plane; explicitly not an agent chat |
-| 07 | [`07-learning-vs-refine.md`](./07-learning-vs-refine.md) | Graph evolution and deliberate learning compared with Prime Agent `/refine` |
+Methodus is a maintainer-operated knowledge studio and a read-only knowledge sidecar
+for coding agents. A small number of maintainers learn, curate, review, and publish
+engineering knowledge in the TUI. Claude Code, Codex, and other agents consume the
+published result through one official connector Skill that calls the local Methodus
+CLI.
 
-`00-product.md` wins for product intent; `01`–`05` win for implementation detail.
+| Doc | Purpose |
+|---|---|
+| [`00-product.md`](./00-product.md) | Product contract, users, boundaries, and end-to-end workflows |
+| [`01-runtime-adapters.md`](./01-runtime-adapters.md) | Learning runtime adapters and the official connector Skill |
+| [`02-architecture.md`](./02-architecture.md) | Components, process model, repositories, indexing, and publishing; includes the architecture diagram |
+| [`03-data-model.md`](./03-data-model.md) | Markdown graph, source evidence, lifecycle, freshness, and SQLite indexes |
+| [`04-roadmap.md`](./04-roadmap.md) | Implementation order and milestone acceptance criteria |
+| [`05-tui.md`](./05-tui.md) | Maintainer-facing Learn, Review, Graph, Team, and Publish experience |
+| [`06-agent-cli.md`](./06-agent-cli.md) | Stable read-only CLI protocol used by the connector Skill |
+| [`07-learning-vs-refine.md`](./07-learning-vs-refine.md) | Deliberate learning, candidate generation, and non-automatic evolution |
+| [`08-development-contract.md`](./08-development-contract.md) | Implementation invariants, file rules, lifecycle gates, and change checklist |
+| [`09-decisions.md`](./09-decisions.md) | Locked product and architecture decisions for future contributors |
 
-## Decisions that stick
+## Standing decisions
 
-1. **Language is Rust**, not TypeScript (`02-architecture.md`).
-2. **Native handoff first.** Claude Code/Codex/Cursor own their interactive TUI;
-   structured JSON/JSONL is an optional managed-execution path (`01-runtime-adapters.md`).
-3. **One always-on control-plane process**, not a daemon/client split. Keep `methodus` open in `tmux`
-   (`02-architecture.md` §0).
-4. **User-triggered execution.** Background work is post-task learning and idle Curiosity.
-   No cron auto-run of executors (`04-roadmap.md`).
-5. **Markdown graph is the knowledge source.** SQLite indexes it; prompts receive only
-   selected facets and lazy references. Nothing silently commits to live knowledge or skills.
+1. **Write few, read many.** One or a few maintainers curate knowledge; ordinary
+   developers consume it without learning the Methodus TUI.
+2. **TUI for humans, CLI for agents.** Maintainers learn and govern in the TUI.
+   Agent runtimes use a stable, non-interactive, read-only CLI.
+3. **One official connector Skill.** Methodus does not manage a general Skill library.
+   Its shipped connector only teaches a runtime when and how to call the CLI.
+4. **No MCP and no ordinary task workspace.** Agent knowledge is retrieved on demand;
+   files are not copied into per-task directories and Methodus does not take over
+   normal coding sessions.
+5. **Curated engineering memory, not generic RAG.** Code, Git, docs, PRs, and logs are
+   evidence used during Learn. Only reviewed conclusions are published.
+6. **Markdown + Git remain open.** Team repositories can be edited and reviewed with
+   normal tools. SQLite is a rebuildable index and lifecycle store.
+7. **No silent evolution.** Source changes mark knowledge stale. Models may propose
+   candidates, but only maintainers commit, merge, deprecate, or publish them.
 
-Open questions sit at the bottom of each document.
+The current architecture diagram is available as [`architecture.svg`](./architecture.svg)
+and [`architecture.png`](./architecture.png). Keep future diagrams aligned with
+`02-architecture.md` and this contract.

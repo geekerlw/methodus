@@ -1,87 +1,135 @@
-# 07 — Learning and Graph Evolution vs Prime Agent `/refine`
+# 07 — Deliberate learning and controlled refinement
 
-Reference: [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) (Continual
-Harness, Aug 2026).
+Methodus learns through an explicit maintainer workflow. It does not observe every
+coding-agent session and does not automatically evolve Skills, Methods, or canonical
+Knowledge from trajectories.
 
-Both projects seek durable improvement. Prime refines one agent harness from its
-in-session trajectory. Methodus grows a Markdown-first knowledge graph around native
-agent runtimes, with a deliberate handoff boundary and human review.
+## 1. Learn versus refinement
 
-## Side-by-side
-
-| Dimension | Prime Agent `/refine` | Methodus |
+| Dimension | Learn | Refinement |
 |---|---|---|
-| Unit of improvement | Harness prompt, memory, sub-agents, skills | Knowledge node/facet, typed graph edge, Experience, Skill, Method, Face lens |
-| Interaction boundary | Inside the harness REPL | Before/after native Claude/Codex/Cursor interaction |
-| Primary source | Full in-session trajectory | Learning capsule outputs, outcome review, artifacts, and optional managed events |
-| Learning entry | Refine after tactic repeats/fails | Explicit `Learn` session or returned work task |
-| Durable representation | Harness-owned state | Independent Markdown files + SQLite graph index |
-| Apply | Turn-boundary update / rollback ID | Candidate → evidence/conflict check → human review → commit |
-| Context reuse | Harness memory in later turns | Minimal selected Execute facets + lazy graph references in a future capsule |
+| Trigger | Maintainer starts a learning goal | Existing node is stale, contradicted, duplicated, or inadequate |
+| Input | Selected sources, existing graph context, maintainer answers | Existing node, evidence delta, related Experience |
+| Runtime role | Investigate, challenge, synthesize candidates | Propose the smallest evidence-backed change |
+| Output | CandidateSet: zero or more Knowledge/Method/Experience + relations | Diff or replacement candidate against explicit target |
+| Canonical write | Never automatic | Never automatic |
+| Decision | Maintainer Review | Maintainer Review |
 
-## What Methodus borrows
-
-1. **Trajectory/outcome awareness.** Distillation must be tied to what happened and
-   whether it worked, not merely to keywords in a note.
-2. **Smallest useful change.** Prefer adding an edge, revising one Execute facet, or
-   patching a Skill over creating a large duplicate document.
-3. **A low-cost memory tier.** A short candidate rule can be useful before it has
-   earned promotion into a full Skill.
-4. **Auditable evolution.** Every proposed graph change records trigger, evidence,
-   diff, and later outcome.
-
-## What Methodus intentionally does differently
-
-- It does not need to own the conversation transcript to learn. Native handoff is the
-  default; the user can return an outcome, attach artifacts, and use a structured
-  retrospective. Managed event streams are an optional richer source.
-- It treats knowledge as a graph of standalone Markdown nodes, not as opaque prompt
-  memory. A learner can read it without an agent; a future runtime can use it without
-  importing the previous runtime's state.
-- It separates **Learn** and **Execute** facets. A 5W2H explanation helps a person;
-  a compact rule/pitfall slice helps an agent without consuming the whole note.
-- It requires review for global graph/skill changes. No model output becomes canonical
-  merely because it appeared in a successful session.
-
-## Learning session contract
-
-`/learn <topic>` creates a `Task(kind=learn)`. The compiler adds:
+## 2. Deliberate-learning state machine
 
 ```text
-learning skill + source artifacts + prerequisite nodes + neighbor nodes
-→ native agent learning session
-→ candidate atomic Markdown Knowledge node
-→ review links, evidence, confidence, and facets
-→ commit to graph
+Goal
+  → Scope challenge
+  → Existing-knowledge inspection
+  → Evidence plan
+  → Investigation
+  → Counterexample/adversarial verification
+  → Consequential maintainer questions
+  → Synthesis
+  → CandidateSet
+  → Review
 ```
 
-The candidate must contain, at minimum:
+The runtime must keep four categories separate:
 
-- stable ID/title/summary/scope/source metadata;
-- a Learn facet in 5W2H form;
-- an Execute facet or an explicit statement that it is not operational knowledge;
-- links to prerequisites, alternatives, Skills, and Experiences when known;
-- evidence and uncertainty/conflict notes.
+- **fact**: directly supported by a cited source;
+- **inference**: reasoned conclusion with stated assumptions;
+- **contradiction**: sources or nodes that cannot both hold under the same scope;
+- **unknown**: unresolved and not safe to convert into an operational rule.
 
-## Context feedback loop
+Unknowns are valid Learn outcomes. A run may produce no candidate when evidence is
+insufficient.
 
-Graph retrieval is not automatically a good outcome. For each selected context item,
-Methodus records `useful`, `unused`, `misleading`, or `unknown` on task return. The
-resolver uses that feedback alongside scope, typed links, and evidence confidence.
+## 3. Source discipline
 
-```text
-graph node selected → facet injected → task/learn return → outcome review
-        ↑                                               │
-        └────── selection score and/or graph proposal ─┘
-```
+Learn receives only sources the maintainer attaches or roots the maintainer authorizes.
+In the current v1 adapter, the launch working directory is the available source root;
+`@` completion can attach paths under it plus explicitly entered absolute/`~` paths.
+Git history, docs, URLs, and scrubbed logs are protocol targets as source adapters are
+added, not automatic ingestion.
 
-This preserves Prime's “improve from experience” instinct while avoiding a growing,
-unreviewed prompt and preserving the user's preferred agent TUI.
+For each consequential claim, synthesis records:
 
-## Deferred work
+- source locator and revision/fingerprint;
+- whether support is direct or inferred;
+- contradictory evidence;
+- scope and invalidation conditions;
+- validation date.
 
-- Automated extraction of a native agent transcript is optional and must never rely on
-  ANSI scraping.
-- Semantic/embedding graph links are candidate suggestions, not authoritative edges.
-- Automatic Skill promotion requires repeated positive use and review; it is not a
-  background self-modification loop.
+Raw sensitive logs should remain temporary run inputs. Durable Team nodes store
+scrubbed patterns, field meaning, and links to authoritative code/specifications.
+
+## 4. Candidate atomization
+
+One Learn run is not one atom. The runtime proposes the smallest reusable set without
+fragmenting every paragraph into a node.
+
+Prefer a separate node when a conclusion:
+
+- has its own applicability boundary;
+- can be reused independently;
+- has a distinct evidence set or freshness lifecycle;
+- participates in different graph relations;
+- is a specific Experience rather than a reusable rule.
+
+Prefer one node with multiple facets when Learn, Decide, Execute, and Evidence describe
+the same reusable conclusion.
+
+The maintainer can split, merge, exclude, or retarget drafts before Review.
+
+The CandidateSet may additionally contain `relations`, `unresolved_questions`, and
+`contradictions`. Methodus resolves relation endpoints against candidate indexes or
+canonical IDs, writes the links into draft frontmatter, and leaves unresolved
+references visible for Review instead of guessing.
+
+## 5. Knowledge versus Method versus Experience
+
+- Create **Knowledge** for a reusable conclusion, diagnostic signal, design decision,
+  constraint, change narrative, or procedural step.
+- Create **Method** for a repeatable way of conducting a class of work, including
+  phases, evidence standard, output contract, and checks.
+- Create **Experience** only for a concrete case with evidence and outcome that can
+  validate or contradict reusable content.
+
+A learning conversation by itself is not an Experience. Its transcript remains under
+the Learn run for audit and resume.
+
+## 6. Controlled refinement
+
+Refinement proposes the smallest useful change:
+
+- update one facet;
+- add or remove a typed relation;
+- mark an old node superseded/deprecated;
+- merge a duplicate candidate into an explicitly selected target;
+- revalidate a stale node against changed evidence;
+- extract a reusable lesson from a reviewed Experience.
+
+Refinement is an explicit maintainer action. A stale source can trigger a suggestion,
+but it never causes an automatic rewrite or promotion.
+
+It must not silently rewrite a node, overwrite a Team file, install a Skill, or infer
+success merely because an agent produced an answer.
+
+## 7. Review requirements
+
+Review verifies:
+
+- correct type and atom boundary;
+- scope, kind, and summary;
+- fact/inference/unknown separation;
+- source validity and freshness;
+- Execute safety and stopping criteria;
+- duplicate and conflict candidates;
+- relation direction and target existence;
+- Personal versus Team visibility;
+- explicit rationale for merge, deprecate, revalidate, or evidence waiver.
+
+Only committed Personal/Team nodes are visible to the Agent CLI.
+
+## 8. Runtime Skill boundary
+
+Methodus does not generate or evolve runtime Skills. It ships one official connector
+whose sole purpose is to call the read-only Agent CLI. Methods remain runtime-neutral;
+concrete web, document, presentation, or coding capabilities belong to the selected
+agent runtime.

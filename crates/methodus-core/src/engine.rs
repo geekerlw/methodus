@@ -1,3448 +1,849 @@
-use std::collections::HashMap;
+//! Methodus's active application service.
+//!
+//! This layer intentionally contains only the maintainer workflow: a focused
+//! Learn conversation, Markdown graph indexing, review actions, and Personal →
+//! Team promotion. Ordinary coding tasks, workspaces, handoff sessions, and
+//! runtime Skill management are not part of the active product surface.
+
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use methodus_domain::{GraphEdge, GraphNode, RuntimeEvent};
+use methodus_runtime::{RuntimeAdapter, SessionHandle, SpawnInput};
+use methodus_store::Store;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use methodus_domain::*;
-use methodus_runtime::{RuntimeAdapter, SpawnInput};
-use methodus_store::Store;
-
 use crate::config::UserConfig;
 use crate::error::CoreError;
-use crate::learning;
-use crate::lock::process_is_alive;
-use crate::policy;
-use crate::resolution::{self, Resolution};
-use crate::scheduler;
-use crate::workspace::{CapsuleSelection, CapsuleSpec, WorkspaceBuilder};
-
-const MAX_AUTO_TURNS: u32 = 12;
-
-fn graph_score(node: &GraphNode, request: &str) -> f64 {
-    let haystack = format!("{} {} {}", node.title, node.summary.as_deref().unwrap_or(""), node.scope.as_deref().unwrap_or("")).to_ascii_lowercase();
-    let matches = request.split(|c: char| !c.is_alphanumeric())
-        .filter(|term| term.len() >= 3)
-        .filter(|term| haystack.contains(*term))
-        .count() as f64;
-    matches + node.confidence.unwrap_or(0.0)
-}
-
-fn native_command(runtime: &str, brief: &str) -> (String, Vec<String>) {
-    match runtime {
-        "claude-code" => ("claude".into(), vec![brief.into()]),
-        "codex" => ("codex".into(), vec![brief.into()]),
-        "cursor" => ("cursor".into(), vec!["agent".into(), brief.into()]),
-        other => (other.into(), vec![brief.into()]),
-    }
-}
-
-fn yaml_quote(value: &str) -> String {
-    value.replace('"', "'").replace('\n', " ").trim().to_string()
-}
-
-/// User decision on a candidate / conflicted knowledge or skill draft.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KnowledgeReviewAction {
-    /// Promote to committed (install skill when path is free).
-    Commit,
-    /// Discard the candidate.
-    Reject,
-    /// Overwrite an existing live skill (conflicted drafts only).
-    ReplaceExisting,
-}
 
 #[derive(Clone)]
 pub struct Engine {
     store: Arc<Store>,
     adapters: HashMap<String, Arc<dyn RuntimeAdapter>>,
     home: PathBuf,
-    /// Directory Methodus was launched from. Source trees stay here; they are not copied.
     launch_cwd: PathBuf,
 }
 
 #[derive(Debug, Clone)]
-pub struct RecoveredSession {
-    pub task_id: String,
-    pub session_id: String,
-    pub executor_sid: Option<String>,
-    pub still_live: bool,
+pub struct TeamStatus {
+    pub team_id: String,
+    pub root: PathBuf,
+    pub is_git: bool,
+    pub branch: Option<String>,
+    pub dirty: bool,
+    pub changes: Vec<String>,
+    pub validation_issues: Vec<crate::graph::GraphIssue>,
+    pub diff: String,
 }
 
-/// A native interactive launch prepared by Methodus. The caller owns terminal
-/// suspension/pane creation; no Agent TUI output is parsed or proxied.
-#[derive(Debug, Clone)]
-pub struct NativeHandoffPlan {
-    pub task_id: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnRun {
+    pub run_id: String,
+    pub goal: String,
     pub runtime: String,
-    pub cwd: PathBuf,
-    pub program: String,
-    pub args: Vec<String>,
-    pub capsule_root: PathBuf,
-    pub brief: String,
+    pub permission_mode: String,
+    pub status: String,
+    pub executor_sid: Option<String>,
+    pub updated_at: String,
 }
 
-/// Result of the short-lived, read-only context-planning Agent call that precedes
-/// native handoff. The planner never executes the user's task.
-#[derive(Debug, Clone)]
-pub struct ContextPlan {
-    pub selected_node_ids: Vec<String>,
-    pub rationale: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnEventRecord {
+    pub at: String,
+    pub role: String,
+    pub text: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LearnRunState {
+    run_id: String,
+    kind: String,
+    status: String,
+    goal: String,
+    runtime: String,
+    #[serde(default = "default_permission_mode")]
+    permission_mode: String,
+    #[serde(default)]
+    executor_sid: Option<String>,
+    #[serde(default)]
+    unresolved_questions: Vec<String>,
+    #[serde(default)]
+    contradictions: Vec<String>,
+    updated_at: String,
+}
+
+fn default_permission_mode() -> String { "plan".into() }
+
+fn permission_profile(mode: &str) -> (&'static str, &'static str) {
+    match mode {
+        "cautious" => ("cautious", "workspace-write"),
+        "acceptEdits" => ("acceptEdits", "workspace-write"),
+        _ => ("plan", "read-only"),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceManifest {
+    sources: Vec<SourceManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceManifestEntry {
+    locator: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateSet {
+    #[serde(default)]
+    candidates: Vec<CandidateDraft>,
+    #[serde(default)]
+    relations: Vec<CandidateRelation>,
+    #[serde(default)]
+    unresolved_questions: Vec<String>,
+    #[serde(default)]
+    contradictions: Vec<String>,
+    #[serde(default)]
+    runtime_skills: Vec<RuntimeSkillObservation>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CandidateRelation {
+    from: String,
+    relation: String,
+    to: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RuntimeSkillObservation {
+    name: String,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateDraft {
+    #[serde(rename = "type", alias = "node_type", default = "default_node_type")]
+    node_type: String,
+    #[serde(default)]
+    kind: Option<String>,
+    title: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    learn: Option<String>,
+    #[serde(default)]
+    decide: Option<String>,
+    #[serde(default)]
+    execute: Option<String>,
+    #[serde(default)]
+    evidence: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    occurred_at: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+fn default_node_type() -> String { "knowledge".into() }
 
 impl Engine {
     pub fn new(store: Arc<Store>, adapter: Arc<dyn RuntimeAdapter>, home: PathBuf) -> Self {
         let mut adapters = HashMap::new();
-        adapters.insert("claude-code".to_string(), adapter);
-        Self {
-            store,
-            adapters,
-            home,
-            launch_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        }
+        adapters.insert("claude-code".into(), adapter);
+        Self { store, adapters, home, launch_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")) }
     }
 
-    pub fn with_runtimes(
-        store: Arc<Store>,
-        home: PathBuf,
-        adapters: HashMap<String, Arc<dyn RuntimeAdapter>>,
-    ) -> Self {
-        Self {
-            store,
-            adapters,
-            home,
-            launch_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        }
+    pub fn with_runtimes(store: Arc<Store>, home: PathBuf, adapters: HashMap<String, Arc<dyn RuntimeAdapter>>) -> Self {
+        Self { store, adapters, home, launch_cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")) }
     }
 
     fn adapter(&self, runtime: &str) -> Result<Arc<dyn RuntimeAdapter>, CoreError> {
-        self.adapters
-            .get(runtime)
-            .cloned()
-            .ok_or_else(|| CoreError::UnknownRuntime(runtime.to_string()))
+        self.adapters.get(runtime).cloned().ok_or_else(|| CoreError::UnknownRuntime(runtime.into()))
     }
 
     fn preferred_runtime(&self, requested: Option<&str>) -> String {
-        if let Some(name) = requested {
-            if self.adapters.contains_key(name) {
-                return name.to_string();
-            }
+        if let Some(runtime) = requested.filter(|runtime| self.adapters.contains_key(*runtime)) { return runtime.into(); }
+        if let Some(runtime) = UserConfig::load(&self.home).default_runtime.filter(|runtime| self.adapters.contains_key(runtime)) { return runtime; }
+        ["claude-code", "codex", "cursor"].into_iter().find(|runtime| self.adapters.contains_key(*runtime)).map(str::to_string)
+            .or_else(|| self.adapters.keys().next().cloned()).unwrap_or_else(|| "claude-code".into())
+    }
+
+    pub fn store(&self) -> &Arc<Store> { &self.store }
+    pub fn home(&self) -> &Path { &self.home }
+    pub fn launch_cwd(&self) -> &Path { &self.launch_cwd }
+    pub fn context_roots(&self) -> Vec<(String, PathBuf)> { crate::mentions::context_roots(&self.home, &self.launch_cwd) }
+
+    pub fn sync_graph(&self) -> Result<usize, CoreError> { Ok(crate::graph::sync_graph(&self.store, &self.home)?) }
+    pub fn list_graph_nodes(&self, query: Option<&str>) -> Result<Vec<GraphNode>, CoreError> { Ok(self.store.list_graph_nodes(query)?) }
+    pub fn graph_edges_for(&self, node_id: &str) -> Result<Vec<GraphEdge>, CoreError> { Ok(self.store.graph_edges_for(node_id)?) }
+    pub fn team_id(&self) -> String { UserConfig::load(&self.home).selected_team().to_string() }
+    pub fn team_root(&self) -> PathBuf { self.home.join("teams").join(self.team_id()) }
+
+    pub fn list_learning_runs(&self) -> Result<Vec<LearnRun>, CoreError> {
+        let root = self.home.join("runs");
+        if !root.is_dir() { return Ok(Vec::new()); }
+        let mut runs = Vec::new();
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path().join("state.yaml");
+            if !path.is_file() { continue; }
+            let Ok(state) = serde_yaml::from_str::<LearnRunState>(&fs::read_to_string(path)?) else { continue; };
+            if state.kind != "learn" { continue; }
+            runs.push(LearnRun { run_id: state.run_id, goal: state.goal, runtime: state.runtime, permission_mode: state.permission_mode, status: state.status, executor_sid: state.executor_sid, updated_at: state.updated_at });
         }
-        let cfg = UserConfig::load(&self.home);
-        if let Some(name) = cfg.default_runtime {
-            if self.adapters.contains_key(&name) {
-                return name;
-            }
-        }
-        for name in ["claude-code", "cursor", "codex"] {
-            if self.adapters.contains_key(name) {
-                return name.to_string();
-            }
-        }
-        self.adapters
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "claude-code".to_string())
+        runs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(runs)
     }
 
-    pub fn store(&self) -> &Arc<Store> {
-        &self.store
+    pub fn latest_resumable_learning(&self) -> Result<Option<LearnRun>, CoreError> {
+        Ok(self.list_learning_runs()?.into_iter().find(|run| matches!(run.status.as_str(), "running" | "awaiting_input" | "failed")))
     }
 
-    pub fn home(&self) -> &Path {
-        &self.home
-    }
-
-    pub fn launch_cwd(&self) -> &Path {
-        &self.launch_cwd
-    }
-
-    /// Directories the executor may read in place (launch cwd ∪ registered projects).
-    pub fn context_roots(&self) -> Vec<(String, PathBuf)> {
-        crate::mentions::context_roots(&self.home, &self.launch_cwd)
-    }
-
-    /// Root directory for per-task executor sandboxes (Claude/Codex cwd).
-    pub fn workspace_root(&self) -> PathBuf {
-        UserConfig::load(&self.home).resolve_workspace_root(&self.home)
-    }
-
-    /// Re-index independent Markdown graph nodes. This is deliberately separate from
-    /// the legacy Face catalog and can run before every graph/task-control refresh.
-    pub fn sync_graph(&self) -> Result<usize, CoreError> {
-        crate::graph::sync_graph(&self.store, &self.home)
-    }
-
-    pub fn list_graph_nodes(&self, query: Option<&str>) -> Result<Vec<GraphNode>, CoreError> {
-        Ok(self.store.list_graph_nodes(query)?)
-    }
-
-    pub fn graph_edges_for(&self, node_id: &str) -> Result<Vec<GraphEdge>, CoreError> {
-        Ok(self.store.graph_edges_for(node_id)?)
-    }
-
-    /// Compile a compact graph-backed Task Workspace without starting a runtime.
-    /// This is the default pre-launch step for both native handoff and optional managed
-    /// execution. The user's project remains the runtime cwd.
-    pub fn compile_capsule(&self, task_id: &str, context_budget_tokens: i64) -> Result<NativeHandoffPlan, CoreError> {
-        self.compile_capsule_with_nodes(task_id, context_budget_tokens, &[])
-    }
-
-    /// Compile against explicit planner choices. An empty list retains the local
-    /// deterministic ranking as an offline fallback.
-    pub fn compile_capsule_with_nodes(&self, task_id: &str, context_budget_tokens: i64, preferred_node_ids: &[String]) -> Result<NativeHandoffPlan, CoreError> {
-        let task = self.store.get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        self.sync_graph()?;
-        let runtime = self.preferred_runtime(task.runtime.as_deref());
-        let launch_cwd = task.project_id.as_ref()
-            .and_then(|id| crate::project::list_projects(&self.home).into_iter().find(|project| project.id == *id))
-            .map(|project| project.root)
-            .unwrap_or_else(|| self.launch_cwd.clone());
-        let roots = self.context_roots().into_iter().map(|(_, path)| path).collect::<Vec<_>>();
-        let (request, _) = crate::mentions::prepare_prompt(&task.request, &roots);
-        let request_terms = request.to_ascii_lowercase();
-        let mut candidates = self.store.list_graph_nodes(None)?;
-        candidates.sort_by(|left, right| graph_score(right, &request_terms).total_cmp(&graph_score(left, &request_terms)));
-        let mut selections = Vec::new();
-        for node in candidates.into_iter()
-            .filter(|node| node.node_type == "knowledge" || node.node_type == "skill" || node.node_type == "experience")
-            .filter(|node| preferred_node_ids.is_empty() || preferred_node_ids.iter().any(|id| id == &node.id))
-            .take(12) {
-            let source = self.home.join(&node.path);
-            let Ok(document) = crate::graph::read_graph_document(&self.home, &source) else { continue };
-            let content = crate::graph::facet(&document.body, "Execute")
-                .or_else(|| node.summary.clone())
-                .unwrap_or_else(|| document.body.lines().take(8).collect::<Vec<_>>().join("\n"));
-            if content.trim().is_empty() { continue; }
-            let priority = graph_score(&node, &request_terms);
-            selections.push(CapsuleSelection {
-                node_id: node.id.clone(), title: node.title.clone(), facet: "Execute".into(),
-                content, reference_path: source, rationale: format!("graph match score {:.1}", priority), priority,
-            });
-        }
-        let skill_files = selections.iter()
-            .filter(|selection| selection.node_id.starts_with("skill/"))
-            .filter_map(|selection| selection.reference_path.parent().map(|parent| (selection.title.clone(), parent.join("SKILL.md"))))
-            .filter(|(_, path)| path.is_file())
-            .collect();
-        let spec = CapsuleSpec {
-            task_id: task.id.clone(), title: task.title.clone(), request,
-            runtime: runtime.clone(), launch_cwd: launch_cwd.clone(), context_budget_tokens,
-            selections: selections.clone(), skills: skill_files,
-        };
-        let compiled = WorkspaceBuilder::build_capsule(&self.workspace_root(), &spec)?;
-        let workspace_id = format!("ws_{}", task.id);
-        let now = Utc::now();
-        self.store.insert_task_workspace(&TaskWorkspace {
-            id: workspace_id.clone(), task_id: task.id.clone(), root_path: compiled.root.display().to_string(),
-            launch_cwd: launch_cwd.display().to_string(), status: "compiled".into(),
-            manifest_hash: compiled.manifest_hash, context_budget_tokens, created_at: now, updated_at: now,
-        })?;
-        self.store.update_task_workspace(&task.id, &workspace_id)?;
-        let mut consumed = 0i64;
-        let selected = selections.into_iter().map(|selection| {
-            let estimate = crate::graph::estimated_tokens(&selection.content);
-            let disposition = if consumed + estimate <= context_budget_tokens {
-                consumed += estimate;
-                "injected"
-            } else { "lazy" };
-            ContextSelection {
-                id: format!("ctx_{}", Uuid::new_v4()), workspace_id: workspace_id.clone(), node_id: selection.node_id,
-                facet: selection.facet, rationale: selection.rationale, priority: Some(selection.priority),
-                estimated_tokens: estimate, disposition: disposition.into(), outcome: None, created_at: now, updated_at: now,
-            }
-        }).collect::<Vec<_>>();
-        self.store.replace_context_selections(&workspace_id, &selected)?;
-        self.emit_simple("workspace.compiled", Some(&task.id), &serde_json::json!({
-            "workspace_id": workspace_id, "path": compiled.root, "estimated_tokens": compiled.estimated_tokens,
-            "budget_tokens": context_budget_tokens,
-        }).to_string());
-        let (program, args) = native_command(&runtime, &compiled.brief);
-        Ok(NativeHandoffPlan { task_id: task.id, runtime, cwd: launch_cwd, program, args, capsule_root: compiled.root, brief: compiled.brief })
-    }
-
-    /// Ask a disposable read-only runtime session to select graph node IDs. The
-    /// response is intentionally a tiny JSON contract; file reads and task work
-    /// remain outside this planning call. If it cannot provide valid selections,
-    /// callers can safely fall back to `compile_capsule`'s local ranker.
-    pub async fn plan_context(&self, task_id: &str) -> Result<ContextPlan, CoreError> {
-        let task = self.store.get_task(task_id)?.ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        self.sync_graph()?;
-        let mut nodes = self.store.list_graph_nodes(None)?;
-        nodes.retain(|node| matches!(node.node_type.as_str(), "knowledge" | "skill" | "experience"));
-        nodes.sort_by(|a, b| graph_score(b, &task.request).total_cmp(&graph_score(a, &task.request)));
-        nodes.truncate(24);
-        let catalog = nodes.iter().map(|node| format!("- {} | {} | {}", node.id, node.node_type, node.summary.as_deref().unwrap_or(""))).collect::<Vec<_>>().join("\n");
-        let prompt = format!(
-            "You are Methodus's disposable context planner. Do not solve the task, use tools, or explain the task. Select at most 8 relevant IDs from the catalog for the goal. Return ONLY JSON: {{\"selected_node_ids\":[...],\"rationale\":\"...\"}}.\n\nGoal:\n{}\n\nCatalog:\n{}",
-            task.request, catalog
-        );
-        let runtime = self.preferred_runtime(task.runtime.as_deref());
-        let adapter = self.adapter(&runtime)?;
-        let cwd = self.workspace_root().join("_context_planner");
-        fs::create_dir_all(&cwd)?;
-        let (handle, rx) = adapter.spawn(SpawnInput {
-            prompt, cwd, session_id: format!("planner_{}", Uuid::new_v4()), permission_mode: "plan".into(),
-            allowed_tools: Vec::new(), sandbox: Some("read-only".into()), extra_dirs: Vec::new(), model: None,
-        }).await?;
-        let text = tokio::time::timeout(Duration::from_secs(45), collect_refine_text(rx)).await
-            .map_err(|_| CoreError::Other("context planner timed out".into()))?;
-        let _ = adapter.stop(&handle).await;
-        let value: serde_json::Value = serde_json::from_str(text.trim())
-            .map_err(|_| CoreError::Other("context planner returned invalid JSON".into()))?;
-        let valid = nodes.iter().map(|node| node.id.as_str()).collect::<std::collections::HashSet<_>>();
-        let selected_node_ids = value.get("selected_node_ids").and_then(serde_json::Value::as_array)
-            .into_iter().flatten().filter_map(serde_json::Value::as_str)
-            .filter(|id| valid.contains(*id)).take(8).map(str::to_string).collect::<Vec<_>>();
-        if selected_node_ids.is_empty() { return Err(CoreError::Other("context planner selected no usable graph nodes".into())); }
-        Ok(ContextPlan { selected_node_ids, rationale: value.get("rationale").and_then(serde_json::Value::as_str).unwrap_or("runtime-selected graph context").to_string() })
-    }
-
-    /// Persist the fact that the user was handed into their native Agent TUI. The
-    /// caller must use `NativeHandoffPlan` with an inherited terminal; Methodus does
-    /// not capture or interpret that UI.
-    pub fn record_native_handoff(&self, plan: &NativeHandoffPlan) -> Result<String, CoreError> {
-        if let Some(task) = self.store.get_task(&plan.task_id)? {
-            match task.status {
-                TaskStatus::Queued => self.transition_task(&task, TaskStatus::Planning)?,
-                TaskStatus::Planning | TaskStatus::Running => {}
-                // A returned task can be continued from the Sessions panel.
-                // Review is the task's outcome-capture phase, not a terminal
-                // state and never a session lifecycle state.
-                TaskStatus::Reviewing => self.transition_task(&task, TaskStatus::Running)?,
-                other => return Err(CoreError::TaskNotRunnable(plan.task_id.clone(), other.to_string())),
-            }
-        }
-        let task = self.store.get_task(&plan.task_id)?.ok_or_else(|| CoreError::TaskNotFound(plan.task_id.clone()))?;
-        if task.status == TaskStatus::Planning {
-            self.transition_task(&task, TaskStatus::Running)?;
-        }
-        let command = std::iter::once(plan.program.as_str()).chain(plan.args.iter().map(String::as_str)).collect::<Vec<_>>().join(" ");
-        let id = self.store.record_launch(&plan.task_id, &plan.runtime, "native_handoff", &command)?;
-        self.emit_simple("launch.started", Some(&plan.task_id), &serde_json::json!({"launch_id": id, "runtime": plan.runtime, "cwd": plan.cwd, "capsule": plan.capsule_root}).to_string());
-        Ok(id)
-    }
-
-    /// Return from native Agent interaction into Methodus's review surface. The exit
-    /// code is lifecycle evidence only; it never decides whether learned knowledge is
-    /// trustworthy or whether the task actually met its acceptance criteria.
-    pub fn record_native_return(&self, launch_id: &str, task_id: &str, exit_status: &str) -> Result<(), CoreError> {
-        self.store.complete_launch(launch_id, exit_status)?;
-        if let Some(task) = self.store.get_task(task_id)? {
-            if task.status == TaskStatus::Running {
-                self.transition_task(&task, TaskStatus::Reviewing)?;
-            }
-        }
-        self.emit_simple("launch.returned", Some(task_id), &serde_json::json!({"launch_id": launch_id, "exit_status": exit_status}).to_string());
-        Ok(())
-    }
-
-    /// Drain due learning jobs (extract → detect → propose). Budgeted, no LLM.
-    pub fn tick_learning(&self) -> Result<usize, CoreError> {
-        scheduler::tick(&self.store, &self.home)
-    }
-
-    /// One budgeted executor call to polish a rules note/patch. Never applies.
-    pub async fn tick_refine_llm(&self) -> Result<usize, CoreError> {
-        let cfg = UserConfig::load(&self.home);
-        if !cfg.refine_llm_enabled() {
-            return Ok(0);
-        }
-        if self.has_live_executor_session()? {
-            return Ok(0);
-        }
-        let (used, skip_ids) = self.refine_llm_today()?;
-        if used >= cfg.refine_llm_daily_cap() {
-            return Ok(0);
-        }
-        let Some(item) =
-            crate::refine::next_unpolished_candidate(&self.store, &self.home, &skip_ids)?
-        else {
-            return Ok(0);
-        };
-        match self.polish_one_candidate(&item).await {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                self.emit_refine_llm(&item.id, false, Some(&e.to_string()));
-                Ok(0)
-            }
-        }
-    }
-
-    fn has_live_executor_session(&self) -> Result<bool, CoreError> {
-        Ok(self.store.list_non_terminal_sessions()?.iter().any(|s| {
-            matches!(s.status, SessionStatus::Running | SessionStatus::Spawning)
-        }))
-    }
-
-    fn refine_llm_today(&self) -> Result<(i64, Vec<String>), CoreError> {
-        let today = Utc::now().date_naive();
-        let events = self.store.list_events(None, 2000)?;
-        let mut ids = Vec::new();
-        let mut n = 0i64;
-        for ev in events {
-            if ev.event_type != crate::refine::REFINE_LLM_EVENT {
-                continue;
-            }
-            if !event_on_date(&ev.occurred_at, today) {
-                continue;
-            }
-            n += 1;
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
-                if let Some(id) = v.get("knowledge_id").and_then(|x| x.as_str()) {
-                    ids.push(id.to_string());
-                }
-            }
-        }
-        Ok((n, ids))
-    }
-
-    fn emit_refine_llm(&self, knowledge_id: &str, skip: bool, error: Option<&str>) {
-        let mut payload = serde_json::json!({
-            "knowledge_id": knowledge_id,
-            "skip": skip,
-        });
-        if let Some(err) = error {
-            payload["error"] = serde_json::Value::String(err.to_string());
-        }
-        self.emit_simple(crate::refine::REFINE_LLM_EVENT, None, &payload.to_string());
-    }
-
-    async fn polish_one_candidate(&self, item: &KnowledgeItem) -> Result<usize, CoreError> {
-        let body = fs::read_to_string(self.home.join(&item.path)).unwrap_or_default();
-        let proposal = crate::refine::parse_proposal(&body).ok_or_else(|| {
-            CoreError::Other("refine llm: candidate missing proposal JSON".into())
-        })?;
-        let task_id = proposal
-            .evidence_refs
-            .first()
-            .cloned()
-            .unwrap_or_default();
-        let title = self
-            .store
-            .get_task(&task_id)
+    fn write_learn_state(&self, run_id: &str, goal: &str, runtime: &str, permission_mode: Option<&str>, status: &str, executor_sid: Option<&str>) -> Result<(), CoreError> {
+        let root = self.home.join("runs").join(run_id);
+        fs::create_dir_all(&root)?;
+        let previous = fs::read_to_string(root.join("state.yaml"))
             .ok()
-            .flatten()
-            .map(|t| t.title)
-            .unwrap_or_else(|| proposal.target_id.clone());
-        let digest = crate::refine::trajectory_digest(&self.store, &task_id, &title);
-        let draft_json = serde_json::to_string_pretty(&proposal).unwrap_or_else(|_| "{}".into());
-        let prompt = crate::refine::polish_prompt(&digest, &draft_json);
-        let runtime = self.preferred_runtime(None);
+            .and_then(|raw| serde_yaml::from_str::<LearnRunState>(&raw).ok());
+        let state = LearnRunState {
+            run_id: run_id.into(), kind: "learn".into(), status: status.into(), goal: goal.into(), runtime: runtime.into(),
+            permission_mode: permission_mode.map(|mode| permission_profile(mode).0.to_string()).or_else(|| previous.as_ref().map(|state| state.permission_mode.clone())).unwrap_or_else(default_permission_mode),
+            executor_sid: executor_sid.map(str::to_string).or_else(|| previous.as_ref().and_then(|state| state.executor_sid.clone())),
+            unresolved_questions: previous.as_ref().map(|state| state.unresolved_questions.clone()).unwrap_or_default(),
+            contradictions: previous.as_ref().map(|state| state.contradictions.clone()).unwrap_or_default(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        fs::write(root.join("state.yaml"), serde_yaml::to_string(&state).map_err(|error| CoreError::Other(format!("serialize Learn state: {error}")))?)?;
+        Ok(())
+    }
+
+    pub fn record_learning_event(&self, run_id: &str, role: &str, text: &str) -> Result<(), CoreError> {
+        let root = self.home.join("runs").join(run_id);
+        fs::create_dir_all(&root)?;
+        let event = serde_json::json!({ "at": Utc::now().to_rfc3339(), "role": role, "text": text });
+        let mut file = OpenOptions::new().create(true).append(true).open(root.join("events.jsonl"))?;
+        writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_else(|_| "{}".into()))?;
+        Ok(())
+    }
+
+    pub fn learning_events(&self, run_id: &str) -> Result<Vec<LearnEventRecord>, CoreError> {
+        let path = self.home.join("runs").join(run_id).join("events.jsonl");
+        if !path.is_file() { return Ok(Vec::new()); }
+        let mut events = Vec::new();
+        for line in fs::read_to_string(path)?.lines() {
+            if let Ok(event) = serde_json::from_str::<LearnEventRecord>(line) { events.push(event); }
+        }
+        Ok(events)
+    }
+
+    /// Persist source locators mentioned in a Learn prompt. This records only
+    /// metadata and fingerprints; it never copies source contents into the run.
+    pub fn record_learning_sources(&self, run_id: &str, text: &str) -> Result<(), CoreError> {
+        let root = self.home.join("runs").join(run_id);
+        fs::create_dir_all(&root)?;
+        let mut entries = fs::read_to_string(root.join("sources.yaml"))
+            .ok()
+            .and_then(|raw| serde_yaml::from_str::<SourceManifest>(&raw).ok())
+            .map(|manifest| manifest.sources)
+            .unwrap_or_default();
+        let mut seen = entries.iter().map(|entry| (entry.locator.clone(), ())).collect::<BTreeMap<_, _>>();
+        for token in text.split_whitespace().filter_map(|token| source_token(token, &self.launch_cwd)) {
+            if seen.insert(token.clone(), ()).is_some() { continue; }
+            let (path, display) = resolve_source_path(&self.launch_cwd, &token);
+            let (fingerprint, status) = if path.is_dir() {
+                (None, "current")
+            } else {
+                match fs::read(&path) {
+                    Ok(bytes) => (Some(format!("sha256:{:x}", Sha256::digest(bytes))), "current"),
+                    Err(_) => (None, "missing"),
+                }
+            };
+            entries.push(SourceManifestEntry { locator: display, path: path.display().to_string(), fingerprint, status: status.into() });
+        }
+        fs::write(root.join("sources.yaml"), serde_yaml::to_string(&SourceManifest { sources: entries }).map_err(|error| CoreError::Other(format!("serialize source manifest: {error}")))?)?;
+        Ok(())
+    }
+
+    pub fn mark_learning_status(&self, run_id: &str, status: &str) -> Result<(), CoreError> {
+        let Some(run) = self.list_learning_runs()?.into_iter().find(|run| run.run_id == run_id) else { return Err(CoreError::Other(format!("Learn run not found: {run_id}"))); };
+        self.write_learn_state(&run.run_id, &run.goal, &run.runtime, Some(&run.permission_mode), status, run.executor_sid.as_deref())
+    }
+
+    pub fn team_status(&self) -> Result<TeamStatus, CoreError> {
+        let team_id = self.team_id();
+        let root = self.team_root();
+        let team_prefix = format!("teams/{team_id}/");
+        let validation_issues = crate::graph::validate_graph(&self.home)?.into_iter().filter(|issue| issue.path.starts_with(&team_prefix)).collect();
+        if !root.is_dir() { return Ok(TeamStatus { team_id, root, is_git: false, branch: None, dirty: false, changes: Vec::new(), validation_issues, diff: String::new() }); }
+        let git = |args: &[&str]| Command::new("git").args(args).current_dir(&root).output();
+        let Ok(status) = git(&["status", "--porcelain=v1", "--branch"]) else { return Ok(TeamStatus { team_id, root, is_git: false, branch: None, dirty: false, changes: Vec::new(), validation_issues, diff: String::new() }); };
+        if !status.status.success() { return Ok(TeamStatus { team_id, root, is_git: false, branch: None, dirty: false, changes: Vec::new(), validation_issues, diff: String::new() }); }
+        let lines = String::from_utf8_lossy(&status.stdout).lines().map(str::to_string).collect::<Vec<_>>();
+        let branch = lines.first().and_then(|line| line.strip_prefix("## ")).map(str::to_string);
+        let changes = lines.into_iter().skip(1).collect::<Vec<_>>();
+        let diff = git(&["diff", "--no-ext-diff", "--", "knowledge", "methods", "experiences"]).ok().map(|output| String::from_utf8_lossy(&output.stdout).to_string()).unwrap_or_default();
+        Ok(TeamStatus { team_id, root, is_git: true, branch, dirty: !changes.is_empty(), changes, validation_issues, diff })
+    }
+
+    /// Write a local, reviewable publish plan. It never commits, pushes, merges,
+    /// or discards a Team working tree.
+    pub fn create_team_publish_plan(&self) -> Result<PathBuf, CoreError> {
+        let status = self.team_status()?;
+        let blocking = status.validation_issues.iter().filter(|issue| issue.severity == crate::graph::IssueSeverity::Error).map(|issue| format!("{}: {}", issue.path, issue.message)).collect::<Vec<_>>();
+        if !blocking.is_empty() {
+            return Err(CoreError::Other(format!("Team publish blocked by validation errors: {}", blocking.join("; "))));
+        }
+        let run_id = format!("publish_{}", Uuid::new_v4());
+        let root = self.home.join("runs").join(&run_id);
+        fs::create_dir_all(&root)?;
+        let issues = if status.validation_issues.is_empty() { "none".into() } else { status.validation_issues.iter().map(|issue| format!("- [{}] {}: {}", issue.severity.as_str(), issue.path, issue.message)).collect::<Vec<_>>().join("\n") };
+        let changes = if status.changes.is_empty() { "none".into() } else { status.changes.join("\n") };
+        fs::write(root.join("publish-plan.md"), format!("# Team publish plan\n\nroot: {}\ngit: {}\nbranch: {}\ndirty: {}\n\n## Validation\n\n{}\n\n## Changes\n\n```text\n{}\n```\n\n## Diff\n\n```diff\n{}\n```\n\nThis is a plan only. Review and commit/push with normal Git tooling.\n", status.root.display(), status.is_git, status.branch.as_deref().unwrap_or("unknown"), status.dirty, issues, changes, status.diff))?;
+        Ok(root.join("publish-plan.md"))
+    }
+
+    /// Start a focused learning conversation with a maintainer-selected permission mode. No task, workspace,
+    /// capsule, or native coding session is created.
+    pub async fn start_learning(&self, runtime: Option<&str>, permission_mode: &str, goal: &str) -> Result<(SessionHandle, mpsc::Receiver<RuntimeEvent>), CoreError> {
+        let runtime = self.preferred_runtime(runtime);
+        let (permission_mode, sandbox) = permission_profile(permission_mode);
         let adapter = self.adapter(&runtime)?;
-        let cwd = self.workspace_root().join("_refine_llm");
-        fs::create_dir_all(&cwd)?;
-        let session_id = Uuid::new_v4().to_string();
-        let (handle, rx) = adapter
-            .spawn(SpawnInput {
-                prompt,
-                cwd,
-                session_id,
-                permission_mode: "plan".into(),
-                allowed_tools: Vec::new(),
-                sandbox: Some("read-only".into()),
-                extra_dirs: Vec::new(),
-                model: None,
-            })
-            .await?;
-        let collected = tokio::time::timeout(Duration::from_secs(45), collect_refine_text(rx)).await;
-        let _ = adapter.stop(&handle).await;
-        let text = match collected {
-            Ok(s) => s,
-            Err(_) => {
-                self.emit_refine_llm(&item.id, false, Some("timeout"));
-                return Ok(0);
-            }
-        };
-        if text.trim().is_empty() {
-            self.emit_refine_llm(&item.id, false, Some("empty"));
-            return Ok(0);
-        }
-        let Some(out) = crate::refine::parse_llm_refine_output(&text) else {
-            self.emit_refine_llm(&item.id, false, Some("parse"));
-            return Ok(0);
-        };
-        if out.skip {
-            let _ = self.review_knowledge(&item.id, KnowledgeReviewAction::Reject);
-            self.emit_refine_llm(&item.id, true, None);
-            return Ok(1);
-        }
-        crate::refine::apply_llm_polish(&self.store, &self.home, item, &out)?;
-        self.emit_refine_llm(&item.id, false, None);
-        Ok(1)
-    }
-
-    pub fn list_learning_jobs(&self) -> Result<Vec<methodus_domain::LearningJob>, CoreError> {
-        Ok(self.store.list_jobs()?)
-    }
-
-    pub fn cancel_learning_job(&self, id: &str) -> Result<bool, CoreError> {
-        Ok(self.store.cancel_learning_job(id)?)
-    }
-
-    pub fn list_recent_events(&self, limit: usize) -> Result<Vec<methodus_store::EventRecord>, CoreError> {
-        Ok(self.store.list_events(None, limit)?)
-    }
-
-    /// Promote the highest-value pending question to Asked when the user is idle.
-    /// No-op if a question is already Asked, or none clear the value floor.
-    pub fn ask_idle_question(&self) -> Result<Option<Question>, CoreError> {
-        learning::promote_idle_question(&self.store)
-    }
-
-    pub fn usage_summary(&self, today_only: bool) -> Result<UsageSummary, CoreError> {
-        let since = if today_only {
-            Utc::now()
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .map(|d| d.and_utc())
-        } else {
-            None
-        };
-        Ok(self.store.usage_summary(since)?)
-    }
-
-    pub fn review_knowledge(
-        &self,
-        id: &str,
-        action: KnowledgeReviewAction,
-    ) -> Result<KnowledgeItem, CoreError> {
-        let mut item = self
-            .store
-            .get_knowledge(id)?
-            .ok_or_else(|| CoreError::KnowledgeNotFound(id.to_string()))?;
-        if action == KnowledgeReviewAction::Commit && item.source == learning::SKILL_DRAFT_SOURCE {
-            match learning::install_skill_draft(&self.home, &item, false) {
-                Ok(live_path) => {
-                    item.path = live_path;
-                }
-                Err(e) => {
-                    if item.status == KnowledgeStatus::Candidate {
-                        item.status = item
-                            .status
-                            .checked_transition(KnowledgeStatus::Conflicted)?;
-                        item.updated_at = Utc::now();
-                        self.store.update_knowledge(&item)?;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        if action == KnowledgeReviewAction::Commit || action == KnowledgeReviewAction::ReplaceExisting
-        {
-            if item.source == crate::refine::SKILL_PATCH_SOURCE {
-                item.path = crate::refine::apply_skill_patch(&self.home, &item)?;
-            }
-            if item.source == crate::refine::HARNESS_NOTE_SOURCE {
-                let (live, _hits) =
-                    crate::refine::apply_harness_note(&self.store, &self.home, &item)?;
-                item.path = live;
-            }
-        }
-        if action == KnowledgeReviewAction::ReplaceExisting {
-            if item.source != learning::SKILL_DRAFT_SOURCE
-                && item.source != crate::refine::SKILL_PATCH_SOURCE
-            {
-                return Err(CoreError::Other(
-                    "replace only applies to skill drafts or patches".into(),
-                ));
-            }
-            if item.source == learning::SKILL_DRAFT_SOURCE {
-                item.path = learning::install_skill_draft(&self.home, &item, true)?;
-            }
-        }
-        let next = match action {
-            KnowledgeReviewAction::Commit | KnowledgeReviewAction::ReplaceExisting => {
-                KnowledgeStatus::Committed
-            }
-            KnowledgeReviewAction::Reject => KnowledgeStatus::Rejected,
-        };
-        let committed = next == KnowledgeStatus::Committed;
-        item.status = item.status.checked_transition(next)?;
-        item.updated_at = Utc::now();
-        self.store.update_knowledge(&item)?;
-        let ev = match action {
-            KnowledgeReviewAction::Reject => "knowledge.rejected",
-            KnowledgeReviewAction::ReplaceExisting => "knowledge.replaced",
-            KnowledgeReviewAction::Commit => "knowledge.committed",
-        };
-        let _ = self.store.insert_event(
-            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
-            ev,
-            &Utc::now().to_rfc3339(),
-            None,
-            None,
-            &serde_json::json!({"knowledge_id": id, "kind": item.source}).to_string(),
-            None,
-        );
-        if committed {
-            if item.source == learning::SKILL_DRAFT_SOURCE {
-                if let (Some(fid), Some(skill)) = (
-                    item.face_id.as_deref(),
-                    crate::evolution::skill_name_from_path(&item.path),
-                ) {
-                    let _ = crate::evolution::maybe_propose_skill_evolution(
-                        &self.store,
-                        &self.home,
-                        fid,
-                        &skill,
-                    );
-                }
-            }
-            if item.source == learning::MODULE_STUDY_SOURCE {
-                if let Some(fid) = item.face_id.as_deref() {
-                    let _ = crate::evolution::maybe_propose_face_evolution(
-                        &self.store,
-                        &self.home,
-                        fid,
-                    );
-                }
-            }
-            if let Some(fid) = item.face_id.as_deref() {
-                let _ = crate::evolution::maybe_propose_method_evolution(
-                    &self.store,
-                    &self.home,
-                    fid,
-                );
-            }
-        }
-        Ok(item)
-    }
-
-    pub fn review_evolution(&self, id: &str, approve: bool) -> Result<EvolutionCandidate, CoreError> {
-        crate::evolution::review_evolution(&self.store, &self.home, id, approve)
-    }
-
-    pub async fn revise_knowledge_with_feedback(
-        &self,
-        id: &str,
-        feedback: &str,
-    ) -> Result<KnowledgeItem, CoreError> {
-        let mut item = self
-            .store
-            .get_knowledge(id)?
-            .ok_or_else(|| CoreError::KnowledgeNotFound(id.to_string()))?;
-        if !matches!(item.status, KnowledgeStatus::Candidate | KnowledgeStatus::Conflicted) {
-            return Err(CoreError::Other(format!(
-                "knowledge {id} is {} — only candidate/conflicted can be optimized",
-                item.status
-            )));
-        }
-        let src = self.home.join(&item.path);
-        let current = fs::read_to_string(&src)
-            .map_err(|e| CoreError::Other(format!("read candidate failed: {e}")))?;
-        let runtime = self.preferred_runtime(None);
-        let adapter = self.adapter(&runtime)?;
+        let root_paths = self.context_roots().into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+        let (goal_with_mentions, mentioned_dirs) = crate::mentions::prepare_prompt(goal, &root_paths);
+        let session_id = format!("learn_{}", Uuid::new_v4());
+        let protocol = fs::read_to_string(self.home.join("protocols/deliberate-learning.md"))
+            .unwrap_or_else(|_| "Clarify the goal, inspect evidence, challenge assumptions, verify counterexamples, and propose candidates for review.".into());
         let prompt = format!(
-            "You are revising a Methodus inbox candidate.\n\
-Return only the full revised markdown content.\n\
-Keep frontmatter keys and metadata unless obviously invalid.\n\
-Do not wrap in code fences.\n\n\
-Reviewer feedback:\n{feedback}\n\n\
-Current candidate markdown:\n\n{current}"
+            "You are the Methodus deliberate-learning runtime.\n\nLearning goal:\n{goal_with_mentions}\n\nFollow this protocol:\n{protocol}\n\nSeparate facts, inferences, contradictions, and unknowns. Ask consequential maintainer questions. Finish with a CandidateSet only when the evidence is sufficient; otherwise keep asking focused questions. Never claim a draft is canonical. When synthesis is ready, include a fenced `json` block with exactly {{\"candidates\":[{{\"type\":\"knowledge|method|experience\",\"kind\":\"...\",\"title\":\"...\",\"summary\":\"...\",\"learn\":\"...\",\"decide\":\"...\",\"execute\":\"...\",\"evidence\":\"...\",\"outcome\":\"...\",\"occurred_at\":\"...\",\"tags\":[\"...\"]}}],\"relations\":[],\"unresolved_questions\":[],\"contradictions\":[]}}."
         );
-        let cwd = self.workspace_root().join("_inbox_feedback");
-        fs::create_dir_all(&cwd)?;
-        let session_id = Uuid::new_v4().to_string();
-        let (handle, rx) = adapter
-            .spawn(SpawnInput {
-                prompt,
-                cwd,
-                session_id,
-                permission_mode: "plan".into(),
-                allowed_tools: Vec::new(),
-                sandbox: Some("read-only".into()),
-                extra_dirs: Vec::new(),
-                model: None,
-            })
-            .await?;
-        let collected = tokio::time::timeout(Duration::from_secs(60), collect_refine_text(rx)).await;
-        let _ = adapter.stop(&handle).await;
-        let revised_raw = match collected {
-            Ok(s) => s,
-            Err(_) => return Err(CoreError::Other("feedback optimize timeout".into())),
-        };
-        let revised = strip_markdown_fences(&revised_raw);
-        if revised.trim().is_empty() {
-            return Err(CoreError::Other("optimizer returned empty content".into()));
-        }
-        fs::write(&src, &revised)
-            .map_err(|e| CoreError::Other(format!("write candidate failed: {e}")))?;
-        item.content_hash = sha256_hex(revised.as_bytes());
-        item.updated_at = Utc::now();
-        self.store.update_knowledge(&item)?;
-        let _ = self.store.insert_event(
-            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
-            "knowledge.feedback_optimized",
-            &Utc::now().to_rfc3339(),
-            None,
-            None,
-            &serde_json::json!({"knowledge_id": id, "feedback": feedback}).to_string(),
-            None,
-        );
-        Ok(item)
-    }
-
-    pub fn answer_question(&self, id: &str, answer: &str) -> Result<Question, CoreError> {
-        let mut q = self
-            .store
-            .get_question(id)?
-            .ok_or_else(|| CoreError::QuestionNotFound(id.to_string()))?;
-        if q.status == QuestionStatus::Pending {
-            q.status = q.status.checked_transition(QuestionStatus::Asked)?;
-        }
-        q.status = q.status.checked_transition(QuestionStatus::Answered)?;
-        q.answer = Some(answer.to_string());
-        q.updated_at = Utc::now();
-        self.store.update_question(&q)?;
-        let _ = self.store.insert_event(
-            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
-            "question.answered",
-            &Utc::now().to_rfc3339(),
-            q.task_id.as_deref(),
-            None,
-            &serde_json::json!({"question_id": id}).to_string(),
-            None,
-        );
-        let refs = learning::JobRefs {
-            experience_id: None,
-            task_id: q.task_id.clone(),
-            face_id: q.face_id.clone(),
-            question_id: Some(q.id.clone()),
-            source: Some("user_answer".to_string()),
-        };
-        learning::enqueue_job(
-            &self.store,
-            JobKind::ProposeKnowledge,
-            &format!("propose:q:{}", q.id),
-            &refs,
-            20,
-        )?;
-        let _ = self.tick_learning()?;
-        Ok(q)
-    }
-
-    /// Human finished looking at a reviewing task (experience + candidates).
-    pub fn complete_review(&self, task_id: &str) -> Result<methodus_domain::Task, CoreError> {
-        let task = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        if task.status != TaskStatus::Reviewing {
-            return Err(CoreError::Other(format!(
-                "task {task_id} is {} — only reviewing tasks can be marked done",
-                task.status
-            )));
-        }
-        self.store
-            .update_task_status(task_id, TaskStatus::Completed)?;
-        let _ = self.store.insert_event(
-            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
-            "task.completed",
-            &Utc::now().to_rfc3339(),
-            Some(task_id),
-            None,
-            &serde_json::json!({"task_id": task_id}).to_string(),
-            None,
-        );
-        self.store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))
-    }
-
-    pub fn snooze_question(&self, id: &str) -> Result<Question, CoreError> {
-        let mut q = self
-            .store
-            .get_question(id)?
-            .ok_or_else(|| CoreError::QuestionNotFound(id.to_string()))?;
-        q.status = q.status.checked_transition(QuestionStatus::Snoozed)?;
-        q.not_before = Some(Utc::now() + learning::snooze_hours());
-        q.updated_at = Utc::now();
-        self.store.update_question(&q)?;
-        Ok(q)
-    }
-
-    pub fn dismiss_question(&self, id: &str) -> Result<Question, CoreError> {
-        let mut q = self
-            .store
-            .get_question(id)?
-            .ok_or_else(|| CoreError::QuestionNotFound(id.to_string()))?;
-        q.status = q.status.checked_transition(QuestionStatus::Dismissed)?;
-        q.updated_at = Utc::now();
-        self.store.update_question(&q)?;
-        Ok(q)
-    }
-
-    pub fn create_task(
-        &self,
-        title: &str,
-        request: &str,
-        face: Option<&str>,
-        runtime: Option<&str>,
-    ) -> Result<Task, CoreError> {
-        let cfg = UserConfig::load(&self.home);
-        let ctx = cfg.context_faces.as_deref().unwrap_or(&[]);
-        let resolution = resolution::resolve(resolution::ResolveOpts {
-            methodus_home: &self.home,
-            request,
-            requested_face: face,
-            requested_context_faces: Some(ctx),
-            requested_method: None,
-        })?;
-        if resolution.context_faces.len() >= 1 {
-            let _ = crate::multi_face::detect_cross_face_debates(
-                &self.store,
-                &self.home,
-                &resolution.all_face_ids(),
-                request,
-            )?;
-        }
-        let now = Utc::now();
-        let id_raw = Uuid::new_v4().to_string().replace('-', "");
-        let project_id = crate::project::focus_project(&self.home).map(|p| p.id);
-        let task = Task {
-            id: format!("task_{}", &id_raw[..12]),
-            title: title.to_string(),
-            request: request.to_string(),
-            project_id,
-            status: TaskStatus::Queued,
-            runtime: Some(self.preferred_runtime(runtime)),
-            workspace_id: None,
-            resolution: Some(resolution.to_json()),
-            version: 1,
-            created_at: now,
-            updated_at: now,
-        };
-        self.store.insert_task(&task)?;
-        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": title}).to_string());
-        Ok(task)
-    }
-
-    /// Create a graph-control task without resolving a Face or starting a managed
-    /// executor. This is the product's default task entry point: the runtime is
-    /// selected only when the capsule is compiled and then owns its native TUI.
-    pub fn create_control_task(
-        &self,
-        title: &str,
-        mode: &str,
-        runtime: Option<&str>,
-    ) -> Result<Task, CoreError> {
-        let now = Utc::now();
-        let id_raw = Uuid::new_v4().to_string().replace('-', "");
-        let task = Task {
-            id: format!("task_{}", &id_raw[..12]),
-            title: title.trim().to_string(),
-            request: title.trim().to_string(),
-            project_id: crate::project::focus_project(&self.home).map(|p| p.id),
-            status: TaskStatus::Queued,
-            runtime: Some(self.preferred_runtime(runtime)),
-            workspace_id: None,
-            resolution: Some(serde_json::json!({"mode": mode, "control_plane": "graph"}).to_string()),
-            version: 1,
-            created_at: now,
-            updated_at: now,
-        };
-        if task.title.is_empty() {
-            return Err(CoreError::Other("task title cannot be empty".into()));
-        }
-        self.store.insert_task(&task)?;
-        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": title, "mode": mode}).to_string());
-        Ok(task)
-    }
-
-    /// Close a native handoff with a human-authored outcome. Work tasks become
-    /// experience nodes; learn tasks additionally create an explicitly-reviewable
-    /// 5W2H knowledge candidate. Neither path asks Methodus to parse the Agent UI.
-    pub fn finalize_control_task(&self, task_id: &str, outcome: &str) -> Result<(), CoreError> {
-        let task = self.store.get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        if task.status == TaskStatus::Reviewing {
-            self.transition_task(&task, TaskStatus::Completed)?;
-        }
-        let is_learn = task.resolution.as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .and_then(|value| value.get("mode").and_then(|value| value.as_str()).map(str::to_string))
-            .as_deref() == Some("learn");
-        let slug = task.id.trim_start_matches("task_");
-        let now = Utc::now();
-        let links = task.workspace_id.as_deref()
-            .map(|id| self.store.list_context_selections(id))
-            .transpose()?
-            .unwrap_or_default()
-            .into_iter().map(|s| s.node_id).collect::<Vec<_>>();
-        let related = if links.is_empty() { "[]".to_string() } else { format!("[{}]", links.iter().map(|id| format!("\"{id}\"")).collect::<Vec<_>>().join(", ")) };
-        let experience_path = self.home.join("graph/experiences").join(format!("{slug}.md"));
-        fs::create_dir_all(experience_path.parent().expect("experience parent"))?;
-        fs::write(&experience_path, format!(
-            "---\nid: experience/{slug}\ntitle: \"{}\"\nnode_type: experience\nstatus: committed\nsummary: \"{}\"\nlinks:\n  learned_from: {related}\n---\n\n## Outcome\n\n{}\n\n## Evidence\n\n- Native runtime: {}\n- Capsule: {}\n",
-            yaml_quote(&task.title), yaml_quote(outcome), outcome.trim(), task.runtime.as_deref().unwrap_or("unknown"), task.workspace_id.as_deref().unwrap_or("none")
-        ))?;
-        if is_learn {
-            let knowledge_path = self.home.join("graph/knowledge").join(format!("candidate-{slug}.md"));
-            fs::create_dir_all(knowledge_path.parent().expect("knowledge parent"))?;
-            fs::write(&knowledge_path, format!(
-                "---\nid: knowledge/candidate-{slug}\ntitle: \"{}\"\nnode_type: knowledge\nstatus: candidate\nsummary: \"{}\"\nlinks:\n  derived_from: [\"experience/{slug}\"]\n---\n\n# 5W2H\n\n## What\n\n{}\n\n## Why\n\n待复盘确认其适用价值。\n\n## Who\n\n面向后续相关任务的 Agent 与操作者。\n\n## When\n\n当任务目标与本主题匹配时。\n\n## Where\n\n由 Methodus graph capsule 选择后注入。\n\n## How\n\n根据证据和复盘补充为可执行步骤。\n\n## How much\n\n按 capsule token 预算按需注入。\n\n## Evidence\n\n- experience/{slug}\n",
-                yaml_quote(&task.title), yaml_quote(outcome), outcome.trim()
-            ))?;
-        }
-        self.sync_graph()?;
-        self.emit_simple("task.reviewed", Some(task_id), &serde_json::json!({"outcome": outcome, "learn": is_learn, "at": now}).to_string());
-        Ok(())
-    }
-
-    /// Promote a Markdown graph candidate after an explicit review. The Markdown
-    /// file remains the source of truth; SQLite is refreshed only as its index.
-    pub fn promote_graph_candidate(&self, node_id: &str) -> Result<(), CoreError> {
-        let node = self.store.graph_node(node_id)?
-            .ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
-        let path = self.home.join(&node.path);
-        let raw = fs::read_to_string(&path)?;
-        let updated = raw.replacen("status: candidate", "status: committed", 1);
-        if updated == raw {
-            return Err(CoreError::Other(format!("{node_id} is not a candidate")));
-        }
-        fs::write(path, updated)?;
-        self.sync_graph()?;
-        self.emit_simple("graph.promoted", None, &serde_json::json!({"node_id": node_id}).to_string());
-        Ok(())
-    }
-
-    /// Ingest docs/standards into the focus project's knowledge corpus.
-    pub fn create_ingest_task(&self, sources: &[String]) -> Result<Task, CoreError> {
-        if sources.is_empty() {
-            return Err(CoreError::Other(
-                "/learn needs document sources — e.g. /learn @~/docs/standard.pdf".into(),
-            ));
-        }
-        let project = crate::project::focus_project(&self.home)
-            .ok_or_else(|| CoreError::Other("set a focus project in /setup first".into()))?;
-        let sources_block = sources
-            .iter()
-            .map(|s| format!("- {s}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let request = format!(
-            "Document ingest for project `{}`\n\n\
-             ## Sources\n\n{sources_block}\n\n\
-             Read sources in place. Extract stable facts with citations. \
-             Output ## Knowledge subsections for review.",
-            project.id
-        );
-        self.create_method_task(
-            "doc ingest",
-            &request,
-            crate::ingest::DOC_INGEST_METHOD_ID,
-            Some(project.id.as_str()),
-            None,
-        )
-    }
-
-    /// Survey the focus project repository layout into project notes.
-    pub fn create_survey_task(&self) -> Result<Task, CoreError> {
-        let project = crate::project::focus_project(&self.home)
-            .ok_or_else(|| CoreError::Other("set a focus project in /setup first".into()))?;
-        let root = project.root.display();
-        let request = format!(
-            "Repository survey: project `{}`\n\n\
-             Survey `{root}` only. Map layout, modules, build entry points. \
-             Write ## Project Notes — do not dump into global Faces.",
-            project.id
-        );
-        self.create_method_task(
-            "repo survey",
-            &request,
-            crate::ingest::REPO_SURVEY_METHOD_ID,
-            Some(project.id.as_str()),
-            None,
-        )
-    }
-
-    fn create_method_task(
-        &self,
-        title: &str,
-        request: &str,
-        method_id: &str,
-        project_id: Option<&str>,
-        study_sources: Option<Vec<String>>,
-    ) -> Result<Task, CoreError> {
-        let mut resolution = resolution::resolve(resolution::ResolveOpts {
-            methodus_home: &self.home,
-            request,
-            requested_face: None,
-            requested_context_faces: None,
-            requested_method: Some(method_id),
-        })?;
-        if resolution.method.as_ref().is_none_or(|m| m.id != method_id) {
-            return Err(CoreError::Other(format!("method `{method_id}` not installed")));
-        }
-        if let Some(src) = study_sources {
-            resolution.study_sources = src;
-        }
-        let now = Utc::now();
-        let id_raw = Uuid::new_v4().to_string().replace('-', "");
-        let task = Task {
-            id: format!("task_{}", &id_raw[..12]),
-            title: title.to_string(),
-            request: request.to_string(),
-            project_id: project_id.map(str::to_string),
-            status: TaskStatus::Queued,
-            runtime: Some(self.preferred_runtime(None)),
-            workspace_id: None,
-            resolution: Some(resolution.to_json()),
-            version: 1,
-            created_at: now,
-            updated_at: now,
-        };
-        self.store.insert_task(&task)?;
-        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": title}).to_string());
-        Ok(task)
-    }
-
-    pub fn review_hypothesis(
-        &self,
-        id: &str,
-        action: crate::hypothesis::HypothesisReviewAction,
-    ) -> Result<Hypothesis, CoreError> {
-        crate::hypothesis::review_hypothesis(&self.store, &self.home, id, action)
-    }
-
-    /// Remove workspace dirs for terminal tasks older than `max_age_days`.
-    pub fn cleanup_workspaces(&self, max_age_days: i64) -> Result<usize, CoreError> {
-        use std::time::SystemTime;
-        let cutoff = Utc::now() - chrono::Duration::days(max_age_days);
-        let mut removed = 0usize;
-        let ws_root = self.home.join("workspaces");
-        let Ok(entries) = fs::read_dir(&ws_root) else {
-            return Ok(0);
-        };
-        for entry in entries.flatten() {
-            let task_id = entry.file_name().to_string_lossy().into_owned();
-            let Ok(Some(task)) = self.store.get_task(&task_id) else {
-                continue;
-            };
-            if !task.status.is_terminal() {
-                continue;
-            }
-            if task.updated_at > cutoff {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                let _ = fs::remove_dir_all(&path);
-                removed += 1;
-                let _ = self.store.insert_event(
-                    &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
-                    "workspace.cleaned",
-                    &Utc::now().to_rfc3339(),
-                    Some(&task_id),
-                    None,
-                    &serde_json::json!({"path": path.display().to_string()}).to_string(),
-                    None,
-                );
-            }
-        }
-        let _ = SystemTime::now();
-        Ok(removed)
-    }
-
-    fn emit_simple(&self, event_type: &str, task_id: Option<&str>, payload: &str) {
-        let _ = self.store.insert_event(
-            &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
-            event_type,
-            &Utc::now().to_rfc3339(),
-            task_id,
-            None,
-            payload,
-            None,
-        );
-    }
-
-    /// Start a module-expert study task from user-specified paths/URLs (not the task workspace).
-    pub fn create_study_task(
-        &self,
-        scope: &str,
-        sources: &[String],
-        face: Option<&str>,
-    ) -> Result<Task, CoreError> {
-        if sources.is_empty() {
-            return Err(CoreError::Other(
-                "learn needs at least one path or URL — e.g. /learn nxm @~/docs/nxm https://…"
-                    .into(),
-            ));
-        }
-        let scope = scope.trim();
-        let title = if scope.is_empty() {
-            sources[0].chars().take(72).collect::<String>()
-        } else if scope.chars().count() > 72 {
-            format!("{}…", scope.chars().take(71).collect::<String>())
-        } else {
-            scope.to_string()
-        };
-        let sources_block = sources
-            .iter()
-            .map(|s| format!("- {s}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let topic = if scope.is_empty() {
-            title.clone()
-        } else {
-            scope.to_string()
-        };
-        let request = format!(
-            "Module expert study: {topic}\n\n\
-             ## Sources to read\n\n\
-             {sources_block}\n\n\
-             Read only the sources above (in place). Do not survey the task workspace. \
-             Synthesize structured knowledge and list open questions for your human mentor. \
-             Follow the module-expert-learning output format."
-        );
-        let face_id = crate::face_util::ensure_study_face(&self.home, scope, face)?;
-        let mut resolution = resolution::resolve(resolution::ResolveOpts {
-            methodus_home: &self.home,
-            request: &request,
-            requested_face: Some(&face_id),
-            requested_context_faces: None,
-            requested_method: Some(crate::curiosity::MODULE_EXPERT_METHOD_ID),
-        })?;
-        if resolution.method.as_ref().is_none_or(|m| {
-            m.id != crate::curiosity::MODULE_EXPERT_METHOD_ID
-        }) {
-            return Err(CoreError::Other(
-                "module-expert-learning method not installed — restart Methodus or check ~/.methodus/methods".into(),
-            ));
-        }
-        resolution.study_sources = sources.to_vec();
-        let now = Utc::now();
-        let id_raw = Uuid::new_v4().to_string().replace('-', "");
-        let task = Task {
-            id: format!("task_{}", &id_raw[..12]),
-            title,
-            request,
-            project_id: None,
-            status: TaskStatus::Queued,
-            runtime: Some(self.preferred_runtime(None)),
-            workspace_id: None,
-            resolution: Some(resolution.to_json()),
-            version: 1,
-            created_at: now,
-            updated_at: now,
-        };
-        self.store.insert_task(&task)?;
-        self.emit_simple("task.created", Some(&task.id), &serde_json::json!({"title": task.title}).to_string());
-        Ok(task)
-    }
-
-    /// Unified learn: user supplies sources; Methodus picks survey / ingest / module-expert.
-    pub fn create_learn_task(
-        &self,
-        hint: &str,
-        sources: &[String],
-        face: Option<&str>,
-    ) -> Result<(Task, crate::learn::LearnMode), CoreError> {
-        let (mode, scope) = crate::learn::plan_learn(&self.home, sources, hint)?;
-        let task = match mode {
-            crate::learn::LearnMode::RepoSurvey => self.create_survey_task()?,
-            crate::learn::LearnMode::DocIngest => self.create_ingest_task(sources)?,
-            crate::learn::LearnMode::ModuleExpert => {
-                self.create_study_task(&scope, sources, face)?
-            }
-        };
-        Ok((task, mode))
-    }
-
-    /// Reconcile every non-terminal session against pid liveness + `claude agents --json`.
-    pub async fn recover(&self) -> Result<Vec<RecoveredSession>, CoreError> {
-        let _ = scheduler::recover_jobs(&self.store)?;
-        let sessions = self.store.list_non_terminal_sessions()?;
-        let mut out = Vec::new();
-        for session in sessions {
-            if let Some(rec) = self.reconcile_session(&session).await? {
-                out.push(rec);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Cancel a task and interrupt any non-terminal sessions it owns.
-    pub fn cancel_task(&self, task_id: &str) -> Result<(), CoreError> {
-        let task = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        if !task.status.can_transition_to(&TaskStatus::Cancelled) {
-            return Err(CoreError::TaskNotCancellable(
-                task_id.to_string(),
-                task.status.to_string(),
-            ));
-        }
-        for session in self.store.list_sessions_for_task(task_id)? {
-            self.interrupt_session(&session)?;
-        }
-        self.store
-            .update_task_status(task_id, TaskStatus::Cancelled)?;
-        Ok(())
-    }
-
-    /// Drop a terminal task from the list (failed / cancelled / completed).
-    pub fn delete_task(&self, task_id: &str) -> Result<(), CoreError> {
-        let task = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        if !task.status.is_terminal() {
-            return Err(CoreError::TaskNotDeletable(
-                task_id.to_string(),
-                task.status.to_string(),
-            ));
-        }
-        let paths = self.store.delete_task(task_id)?;
-        for path in paths {
-            let p = PathBuf::from(&path);
-            if p.is_dir() {
-                let _ = fs::remove_dir_all(&p);
-            }
-        }
-        Ok(())
-    }
-
-    /// Cancel one session and, if the parent task is still open, cancel it too.
-    pub fn cancel_session(&self, session_id: &str) -> Result<(), CoreError> {
-        let session = self
-            .store
-            .get_session(session_id)?
-            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
-        if session.status.is_terminal() {
-            return Err(CoreError::SessionNotCancellable(
-                session_id.to_string(),
-                session.status.to_string(),
-            ));
-        }
-        self.interrupt_session(&session)?;
-        if let Some(task) = self.store.get_task(&session.task_id)? {
-            if task.status.can_transition_to(&TaskStatus::Cancelled) {
-                self.store
-                    .update_task_status(&task.id, TaskStatus::Cancelled)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn interrupt_session(&self, session: &Session) -> Result<(), CoreError> {
-        if session.status.is_terminal() {
-            return Ok(());
-        }
-        if let Some(pid) = session.pid {
-            terminate_pid(pid);
-        }
-        let next = if session
-            .status
-            .can_transition_to(&SessionStatus::Interrupted)
-        {
-            SessionStatus::Interrupted
-        } else if session.status.can_transition_to(&SessionStatus::Failed) {
-            SessionStatus::Failed
-        } else {
-            return Ok(());
-        };
-        self.store.update_session_status(&session.id, next)?;
-        Ok(())
-    }
-
-    /// Persist a user chat line so transcripts reload as a conversation.
-    pub fn record_user_message(&self, task_id: &str, text: &str) -> Result<(), CoreError> {
-        let _ = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        let payload = serde_json::to_string(&RuntimeEvent::UserText {
-            text: text.to_string(),
-        })
-        .unwrap_or_default();
-        self.store.insert_event(
-            &format!("ev_user_{}", Uuid::new_v4().to_string().replace('-', "")),
-            "user.message",
-            &Utc::now().to_rfc3339(),
-            Some(task_id),
-            None,
-            &payload,
-            None,
-        )?;
-        Ok(())
-    }
-
-    /// Send a user turn: first run on queued tasks, follow-up `--resume` on reviewing ones.
-    pub async fn send_turn(
-        &self,
-        task_id: &str,
-        prompt: &str,
-    ) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            return Err(CoreError::EmptyMessage);
-        }
-        let task = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        self.record_user_message(task_id, prompt)?;
-        let resume = matches!(
-            task.status,
-            TaskStatus::Reviewing | TaskStatus::WaitingUser | TaskStatus::Running
-        );
-        self.run_task_inner(task_id, resume, Some(prompt.to_string()))
-            .await
-    }
-
-    /// Run a task: build workspace, spawn or resume executor, stream events, persist, save experience.
-    pub async fn run_task(
-        &self,
-        task_id: &str,
-        resume: bool,
-    ) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
-        self.run_task_inner(task_id, resume, None).await
-    }
-
-    async fn run_task_inner(
-        &self,
-        task_id: &str,
-        resume: bool,
-        follow_up: Option<String>,
-    ) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
-        let mut task = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-
-        if matches!(
-            task.status,
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-        ) {
-            return Err(CoreError::TaskNotRunnable(
-                task_id.to_string(),
-                task.status.to_string(),
-            ));
-        }
-
-        if let Some(pending) = self
-            .store
-            .list_pending_approvals(Some(task_id))?
-            .into_iter()
-            .next()
-        {
-            return Err(CoreError::NeedsApproval(task_id.to_string(), pending.id));
-        }
-
-        let resume_sid = self.prepare_run(&task, resume).await?;
-
-        // Reload after reconcile may have moved the task to waiting_user.
-        task = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-
-        match task.status {
-            TaskStatus::Queued => self.transition_task(&task, TaskStatus::Planning)?,
-            TaskStatus::Planning
-            | TaskStatus::WaitingUser
-            | TaskStatus::Running
-            | TaskStatus::Reviewing => {}
-            other => {
-                return Err(CoreError::TaskNotRunnable(
-                    task_id.to_string(),
-                    other.to_string(),
-                ));
-            }
-        }
-
-        let resolution = resolution_from_task(&task, &self.home)?;
-        let is_study = !resolution.study_sources.is_empty();
-        let face_ids = resolution.all_face_ids();
-        let face_refs: Vec<&str> = face_ids.iter().map(String::as_str).collect();
-        let snippets = if is_study {
-            Vec::new()
-        } else {
-            learning::select_committed_knowledge_multi(
-                &self.store,
-                &self.home,
-                &face_refs,
-                &task.request,
-            )?
-        };
-        let notes = if is_study {
-            Vec::new()
-        } else {
-            crate::refine::select_committed_notes(
-                &self.store,
-                &self.home,
-                &face_refs,
-                &task.request,
-            )?
-        };
-        let inventory = learning::render_injected_inventory(&notes, &snippets);
-        if !is_study {
-            let _ = learning::record_injections(
-                &self.store,
-                &self.home,
-                task_id,
-                &notes,
-                &snippets,
-            )?;
-        }
-        let mut context = resolution.to_context_markdown(&task.title, &task.request);
-        if !is_study {
-            context.push_str(&inventory);
-            if let Some(ref pid) = task.project_id {
-                if let Some(proj) = crate::project::list_projects(&self.home)
-                    .into_iter()
-                    .find(|p| p.id == *pid)
-                {
-                    context.push_str(&format!(
-                        "\n## Project\n\nRoot: `{}`\nWrites inside this tree are in-scope when the user asks.\n",
-                        proj.root.display()
-                    ));
-                }
-            }
-            context.push_str(&crate::refine::render_notes_context(&notes));
-            context.push_str(&learning::render_knowledge_context(&snippets));
-        } else {
-            context.push_str(&crate::curiosity::render_study_sources(
-                &resolution.study_sources,
-            ));
-        }
-        let named_roots = if is_study {
-            crate::curiosity::study_named_roots(&self.home, &resolution.study_sources)?
-        } else {
-            self.context_roots()
-        };
-        context.push_str(&crate::mentions::render_readable_dirs(&named_roots));
-        let mention_source = follow_up.as_deref().unwrap_or(&task.request);
-        let mentions = crate::mentions::resolve_named(mention_source, &named_roots);
-        context.push_str(&crate::mentions::render_attached(&mentions));
-        let extra_dirs = crate::mentions::readable_dirs(&named_roots);
-        let ws_root = WorkspaceBuilder::build(&self.workspace_root(), task_id, &context)?;
-        WorkspaceBuilder::write_injected(&ws_root, &inventory)?;
-        WorkspaceBuilder::write_plan(&ws_root, &resolution.to_plan_markdown(&task.title))?;
-        let knowledge_files: Vec<(String, PathBuf)> = notes
-            .iter()
-            .chain(snippets.iter())
-            .map(|s| (s.dest_name.clone(), s.src_path.clone()))
-            .collect();
-        WorkspaceBuilder::materialize_knowledge(&ws_root, &knowledge_files)?;
-
-        let face_yaml = if !resolution.face_dir.is_empty() {
-            PathBuf::from(&resolution.face_dir).join("face.yaml")
-        } else {
-            self.home
-                .join("faces")
-                .join(&resolution.face_id)
-                .join("face.yaml")
-        };
-        if face_yaml.is_file() {
-            let dest = ws_root.join("face-context").join(&resolution.face_id);
-            fs::create_dir_all(&dest)?;
-            fs::copy(&face_yaml, dest.join("face.yaml"))?;
-        }
-        for ctx in &resolution.context_faces {
-            if ctx.face_dir.is_empty() {
-                continue;
-            }
-            let ctx_yaml = PathBuf::from(&ctx.face_dir).join("face.yaml");
-            if ctx_yaml.is_file() {
-                let dest = ws_root.join("face-context").join(&ctx.id);
-                fs::create_dir_all(&dest)?;
-                let _ = fs::copy(&ctx_yaml, dest.join("face.yaml"));
-            }
-        }
-
-        let method_src = resolution.method.as_ref().map(|m| PathBuf::from(&m.path));
-        let skill_files: Vec<(String, PathBuf)> = resolution
-            .skills
-            .iter()
-            .map(|s| (s.name.clone(), PathBuf::from(&s.path)))
-            .collect();
-        WorkspaceBuilder::materialize_resolution(&ws_root, method_src.as_deref(), &skill_files)?;
-
-        let ws_id = format!("ws_{task_id}");
-        self.store.insert_workspace(
-            &ws_id,
-            task_id,
-            ws_root.to_str().unwrap_or(""),
-            "active",
-            &Utc::now().to_rfc3339(),
-        )?;
-        self.store.update_task_workspace(task_id, &ws_id)?;
-        self.emit_simple(
-            "workspace.created",
-            Some(task_id),
-            &serde_json::json!({"workspace_id": ws_id, "path": ws_root.to_string_lossy()}).to_string(),
-        );
-
-        task = self
-            .store
-            .get_task(task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(task_id.to_string()))?;
-        match task.status {
-            TaskStatus::Planning | TaskStatus::WaitingUser | TaskStatus::Reviewing => {
-                self.transition_task(&task, TaskStatus::Running)?;
-            }
-            TaskStatus::Running => {}
-            other => {
-                return Err(CoreError::TaskNotRunnable(
-                    task_id.to_string(),
-                    other.to_string(),
-                ));
-            }
-        }
-
-        let session_id = Uuid::new_v4().to_string();
-        let session = Session {
-            id: session_id.clone(),
-            task_id: task_id.to_string(),
-            runtime: task
-                .runtime
-                .clone()
-                .unwrap_or_else(|| self.preferred_runtime(None)),
-            executor_sid: resume_sid.clone(),
-            transport: "subprocess".to_string(),
-            pid: None,
-            cwd: ws_root.to_str().unwrap_or("").to_string(),
-            status: SessionStatus::Spawning,
-            last_turn: None,
-            started_at: Utc::now(),
-            ended_at: None,
-            updated_at: Utc::now(),
-        };
-        self.store.insert_session(&session)?;
-
-        let spawn_input_prompt = {
-            let body = if let Some(text) = follow_up {
-                text
-            } else if resume_sid.is_some() {
-                format!(
-                    "The previous session was interrupted. Continue from where you left off.\n\n\
-                     Original request:\n{}",
-                    task.request
-                )
-            } else {
-                task.request.clone()
-            };
-            if resume_sid.is_none() {
-                format!(
-                    "{body}\n\n\
-                     Follow `.methodus/selected-context.md`. \
-                     Load listed skills from `.claude/skills/` with the Skill tool, \
-                     or read each `SKILL.md` and follow it."
-                )
-            } else {
-                body
-            }
-        };
-
-        let runtime_name = task
-            .runtime
-            .clone()
-            .unwrap_or_else(|| self.preferred_runtime(None));
-        let adapter = self.adapter(&runtime_name)?;
-        let permission_mode =
-            policy::PermissionMode::parse(UserConfig::load(&self.home).permission_mode.as_deref());
-        let allowed_tools = policy::spawn_allowed_tools(permission_mode);
-        let _ = self
-            .store
-            .set_session_allowed_tools(&session_id, &allowed_tools);
-
-        self.launch_turns(LaunchTurns {
-            adapter,
-            runtime: runtime_name,
-            task_id: task_id.to_string(),
-            session_id,
-            workspace: ws_root,
-            face_id: Some(resolution.face_id),
-            method_id: resolution.method.as_ref().map(|m| m.id.clone()),
-            task_title: task.title.clone(),
-            task_request: task.request.clone(),
-            prompt: spawn_input_prompt,
-            executor_sid: resume_sid.clone(),
-            allowed_tools,
-            next_is_resume: resume_sid.is_some(),
-            extra_dirs,
-        })
-    }
-
-    /// Resolve a pending approval and, when none remain, resume the executor turn.
-    pub async fn approve(
-        &self,
-        approval_id: &str,
-        decision: ApprovalDecision,
-        actor: &str,
-    ) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
-        let approval = self
-            .store
-            .get_approval(approval_id)?
-            .ok_or_else(|| CoreError::ApprovalNotFound(approval_id.to_string()))?;
-        if approval.decision.is_some() {
-            return Err(CoreError::ApprovalResolved(approval_id.to_string()));
-        }
-
-        self.store
-            .resolve_approval(approval_id, &decision.to_string(), actor)?;
-        let _ = self.store.insert_event(
-            &format!("evt_{approval_id}_resolved"),
-            "approval.resolved",
-            &Utc::now().to_rfc3339(),
-            Some(&approval.task_id),
-            Some(&approval.session_id),
-            &serde_json::json!({ "id": approval_id, "decision": decision.to_string() }).to_string(),
-            None,
-        );
-
-        let task = self
-            .store
-            .get_task(&approval.task_id)?
-            .ok_or_else(|| CoreError::TaskNotFound(approval.task_id.clone()))?;
-        let session = self
-            .store
-            .get_session(&approval.session_id)?
-            .ok_or_else(|| {
-                CoreError::Other(format!("session not found: {}", approval.session_id))
-            })?;
-
-        if decision == ApprovalDecision::Abort {
-            if task.status.can_transition_to(&TaskStatus::Cancelled) {
-                self.store
-                    .update_task_status(&task.id, TaskStatus::Cancelled)?;
-            }
-            if session
-                .status
-                .can_transition_to(&SessionStatus::Interrupted)
-            {
-                self.store
-                    .update_session_status(&session.id, SessionStatus::Interrupted)?;
-            }
-            let (tx, rx) = mpsc::channel(1);
-            drop(tx);
-            return Ok(rx);
-        }
-
-        let mut allowed = self.store.get_session_allowed_tools(&session.id)?;
-        match decision {
-            ApprovalDecision::Once | ApprovalDecision::Session => {
-                policy::grant_tools(&mut allowed, [approval.tool_name.clone()]);
-                if decision == ApprovalDecision::Session {
-                    self.store
-                        .set_session_allowed_tools(&session.id, &allowed)?;
-                }
-            }
-            ApprovalDecision::Deny => {}
-            ApprovalDecision::Abort => {}
-        }
-
-        let remaining = self.store.list_pending_approvals(Some(&task.id))?;
-        if !remaining.is_empty() {
-            let (tx, rx) = mpsc::channel(1);
-            drop(tx);
-            return Ok(rx);
-        }
-
-        let runtime_name = session.runtime.clone();
-        let adapter = self.adapter(&runtime_name)?;
-        let prompt = match decision {
-            ApprovalDecision::Deny => format!(
-                "The user denied tool `{}`. Continue the original task without it.\n\nOriginal request:\n{}",
-                approval.tool_name, task.request
-            ),
-            _ => format!(
-                "The user approved additional tools. Continue the original task.\n\nOriginal request:\n{}",
-                task.request
-            ),
-        };
-
-        if task.status.can_transition_to(&TaskStatus::Running) {
-            self.store
-                .update_task_status(&task.id, TaskStatus::Running)?;
-        }
-        if session.status.can_transition_to(&SessionStatus::Running) {
-            self.store
-                .update_session_status(&session.id, SessionStatus::Running)?;
-        }
-
-        self.launch_turns(LaunchTurns {
-            adapter,
-            runtime: runtime_name,
-            task_id: task.id.clone(),
-            session_id: session.id.clone(),
-            workspace: PathBuf::from(&session.cwd),
-            face_id: resolution_from_task(&task, &self.home)
-                .ok()
-                .map(|r| r.face_id),
-            method_id: resolution_from_task(&task, &self.home)
-                .ok()
-                .and_then(|r| r.method.map(|m| m.id)),
-            task_title: task.title.clone(),
-            task_request: task.request.clone(),
+        self.write_learn_state(&session_id, goal, &runtime, Some(permission_mode), "running", None)?;
+        self.record_learning_sources(&session_id, goal)?;
+        let mut extra_dirs = root_paths;
+        extra_dirs.extend(mentioned_dirs);
+        extra_dirs.extend(source_directories(&self.launch_cwd, goal));
+        extra_dirs.sort(); extra_dirs.dedup();
+        let spawn = adapter.spawn(SpawnInput {
             prompt,
-            executor_sid: session.executor_sid.clone(),
-            allowed_tools: allowed,
-            next_is_resume: session.executor_sid.is_some(),
-            extra_dirs: crate::mentions::readable_dirs(&self.context_roots()),
-        })
-    }
-
-    fn launch_turns(&self, launch: LaunchTurns) -> Result<mpsc::Receiver<RuntimeEvent>, CoreError> {
-        let (caller_tx, caller_rx) = mpsc::channel(256);
-        let permission_mode =
-            policy::PermissionMode::parse(UserConfig::load(&self.home).permission_mode.as_deref());
-        let runner = TurnRunner {
-            store: self.store.clone(),
-            adapter: launch.adapter,
-            home: self.home.clone(),
-            workspace: launch.workspace,
-            task_id: launch.task_id,
-            session_id: launch.session_id,
-            face_id: launch.face_id,
-            method_id: launch.method_id,
-            task_title: launch.task_title,
-            task_request: launch.task_request,
-            caller_tx,
-            permission_mode,
-            runtime: launch.runtime,
-            extra_dirs: launch.extra_dirs,
+            cwd: self.launch_cwd.clone(),
+            session_id: session_id.clone(),
+            permission_mode: permission_mode.into(),
+            allowed_tools: vec!["Read".into(), "Glob".into(), "Grep".into(), "WebSearch".into()],
+            sandbox: Some(sandbox.into()),
+            extra_dirs,
+            model: None,
+        }).await;
+        let (handle, events) = match spawn {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.mark_learning_status(&session_id, "failed");
+                return Err(error.into());
+            }
         };
-        tokio::spawn(runner.run(
-            launch.prompt,
-            launch.executor_sid,
-            launch.allowed_tools,
-            launch.next_is_resume,
-        ));
-        Ok(caller_rx)
+        self.write_learn_state(&session_id, goal, &runtime, Some(permission_mode), "running", handle.executor_sid.as_deref())?;
+        Ok((handle, events))
     }
 
-    fn transition_task(&self, task: &Task, next: TaskStatus) -> Result<(), CoreError> {
-        if task.status == next {
-            return Ok(());
+    /// Continue the same focused Learn conversation using the runtime executor ID.
+    pub async fn continue_learning(&self, runtime: &str, permission_mode: &str, executor_sid: &str, session_id: &str, prompt: &str) -> Result<(SessionHandle, mpsc::Receiver<RuntimeEvent>), CoreError> {
+        let adapter = self.adapter(runtime)?;
+        let (permission_mode, sandbox) = permission_profile(permission_mode);
+        let root_paths = self.context_roots().into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+        let (prompt_with_mentions, mentioned_dirs) = crate::mentions::prepare_prompt(prompt, &root_paths);
+        let mut extra_dirs = root_paths;
+        extra_dirs.extend(mentioned_dirs);
+        extra_dirs.extend(source_directories(&self.launch_cwd, prompt));
+        extra_dirs.sort(); extra_dirs.dedup();
+        let resume = adapter.resume(executor_sid, SpawnInput {
+            prompt: prompt_with_mentions, cwd: self.launch_cwd.clone(), session_id: session_id.into(),
+            permission_mode: permission_mode.into(), allowed_tools: vec!["Read".into(), "Glob".into(), "Grep".into(), "WebSearch".into()],
+            sandbox: Some(sandbox.into()), extra_dirs, model: None,
+        }).await;
+        let (handle, events) = match resume {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.mark_learning_status(session_id, "failed");
+                return Err(error.into());
+            }
+        };
+        let goal = self.list_learning_runs()?.into_iter().find(|run| run.run_id == session_id).map(|run| run.goal).unwrap_or_else(|| prompt.into());
+        self.write_learn_state(session_id, &goal, runtime, Some(permission_mode), "running", handle.executor_sid.as_deref().or(Some(executor_sid)))?;
+        self.record_learning_sources(session_id, prompt)?;
+        Ok((handle, events))
+    }
+
+    /// Write a Learn transcript and a review-only CandidateSet. The candidates
+    /// are deliberately separate from canonical Personal/Team content.
+    pub fn record_learning_output(&self, goal: &str, output: &str) -> Result<Vec<String>, CoreError> {
+        let run_id = format!("learn_{}", Uuid::new_v4());
+        self.record_learning_output_for_run(&run_id, goal, output)
+    }
+
+    pub fn record_learning_output_for_run(&self, run_id: &str, goal: &str, output: &str) -> Result<Vec<String>, CoreError> {
+        let run_root = self.home.join("runs").join(&run_id);
+        fs::create_dir_all(&run_root)?;
+        let runtime = self.list_learning_runs()?.into_iter().find(|run| run.run_id == run_id).map(|run| run.runtime).unwrap_or_else(|| "unknown".into());
+        let existing = self.list_learning_runs()?.into_iter().find(|run| run.run_id == run_id);
+        self.write_learn_state(run_id, goal, &runtime, existing.as_ref().map(|run| run.permission_mode.as_str()), "awaiting_review", existing.as_ref().and_then(|run| run.executor_sid.as_deref()))?;
+        fs::write(run_root.join("assistant.md"), output.trim())?;
+        self.record_learning_sources(run_id, goal)?;
+
+        let slug = slug_for_learning(goal);
+        let suffix = run_id.strip_prefix("learn_").unwrap_or(&run_id).chars().take(8).collect::<String>();
+        let candidates_root = self.home.join("personal/candidates");
+        fs::create_dir_all(&candidates_root)?;
+        let set = extract_candidate_set(output).unwrap_or_else(|| CandidateSet {
+            candidates: Vec::new(),
+            relations: Vec::new(),
+            unresolved_questions: vec!["runtime did not return a structured CandidateSet".into()],
+            contradictions: Vec::new(),
+            runtime_skills: Vec::new(),
+        });
+        let runtime_skills = set.runtime_skills.clone();
+        let drafts = set.candidates;
+        let candidate_ids = drafts.iter().enumerate().map(|(index, draft)| {
+            let node_type = match draft.node_type.to_ascii_lowercase().as_str() { "method" => "method", "experience" => "experience", _ => "knowledge" };
+            (node_type.to_string(), format!("{node_type}/candidate-{slug}-{suffix}-{index}"))
+        }).collect::<Vec<_>>();
+        let (links, unresolved_relations) = candidate_links(&set.relations, &drafts, &candidate_ids);
+        let mut unresolved_questions = set.unresolved_questions.clone();
+        unresolved_questions.extend(unresolved_relations);
+        let review_notes = format!(
+            "### Unresolved questions\n\n{}\n\n### Contradictions\n\n{}",
+            if unresolved_questions.is_empty() { "none".into() } else { unresolved_questions.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n") },
+            if set.contradictions.is_empty() { "none".into() } else { set.contradictions.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n") },
+        );
+        let state = LearnRunState {
+            run_id: run_id.into(), kind: "learn".into(), status: "awaiting_review".into(), goal: goal.trim().into(),
+            runtime,
+            permission_mode: existing.as_ref().map(|run| run.permission_mode.clone()).unwrap_or_else(default_permission_mode),
+            executor_sid: existing.and_then(|run| run.executor_sid),
+            unresolved_questions,
+            contradictions: set.contradictions.clone(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        fs::write(run_root.join("state.yaml"), serde_yaml::to_string(&state).map_err(|error| CoreError::Other(format!("serialize Learn state: {error}")))?)?;
+        let mut ids = Vec::new();
+        for (index, draft) in drafts.into_iter().enumerate() {
+            let node_type = match draft.node_type.to_ascii_lowercase().as_str() { "method" => "method", "experience" => "experience", _ => "knowledge" };
+            let kind = yaml_quote(draft.kind.as_deref().unwrap_or(if node_type == "experience" { "case" } else if node_type == "method" { "workflow" } else { "procedure" }));
+            let title = yaml_quote(if draft.title.trim().is_empty() { goal } else { &draft.title });
+            let summary = yaml_quote(draft.summary.as_deref().unwrap_or("Learning runtime proposal awaiting maintainer review."));
+            let id = candidate_ids[index].1.clone();
+            let tags = if draft.tags.is_empty() { "[]".into() } else { format!("[{}]", draft.tags.iter().map(|tag| format!("\"{}\"", yaml_quote(tag))).collect::<Vec<_>>().join(", ")) };
+            let evidence = draft.evidence.as_deref().unwrap_or("Evidence is recorded in the Learn run and must be checked during Review.").to_string();
+            let evidence = if node_type == "experience" && !runtime_skills.is_empty() {
+                let observations = runtime_skills.iter().map(|skill| format!("- {} · runtime: {} · outcome: {} · {}", skill.name, skill.runtime.as_deref().unwrap_or("unknown"), skill.outcome.as_deref().unwrap_or("observed"), skill.reason.as_deref().unwrap_or("no reason recorded"))).collect::<Vec<_>>().join("\n");
+                format!("{evidence}\n\n### Runtime Skills observed\n\n{observations}")
+            } else { evidence };
+            let experience_meta = if node_type == "experience" {
+                let mut meta = String::new();
+                if let Some(outcome) = draft.outcome.as_deref().filter(|value| !value.trim().is_empty()) { meta.push_str(&format!("outcome: \"{}\"\n", yaml_quote(outcome))); }
+                if let Some(occurred_at) = draft.occurred_at.as_deref().filter(|value| !value.trim().is_empty()) { meta.push_str(&format!("occurred_at: \"{}\"\n", yaml_quote(occurred_at))); }
+                meta
+            } else { String::new() };
+            let body = format!(
+                "---\nid: {id}\ntitle: \"{title}\"\nnode_type: {node_type}\nkind: {kind}\nstatus: candidate\nvisibility: personal\nsummary: \"{summary}\"\ntags: {tags}\n{experience_meta}sources:\n  - path: runs/{run_id}/assistant.md\n    type: learn-run\n  - path: runs/{run_id}/sources.yaml\n    type: learn-source-manifest\n{}---\n\n## Learn\n\n{}\n\n## Decide\n\n{}\n\n## Execute\n\n{}\n\n## Evidence\n\n{}\n\n## Review notes\n\n{}\n\n- Learn run: runs/{run_id}/assistant.md\n- Source manifest: runs/{run_id}/sources.yaml\n- Goal: {}\n",
+                links.get(&id).map(|value| format!("links:\n{value}")).unwrap_or_else(|| "links: {}\n".into()),
+                draft.learn.as_deref().unwrap_or(output),
+                draft.decide.as_deref().unwrap_or("Review applicability, alternatives, boundaries, and contradictions before promotion."),
+                draft.execute.as_deref().unwrap_or("Rewrite this section into a compact, safe rule before exposing it to an Agent runtime."),
+                evidence,
+                review_notes,
+                yaml_quote(goal),
+            );
+            fs::write(candidates_root.join(format!("{node_type}-{slug}-{run_id}-{index}.md")), body)?;
+            ids.push(id);
         }
-        task.status.checked_transition(next.clone())?;
-        self.store.update_task_status(&task.id, next)?;
+        self.sync_graph()?;
+        Ok(ids)
+    }
+
+    pub fn promote_graph_candidate(&self, node_id: &str) -> Result<(), CoreError> {
+        let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
+        if node.status.as_deref() != Some("candidate") { return Err(CoreError::Other(format!("{node_id} is not a candidate"))); }
+        let path = self.node_path(&node)?;
+        self.ensure_reviewable_path(&node.path)?;
+        let raw = fs::read_to_string(&path)?;
+        let updated = replace_frontmatter_value(&raw, "status", "candidate", "committed").ok_or_else(|| CoreError::Other(format!("{node_id} has no candidate status")))?;
+        let root = if node.visibility == "team" { self.team_root() } else { self.home.join("personal") };
+        let dir = root.join(match node.node_type.as_str() { "knowledge" => "knowledge", "method" => "methods", "experience" => "experiences", other => return Err(CoreError::Other(format!("unsupported candidate type: {other}"))) });
+        fs::create_dir_all(&dir)?;
+        let target = dir.join(path.file_name().ok_or_else(|| CoreError::Other("candidate has no filename".into()))?);
+        if target != path && target.exists() { return Err(CoreError::Other(format!("canonical target already exists: {} (use merge instead)", target.display()))); }
+        fs::write(&target, updated)?;
+        if path != target { fs::remove_file(path)?; }
+        self.record_review_action(node_id, "commit", "candidate approved in Methodus Review")?;
+        self.sync_graph()?;
         Ok(())
     }
 
-    async fn prepare_run(&self, task: &Task, resume: bool) -> Result<Option<String>, CoreError> {
-        let sessions = self.store.list_sessions_for_task(&task.id)?;
-        let mut latest_executor_sid: Option<String> = None;
-        let mut had_interrupted = false;
-
-        for session in &sessions {
-            if !session.status.is_terminal() {
-                if let Some(rec) = self.reconcile_session(session).await? {
-                    if rec.still_live {
-                        let pid = session.pid.unwrap_or(0);
-                        return Err(CoreError::SessionLive(pid));
-                    }
-                    had_interrupted = true;
-                    if rec.executor_sid.is_some() {
-                        latest_executor_sid = rec.executor_sid;
-                    }
-                }
-            } else if session.status == SessionStatus::Interrupted {
-                had_interrupted = true;
-                if session.executor_sid.is_some() && latest_executor_sid.is_none() {
-                    latest_executor_sid = session.executor_sid.clone();
-                }
-            } else if latest_executor_sid.is_none() {
-                latest_executor_sid = session.executor_sid.clone();
-            }
-        }
-
-        if resume {
-            return latest_executor_sid
-                .clone()
-                .ok_or_else(|| CoreError::NothingToResume(task.id.clone()))
-                .map(Some);
-        }
-
-        if had_interrupted && latest_executor_sid.is_some() {
-            return Err(CoreError::NeedsResume);
-        }
-
-        // A finished turn (reviewing) still has an executor thread to continue.
-        if matches!(task.status, TaskStatus::Reviewing) && latest_executor_sid.is_some() {
-            return Ok(latest_executor_sid);
-        }
-
-        Ok(None)
+    pub fn reject_graph_candidate(&self, node_id: &str) -> Result<(), CoreError> {
+        let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
+        if node.status.as_deref() != Some("candidate") { return Err(CoreError::Other(format!("{node_id} is not a candidate"))); }
+        let path = self.node_path(&node)?;
+        let raw = fs::read_to_string(&path)?;
+        let updated = replace_frontmatter_value(&raw, "status", "candidate", "rejected").ok_or_else(|| CoreError::Other(format!("{node_id} has no candidate status")))?;
+        fs::write(path, updated)?;
+        self.record_review_action(node_id, "reject", "candidate rejected in Methodus Review")?;
+        self.sync_graph()?;
+        Ok(())
     }
 
-    async fn reconcile_session(
-        &self,
-        session: &Session,
-    ) -> Result<Option<RecoveredSession>, CoreError> {
-        if session.status.is_terminal() {
-            return Ok(None);
+    /// Mark a committed or stale node as historical. Deprecated nodes remain
+    /// readable through explicit Agent history queries but are never selected by
+    /// normal retrieval.
+    pub fn deprecate_graph_node(&self, node_id: &str, rationale: &str) -> Result<(), CoreError> {
+        let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
+        let status = node.status.as_deref().unwrap_or("committed");
+        if !matches!(status, "committed" | "stale") {
+            return Err(CoreError::Other(format!("{node_id} cannot be deprecated from status {status}")));
         }
-
-        if session.status == SessionStatus::WaitingUser {
-            return Ok(None);
-        }
-
-        let pid_alive = session.pid.map(process_is_alive).unwrap_or(false);
-        let agent_alive = self
-            .agent_is_live(&session.runtime, session.executor_sid.as_deref())
-            .await;
-
-        if pid_alive || agent_alive {
-            return Ok(Some(RecoveredSession {
-                task_id: session.task_id.clone(),
-                session_id: session.id.clone(),
-                executor_sid: session.executor_sid.clone(),
-                still_live: true,
-            }));
-        }
-
-        session
-            .status
-            .checked_transition(SessionStatus::Interrupted)?;
-        self.store
-            .update_session_status(&session.id, SessionStatus::Interrupted)?;
-
-        if let Some(task) = self.store.get_task(&session.task_id)? {
-            if matches!(task.status, TaskStatus::Running | TaskStatus::Planning)
-                && task.status.can_transition_to(&TaskStatus::WaitingUser)
-            {
-                self.store
-                    .update_task_status(&task.id, TaskStatus::WaitingUser)?;
-            }
-        }
-
-        Ok(Some(RecoveredSession {
-            task_id: session.task_id.clone(),
-            session_id: session.id.clone(),
-            executor_sid: session.executor_sid.clone(),
-            still_live: false,
-        }))
+        let path = self.node_path(&node)?;
+        let raw = fs::read_to_string(&path)?;
+        // `stale` is a projection state derived from source fingerprints; the
+        // authored Markdown may still say `committed`. Preserve that source
+        // contract while allowing an explicitly reviewed archive action.
+        let authored_status = crate::graph::read_graph_document(&self.home, &path)?.node.status.unwrap_or_else(|| "committed".into());
+        let updated = replace_frontmatter_value(&raw, "status", &authored_status, "deprecated")
+            .ok_or_else(|| CoreError::Other(format!("{node_id} has no editable status frontmatter")))?;
+        fs::write(path, updated)?;
+        self.record_review_action(node_id, "deprecate", rationale)?;
+        self.sync_graph()?;
+        Ok(())
     }
 
-    async fn agent_is_live(&self, runtime: &str, executor_sid: Option<&str>) -> bool {
-        let Some(sid) = executor_sid else {
-            return false;
+    /// Revalidate a stale node against its recorded local source fingerprints.
+    /// Revalidation never changes the body or source declaration.
+    pub fn revalidate_graph_node(&self, node_id: &str, rationale: &str) -> Result<(), CoreError> {
+        let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
+        if node.status.as_deref() != Some("stale") {
+            return Err(CoreError::Other(format!("{node_id} is not stale")));
+        }
+        let path = self.node_path(&node)?;
+        let document = crate::graph::read_graph_document(&self.home, &path)?;
+        if crate::graph::sources_are_stale_now(&self.home, &document.sources) {
+            return Err(CoreError::Other(format!("{node_id} still has changed or missing evidence")));
+        }
+        let raw = fs::read_to_string(&path)?;
+        // A stale row is derived at sync time. If the authored file already
+        // says committed, revalidation only records the maintainer decision.
+        if document.node.status.as_deref() == Some("stale") {
+            let updated = replace_frontmatter_value(&raw, "status", "stale", "committed")
+                .ok_or_else(|| CoreError::Other(format!("{node_id} has no editable status frontmatter")))?;
+            fs::write(path, updated)?;
+        }
+        self.record_review_action(node_id, "revalidate", rationale)?;
+        self.sync_graph()?;
+        Ok(())
+    }
+
+    pub fn promote_candidate_to_team(&self, node_id: &str) -> Result<(), CoreError> {
+        let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
+        if node.status.as_deref() != Some("candidate") { return Err(CoreError::Other(format!("{node_id} is not a candidate"))); }
+        let path = self.node_path(&node)?;
+        self.ensure_reviewable_path(&node.path)?;
+        let raw = fs::read_to_string(&path)?;
+        let updated = if raw.lines().any(|line| line.trim_start().starts_with("visibility:")) {
+            replace_frontmatter_value(&raw, "visibility", "personal", "team").unwrap_or(raw)
+        } else {
+            raw.replacen("---\n", "---\nvisibility: team\n", 1)
         };
-        let Ok(adapter) = self.adapter(runtime) else {
-            return false;
-        };
-        match adapter.list_live_agents().await {
-            Ok(agents) => agents.iter().any(|a| a.session_id == sid),
-            Err(_) => false,
-        }
+        let dir = self.team_root().join(match node.node_type.as_str() {
+            "knowledge" => "knowledge", "method" => "methods", "experience" => "experiences",
+            other => return Err(CoreError::Other(format!("unsupported candidate type: {other}"))),
+        });
+        fs::create_dir_all(&dir)?;
+        let target = dir.join(path.file_name().ok_or_else(|| CoreError::Other("candidate has no filename".into()))?);
+        if target != path && target.exists() { return Err(CoreError::Other(format!("Team target already exists: {}", target.display()))); }
+        fs::write(&target, updated)?;
+        if path != target { fs::remove_file(path)?; }
+        self.record_review_action(node_id, "mark_team", "candidate marked for Team visibility")?;
+        self.sync_graph()?;
+        Ok(())
+    }
+
+    pub fn merge_graph_candidate(&self, candidate_id: &str, target_id: &str) -> Result<(), CoreError> {
+        let candidate = self.store.graph_node(candidate_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {candidate_id}")))?;
+        let target = self.store.graph_node(target_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {target_id}")))?;
+        if candidate.status.as_deref() != Some("candidate") || candidate.node_type != "knowledge" || target.node_type != "knowledge" || target.status.as_deref() != Some("committed") { return Err(CoreError::Other("merge requires a candidate Knowledge and a committed Knowledge target".into())); }
+        let candidate_path = self.node_path(&candidate)?;
+        let target_path = self.node_path(&target)?;
+        self.ensure_reviewable_path(&candidate.path)?;
+        let candidate_doc = crate::graph::read_graph_document(&self.home, &candidate_path)?;
+        let target_raw = fs::read_to_string(&target_path)?;
+        fs::write(&target_path, format!("{}\n\n## Merged evidence from {}\n\n{}\n", target_raw.trim_end(), candidate_id, candidate_doc.body.trim()))?;
+        let raw = fs::read_to_string(&candidate_path)?;
+        let updated = replace_frontmatter_value(&raw, "status", "candidate", "rejected").unwrap_or(raw);
+        let updated = if updated.lines().any(|line| line.trim_start().starts_with("merged_into:")) { updated } else { updated.replacen("---\n", &format!("---\nmerged_into: {target_id}\n"), 1) };
+        fs::write(candidate_path, updated)?;
+        self.record_review_action(candidate_id, "merge", &format!("merged into {target_id}"))?;
+        self.sync_graph()?;
+        Ok(())
+    }
+
+    fn record_review_action(&self, node_id: &str, action: &str, rationale: &str) -> Result<(), CoreError> {
+        let path = self.home.join("runs/reviews.jsonl");
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        let record = serde_json::json!({
+            "at": Utc::now().to_rfc3339(),
+            "node_id": node_id,
+            "action": action,
+            "rationale": rationale.trim(),
+        });
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(file, "{}", serde_json::to_string(&record).unwrap_or_else(|_| "{}".into()))?;
+        Ok(())
+    }
+
+    fn ensure_reviewable_path(&self, relative_path: &str) -> Result<(), CoreError> {
+        let errors = crate::graph::validate_graph(&self.home)?.into_iter()
+            .filter(|issue| issue.path == relative_path && issue.severity == crate::graph::IssueSeverity::Error)
+            .map(|issue| issue.message)
+            .collect::<Vec<_>>();
+        if errors.is_empty() { Ok(()) } else { Err(CoreError::Other(format!("Review blocked: {}", errors.join("; ")))) }
+    }
+
+    fn node_path(&self, node: &GraphNode) -> Result<PathBuf, CoreError> {
+        let relative = Path::new(&node.path);
+        if relative.is_absolute() || relative.components().any(|component| component == std::path::Component::ParentDir) { return Err(CoreError::Other(format!("unsafe graph path: {}", node.path))); }
+        Ok(self.home.join(relative))
     }
 }
 
-fn terminate_pid(pid: u32) {
-    if pid <= 1 || pid == std::process::id() || !process_is_alive(pid) {
-        return;
-    }
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
-}
+fn yaml_quote(value: &str) -> String { value.replace('"', "'").replace('\n', " ").trim().to_string() }
 
-fn resolution_from_task(task: &Task, home: &std::path::Path) -> Result<Resolution, CoreError> {
-    if let Some(raw) = &task.resolution {
-        if let Some(res) = Resolution::parse_json(raw) {
-            if !res.face_id.is_empty() {
-                return Ok(res);
-            }
-        }
-    }
-    resolution::resolve(resolution::ResolveOpts {
-        methodus_home: home,
-        request: &task.request,
-        requested_face: None,
-        requested_context_faces: None,
-        requested_method: None,
-    })
-}
-
-fn write_session_json(
-    ws_root: &std::path::Path,
-    session_id: &str,
-    executor_sid: Option<&str>,
-    pid: Option<u32>,
-) -> Result<(), CoreError> {
-    let body = serde_json::json!({
-        "methodus_session_id": session_id,
-        "executor_sid": executor_sid,
-        "pid": pid,
-    });
-    fs::write(
-        ws_root.join(".methodus/session.json"),
-        serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()),
-    )?;
-    Ok(())
-}
-
-struct LaunchTurns {
-    adapter: Arc<dyn RuntimeAdapter>,
-    runtime: String,
-    task_id: String,
-    session_id: String,
-    workspace: PathBuf,
-    face_id: Option<String>,
-    method_id: Option<String>,
-    task_title: String,
-    task_request: String,
-    prompt: String,
-    executor_sid: Option<String>,
-    allowed_tools: Vec<String>,
-    next_is_resume: bool,
-    extra_dirs: Vec<PathBuf>,
-}
-
-struct TurnRunner {
-    store: Arc<Store>,
-    adapter: Arc<dyn RuntimeAdapter>,
-    home: PathBuf,
-    workspace: PathBuf,
-    task_id: String,
-    session_id: String,
-    face_id: Option<String>,
-    method_id: Option<String>,
-    task_title: String,
-    task_request: String,
-    caller_tx: mpsc::Sender<RuntimeEvent>,
-    permission_mode: policy::PermissionMode,
-    runtime: String,
-    extra_dirs: Vec<PathBuf>,
-}
-
-struct TurnOutcome {
-    result_text: String,
-    is_error: bool,
-    denials: Vec<PermissionDenial>,
-    executor_sid: Option<String>,
-}
-
-impl TurnRunner {
-    async fn run(
-        self,
-        mut prompt: String,
-        mut executor_sid: Option<String>,
-        mut allowed_tools: Vec<String>,
-        mut next_is_resume: bool,
-    ) {
-        for _turn in 0..MAX_AUTO_TURNS {
-            let permission_mode = self.permission_mode.as_str().to_string();
-            let sandbox = if self.runtime == "codex" {
-                Some(self.permission_mode.codex_sandbox().to_string())
-            } else {
-                None
-            };
-            let spawn_input = SpawnInput {
-                prompt: prompt.clone(),
-                cwd: self.workspace.clone(),
-                session_id: self.session_id.clone(),
-                permission_mode,
-                allowed_tools: allowed_tools.clone(),
-                sandbox,
-                extra_dirs: self.extra_dirs.clone(),
-                model: None,
-            };
-
-            let spawn_res = if next_is_resume {
-                if let Some(ref sid) = executor_sid {
-                    self.adapter.resume(sid, spawn_input).await
-                } else {
-                    self.adapter.spawn(spawn_input).await
-                }
-            } else {
-                self.adapter.spawn(spawn_input).await
-            };
-
-            let (handle, event_rx) = match spawn_res {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = self
-                        .caller_tx
-                        .send(RuntimeEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
-                    let _ = self
-                        .store
-                        .update_session_status(&self.session_id, SessionStatus::Failed);
-                    if let Ok(Some(task)) = self.store.get_task(&self.task_id) {
-                        if task.status.can_transition_to(&TaskStatus::Failed) {
-                            let _ = self
-                                .store
-                                .update_task_status(&self.task_id, TaskStatus::Failed);
-                        }
-                    }
-                    return;
-                }
-            };
-
-            let _ = self.store.set_session_pid(&self.session_id, handle.pid);
-            if let Some(ref sid) = handle.executor_sid {
-                let _ = self.store.set_executor_sid(&self.session_id, sid);
-                executor_sid = Some(sid.clone());
-            }
-            let _ = write_session_json(
-                &self.workspace,
-                &self.session_id,
-                handle.executor_sid.as_deref(),
-                handle.pid,
-            );
-
-            let ctx = RelayCtx {
-                caller_tx: self.caller_tx.clone(),
-                store: self.store.clone(),
-                workspace: self.workspace.clone(),
-                task_id: self.task_id.clone(),
-                session_id: self.session_id.clone(),
-                pid: handle.pid,
-                runtime: self.runtime.clone(),
-            };
-            let outcome = persist_turn(event_rx, ctx).await;
-            if let Some(sid) = outcome.executor_sid.clone() {
-                executor_sid = Some(sid);
-            }
-
-            if outcome.denials.is_empty() {
-                finish_task(&self, &outcome.result_text, outcome.is_error);
-                return;
-            }
-
-            let (auto, user) = policy::split_denials(&outcome.denials, self.permission_mode);
-            policy::grant_tools(&mut allowed_tools, auto.into_iter().map(|d| d.tool_name));
-            let _ = self
-                .store
-                .set_session_allowed_tools(&self.session_id, &allowed_tools);
-
-            if user.is_empty() {
-                next_is_resume = executor_sid.is_some();
-                prompt =
-                    "Continue. Previously blocked read-only tools are now allowed.".to_string();
-                continue;
-            }
-
-            pause_for_approval(&self, user).await;
-            return;
-        }
-
-        let _ = self
-            .caller_tx
-            .send(RuntimeEvent::Error {
-                message: "too many auto-resume turns without completion".to_string(),
-            })
-            .await;
-        if let Ok(Some(task)) = self.store.get_task(&self.task_id) {
-            if task.status.can_transition_to(&TaskStatus::Failed) {
-                let _ = self
-                    .store
-                    .update_task_status(&self.task_id, TaskStatus::Failed);
-            }
-        }
-    }
-}
-
-async fn pause_for_approval(runner: &TurnRunner, denials: Vec<PermissionDenial>) {
-    if let Ok(Some(task)) = runner.store.get_task(&runner.task_id) {
-        if task.status.can_transition_to(&TaskStatus::WaitingUser) {
-            let _ = runner
-                .store
-                .update_task_status(&runner.task_id, TaskStatus::WaitingUser);
-        }
-    }
-    if let Ok(Some(session)) = runner.store.get_session(&runner.session_id) {
-        if session
-            .status
-            .can_transition_to(&SessionStatus::WaitingUser)
-        {
-            let _ = runner
-                .store
-                .update_session_status(&runner.session_id, SessionStatus::WaitingUser);
-        }
-    }
-
-    for denial in denials {
-        let id_raw = Uuid::new_v4().to_string().replace('-', "");
-        let id = format!("appr_{}", &id_raw[..12]);
-        let input_json = denial.tool_input.to_string();
-        let approval = Approval {
-            id: id.clone(),
-            session_id: runner.session_id.clone(),
-            task_id: runner.task_id.clone(),
-            subject: format!("{} {}", denial.tool_name, input_json),
-            tool_name: denial.tool_name.clone(),
-            tool_use_id: denial.tool_use_id.clone(),
-            tool_input: input_json,
-            decision: None,
-            actor: None,
-            requested_at: Utc::now(),
-            resolved_at: None,
-        };
-        let _ = runner.store.insert_approval(&approval);
-        let payload = serde_json::to_string(&approval).unwrap_or_default();
-        let _ = runner.store.insert_event(
-            &format!("evt_{id}_req"),
-            "approval.requested",
-            &Utc::now().to_rfc3339(),
-            Some(&runner.task_id),
-            Some(&runner.session_id),
-            &payload,
-            None,
-        );
-        let _ = runner
-            .caller_tx
-            .send(RuntimeEvent::ApprovalRequested {
-                id,
-                tool_name: denial.tool_name,
-                input: denial.tool_input,
-            })
-            .await;
-    }
-}
-
-fn finish_task(runner: &TurnRunner, result_text: &str, is_error: bool) {
-    let final_status = if is_error {
-        SessionStatus::Failed
+fn source_token(token: &str, cwd: &Path) -> Option<String> {
+    let token = token.strip_prefix('@')?.trim_matches(|ch: char| ",.;:!?()[]{}<>".contains(ch));
+    if token.is_empty() { return None; }
+    let path_like = token.starts_with('/') || token.starts_with("~/") || token == "." || token == ".." || token.contains('/') || token.contains('.');
+    let path = if token == "~" || token.starts_with("~/") {
+        std::env::var_os("HOME").map(PathBuf::from).map(|home| if token == "~" { home } else { home.join(token.trim_start_matches("~/")) })
     } else {
-        SessionStatus::Exited
+        Some(Path::new(token).is_absolute().then(|| PathBuf::from(token)).unwrap_or_else(|| cwd.join(token)))
     };
-    let _ = runner
-        .store
-        .update_session_status(&runner.session_id, final_status);
+    (path_like || path.is_some_and(|path| path.exists())).then(|| token.to_string())
+}
 
-    if let Ok(Some(task)) = runner.store.get_task(&runner.task_id) {
-        if is_error {
-            if task.status.can_transition_to(&TaskStatus::Failed) {
-                let _ = runner
-                    .store
-                    .update_task_status(&runner.task_id, TaskStatus::Failed);
-            }
-        } else if task.status.can_transition_to(&TaskStatus::Reviewing) {
-            let _ = runner
-                .store
-                .update_task_status(&runner.task_id, TaskStatus::Reviewing);
+fn resolve_source_path(cwd: &Path, token: &str) -> (PathBuf, String) {
+    if token == "~" || token.starts_with("~/") {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            return (home.join(token.trim_start_matches("~/")), token.to_string());
         }
     }
-
-    let _ = save_experience_direct(runner, result_text, is_error);
-    let _ = crate::scheduler::tick(&runner.store, &runner.home);
+    let path = Path::new(token);
+    if path.is_absolute() { (path.to_path_buf(), token.to_string()) } else { (cwd.join(path), token.to_string()) }
 }
 
-struct RelayCtx {
-    caller_tx: mpsc::Sender<RuntimeEvent>,
-    store: Arc<Store>,
-    workspace: PathBuf,
-    task_id: String,
-    session_id: String,
-    pid: Option<u32>,
-    runtime: String,
+fn source_directories(cwd: &Path, text: &str) -> Vec<PathBuf> {
+    text.split_whitespace().filter_map(|token| source_token(token, cwd)).map(|token| {
+        let (path, _) = resolve_source_path(cwd, &token);
+        if path.is_dir() { path } else { path.parent().unwrap_or(cwd).to_path_buf() }
+    }).filter(|path| path.is_dir()).collect()
 }
 
-async fn persist_turn(mut event_rx: mpsc::Receiver<RuntimeEvent>, ctx: RelayCtx) -> TurnOutcome {
-    let mut seq: i64 = 0;
-    let mut result_text = String::new();
-    let mut is_error = false;
-    let mut denials = Vec::new();
-    let mut executor_sid = None;
-    let transcript = ctx.workspace.join("transcript/events.jsonl");
+fn extract_candidate_set(answer: &str) -> Option<CandidateSet> {
+    let mut cursor = 0;
+    while let Some(start) = answer[cursor..].find("```") {
+        let start = cursor + start;
+        let after_fence = &answer[start + 3..];
+        let content_start = after_fence.find('\n').map(|offset| start + 3 + offset + 1)?;
+        let end = answer[content_start..].find("```").map(|offset| content_start + offset)?;
+        let json = answer[content_start..end].trim();
+        if let Ok(set) = serde_json::from_str::<CandidateSet>(json) {
+            return Some(set);
+        }
+        cursor = end + 3;
+    }
+    None
+}
 
-    while let Some(event) = event_rx.recv().await {
-        seq += 1;
-        let evt_id = format!(
-            "evt_{}_{seq}",
-            &ctx.session_id[..8.min(ctx.session_id.len())]
-        );
-        let event_type = match &event {
-            RuntimeEvent::SessionStarted { .. } => "session.started",
-            RuntimeEvent::UserText { .. } => "user.message",
-            RuntimeEvent::AssistantText { .. } => "session.output",
-            RuntimeEvent::Thinking { .. } => "session.thinking",
-            RuntimeEvent::ToolCallStarted { .. } => "session.tool_start",
-            RuntimeEvent::ToolCallCompleted { .. } => "session.tool_done",
-            RuntimeEvent::TurnCompleted { .. } => "session.turn_done",
-            RuntimeEvent::Result { .. } => "session.result",
-            RuntimeEvent::ApprovalRequested { .. } => "approval.requested",
-            RuntimeEvent::Error { .. } => "session.error",
+fn candidate_links(relations: &[CandidateRelation], drafts: &[CandidateDraft], ids: &[(String, String)]) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut grouped = BTreeMap::<String, BTreeMap<String, Vec<String>>>::new();
+    let mut unresolved = Vec::new();
+    for relation in relations {
+        let Some(from) = resolve_candidate_ref(&relation.from, drafts, ids) else {
+            unresolved.push(format!("unresolved relation source: {}", relation.from));
+            continue;
         };
-        let payload = serde_json::to_string(&event).unwrap_or_default();
-        let _ = ctx.store.insert_event(
-            &evt_id,
-            event_type,
-            &Utc::now().to_rfc3339(),
-            Some(&ctx.task_id),
-            Some(&ctx.session_id),
-            &payload,
-            Some(seq),
-        );
-        let _ = append_transcript(&transcript, &payload);
-
-        match &event {
-            RuntimeEvent::SessionStarted { session_id } => {
-                let _ = ctx.store.set_executor_sid(&ctx.session_id, session_id);
-                let _ =
-                    write_session_json(&ctx.workspace, &ctx.session_id, Some(session_id), ctx.pid);
-                executor_sid = Some(session_id.clone());
-            }
-            RuntimeEvent::Result {
-                text,
-                is_error: err,
-                session_id,
-                permission_denials,
-                cost_usd,
-                usage,
-            } => {
-                result_text = text.clone();
-                is_error = *err;
-                denials = permission_denials.clone();
-                if let Some(sid) = session_id {
-                    let _ = ctx.store.set_executor_sid(&ctx.session_id, sid);
-                    executor_sid = Some(sid.clone());
-                }
-                let delta = UsageDelta::from_result(*cost_usd, usage.as_ref());
-                let _ = ctx.store.insert_usage(
-                    Some(&ctx.task_id),
-                    Some(&ctx.session_id),
-                    Some(&ctx.runtime),
-                    &delta,
-                );
-            }
-            _ => {}
+        let Some(to) = resolve_candidate_ref(&relation.to, drafts, ids) else {
+            unresolved.push(format!("unresolved relation target: {}", relation.to));
+            continue;
+        };
+        let relation_name = relation.relation.trim();
+        if relation_name.is_empty() || !relation_name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')) {
+            unresolved.push(format!("relation between {from} and {to} has an invalid relation type"));
+            continue;
         }
-
-        if ctx.caller_tx.send(event).await.is_err() {
-            break;
-        }
+        grouped.entry(from).or_default().entry(relation_name.to_string()).or_default().push(to);
     }
-
-    TurnOutcome {
-        result_text,
-        is_error,
-        denials,
-        executor_sid,
-    }
+    let links = grouped.into_iter().map(|(from, relations)| {
+        let yaml = relations.into_iter().map(|(relation, targets)| {
+            let values = targets.into_iter().map(|target| format!("    - {target}")).collect::<Vec<_>>().join("\n");
+            format!("  {relation}:\n{values}")
+        }).collect::<Vec<_>>().join("\n");
+        (from, yaml)
+    }).collect();
+    (links, unresolved)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+fn resolve_candidate_ref(value: &str, drafts: &[CandidateDraft], ids: &[(String, String)]) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() { return None; }
+    if let Ok(index) = value.strip_prefix("candidate-").unwrap_or(value).parse::<usize>() {
+        return ids.get(index).map(|(_, id)| id.clone());
+    }
+    if value.contains('/') && value.chars().all(|ch| !ch.is_whitespace() && !matches!(ch, ':' | '[' | ']' | '{' | '}')) { return Some(value.to_string()); }
+    drafts.iter().position(|draft| draft.title.eq_ignore_ascii_case(value)).and_then(|index| ids.get(index).map(|(_, id)| id.clone()))
 }
 
-fn event_on_date(occurred_at: &str, day: chrono::NaiveDate) -> bool {
-    DateTime::parse_from_rfc3339(occurred_at)
-        .map(|d| d.date_naive() == day)
-        .unwrap_or(false)
+fn replace_frontmatter_value(raw: &str, key: &str, from: &str, to: &str) -> Option<String> {
+    let rest = raw.strip_prefix("---\n")?;
+    let end = rest.find("\n---\n")?;
+    let front_end = 4 + end;
+    let (front, marker_and_body) = raw.split_at(front_end);
+    let body = marker_and_body.strip_prefix("\n---\n")?;
+    let mut replaced = false;
+    let lines = front.lines().map(|line| {
+        let prefix = format!("{key}:");
+        if line.trim_start().starts_with(&prefix) && line.split_once(':').map(|(_, value)| value.trim().trim_matches('"').trim_matches('\'') == from).unwrap_or(false) {
+            replaced = true;
+            format!("{key}: {to}")
+        } else { line.to_string() }
+    }).collect::<Vec<_>>().join("\n");
+    replaced.then(|| format!("{lines}\n---\n{body}"))
 }
 
-async fn collect_refine_text(mut rx: mpsc::Receiver<RuntimeEvent>) -> String {
-    let mut last = String::new();
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            RuntimeEvent::Result {
-                is_error: true, ..
-            } => return String::new(),
-            RuntimeEvent::Result { text, .. } => {
-                if !text.trim().is_empty() {
-                    return text;
-                }
-                return last;
-            }
-            RuntimeEvent::AssistantText { text } => last = text,
-            RuntimeEvent::Error { .. } => return String::new(),
-            _ => {}
-        }
-    }
-    last
-}
-
-fn strip_markdown_fences(text: &str) -> String {
-    let t = text.trim();
-    if !t.starts_with("```") {
-        return t.to_string();
-    }
-    let mut lines = t.lines();
-    let _ = lines.next();
-    let mut out = Vec::new();
-    for line in lines {
-        if line.trim_start().starts_with("```") {
-            break;
-        }
-        out.push(line);
-    }
-    out.join("\n").trim().to_string()
-}
-
-fn append_transcript(path: &std::path::Path, line: &str) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{line}")?;
-    Ok(())
-}
-
-fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
-}
-
-fn save_experience_direct(
-    runner: &TurnRunner,
-    result_text: &str,
-    is_error: bool,
-) -> Result<(), CoreError> {
-    let now = Utc::now();
-    let exp_id_raw = Uuid::new_v4().to_string().replace('-', "");
-    let exp_id = format!("exp_{}", &exp_id_raw[..12]);
-    let face = runner
-        .face_id
-        .clone()
-        .unwrap_or_else(|| "general".to_string());
-    let rel = format!("faces/{face}/experiences/{exp_id}.md");
-    let abs = runner.home.join(&rel);
-    if let Some(parent) = abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let outcome = if is_error { "failed" } else { "success" };
-    let summary = truncate_utf8_prefix(result_text, 500);
-    let mode_line = if runner.method_id.as_deref()
-        == Some(crate::curiosity::MODULE_EXPERT_METHOD_ID)
-    {
-        "         - mode: module_expert\n"
-    } else {
-        ""
-    };
-
-    let body = format!(
-        "# Experience `{exp_id}`\n\n\
-         - task: `{task}`\n\
-         - face: `{face}`\n\
-         - outcome: {outcome}\n\
-{mode_line}\
-         - created: {ts}\n\n\
-         ## Request\n\n\
-         {title}\n\n\
-         {request}\n\n\
-         ## Result\n\n\
-         {result}\n",
-        task = runner.task_id,
-        ts = now.to_rfc3339(),
-        title = runner.task_title,
-        request = runner.task_request,
-        result = result_text,
-        mode_line = mode_line,
-    );
-    fs::write(&abs, &body)?;
-    let hash = sha256_hex(body.as_bytes());
-
-    let exp = Experience {
-        id: exp_id,
-        task_id: runner.task_id.clone(),
-        face_id: Some(face.clone()),
-        path: rel,
-        content_hash: hash,
-        outcome: Some(outcome.to_string()),
-        summary: Some(summary),
-        created_at: now,
-        updated_at: now,
-    };
-    runner.store.insert_experience(&exp)?;
-    let _ = runner.store.insert_event(
-        &format!("ev_{}", Uuid::new_v4().to_string().replace('-', "")),
-        "experience.created",
-        &now.to_rfc3339(),
-        Some(&runner.task_id),
-        None,
-        &serde_json::json!({"experience_id": exp.id, "face_id": face}).to_string(),
-        None,
-    );
-    let _ = learning::enqueue_extract(&runner.store, &exp);
-    Ok(())
+fn slug_for_learning(value: &str) -> String {
+    let mut slug = value.chars().filter_map(|ch| if ch.is_ascii_alphanumeric() { Some(ch.to_ascii_lowercase()) } else if ch.is_whitespace() || ch == '-' || ch == '_' { Some('-') } else { None }).collect::<String>();
+    while slug.contains("--") { slug = slug.replace("--", "-"); }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() { "learning-result".into() } else { slug.chars().take(48).collect() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use methodus_runtime::{LiveAgent, RuntimeError, SessionHandle};
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
-    fn truncate_utf8_prefix_respects_char_boundary() {
-        let s = "中".repeat(200); // 600 bytes
-        let out = truncate_utf8_prefix(&s, 500);
-        assert!(out.len() <= 500);
-        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    fn permission_profiles_are_bounded_and_never_bypass() {
+        assert_eq!(permission_profile("plan"), ("plan", "read-only"));
+        assert_eq!(permission_profile("cautious"), ("cautious", "workspace-write"));
+        assert_eq!(permission_profile("acceptEdits"), ("acceptEdits", "workspace-write"));
+        assert_eq!(permission_profile("bypassPermissions"), ("plan", "read-only"));
     }
 
-    struct MockAdapter {
-        turns: Mutex<VecDeque<Vec<RuntimeEvent>>>,
-        live: Vec<LiveAgent>,
+    #[test]
+    fn extracts_structured_candidate_set_from_runtime_response() {
+        let answer = "结论如下：\n```json\n{\"candidates\":[{\"type\":\"knowledge\",\"kind\":\"diagnostic-signal\",\"title\":\"Previous shutdown reason\",\"learn\":\"Read the reason first.\",\"tags\":[\"shutdown\"]}]}\n```";
+        let set = extract_candidate_set(answer).unwrap();
+        assert_eq!(set.candidates.len(), 1);
+        assert_eq!(set.candidates[0].node_type, "knowledge");
+        assert_eq!(set.candidates[0].kind.as_deref(), Some("diagnostic-signal"));
     }
 
-    impl MockAdapter {
-        fn take_turn(&self) -> Vec<RuntimeEvent> {
-            self.turns.lock().unwrap().pop_front().unwrap_or_default()
-        }
+    #[test]
+    fn empty_candidate_set_remains_a_no_publish_learning_result() {
+        let set = extract_candidate_set("```json\n{\"candidates\":[],\"unresolved_questions\":[\"scope\"]}\n```").unwrap();
+        assert!(set.candidates.is_empty());
+        assert_eq!(set.unresolved_questions, vec!["scope"]);
     }
 
-    #[async_trait]
-    impl RuntimeAdapter for MockAdapter {
-        async fn spawn(
-            &self,
-            input: SpawnInput,
-        ) -> Result<(SessionHandle, mpsc::Receiver<RuntimeEvent>), RuntimeError> {
-            let (tx, rx) = mpsc::channel(16);
-            for event in self.take_turn() {
-                let _ = tx.send(event).await;
-            }
-            drop(tx);
-            Ok((
-                SessionHandle {
-                    session_id: input.session_id,
-                    executor_sid: Some("exec-sid-1".to_string()),
-                    pid: None,
-                },
-                rx,
-            ))
-        }
-
-        async fn resume(
-            &self,
-            executor_sid: &str,
-            input: SpawnInput,
-        ) -> Result<(SessionHandle, mpsc::Receiver<RuntimeEvent>), RuntimeError> {
-            let (handle, rx) = self.spawn(input).await?;
-            Ok((
-                SessionHandle {
-                    session_id: handle.session_id,
-                    executor_sid: Some(executor_sid.to_string()),
-                    pid: handle.pid,
-                },
-                rx,
-            ))
-        }
-
-        async fn stop(&self, _handle: &SessionHandle) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
-        async fn list_live_agents(&self) -> Result<Vec<LiveAgent>, RuntimeError> {
-            Ok(self.live.clone())
-        }
-
-        fn uses_manual_permissions(&self) -> bool {
-            true
-        }
+    #[test]
+    fn frontmatter_replacement_preserves_markdown_body() {
+        let raw = "---\nstatus: candidate\ntitle: Note\n---\n\n## Learn\nBody\n";
+        let updated = replace_frontmatter_value(raw, "status", "candidate", "committed").unwrap();
+        assert!(updated.contains("status: committed"));
+        assert!(updated.contains("## Learn\nBody"));
     }
 
-    fn ok_result(text: &str) -> RuntimeEvent {
-        RuntimeEvent::Result {
-            is_error: false,
-            text: text.to_string(),
-            cost_usd: None,
-            usage: None,
-            session_id: Some("exec-sid-1".to_string()),
-            permission_denials: Vec::new(),
-        }
-    }
-
-    fn engine_with(events: Vec<RuntimeEvent>) -> (Engine, tempfile::TempDir) {
-        engine_with_turns(vec![events])
-    }
-
-    fn engine_with_turns(turns: Vec<Vec<RuntimeEvent>>) -> (Engine, tempfile::TempDir) {
+    #[test]
+    fn learning_output_preserves_run_state_and_materializes_relations() {
         let dir = tempdir().unwrap();
-        let store = Arc::new(Store::open(&dir.path().join("state.db")).unwrap());
-        let adapter = Arc::new(MockAdapter {
-            turns: Mutex::new(turns.into()),
-            live: vec![],
-        });
-        (Engine::new(store, adapter, dir.path().to_path_buf()), dir)
+        fs::create_dir_all(dir.path().join("personal/candidates")).unwrap();
+        let engine = Engine::with_runtimes(Arc::new(Store::open_memory().unwrap()), dir.path().to_path_buf(), HashMap::new());
+        let run_id = "learn_test";
+        engine.write_learn_state(run_id, "shutdown diagnosis", "claude-code", Some("plan"), "awaiting_input", Some("exec-1")).unwrap();
+        let output = "```json\n{\"candidates\":[{\"type\":\"knowledge\",\"kind\":\"signal\",\"title\":\"Reason\",\"summary\":\"Read reason\",\"learn\":\"Explain\"},{\"type\":\"experience\",\"kind\":\"incident\",\"title\":\"Case\",\"summary\":\"A case\",\"learn\":\"Observed\"}],\"relations\":[{\"from\":\"candidate-0\",\"relation\":\"validated_by\",\"to\":\"candidate-1\"}],\"unresolved_questions\":[\"scope?\"],\"contradictions\":[\"old claim\"],\"runtime_skills\":[{\"name\":\"repo-survey\",\"runtime\":\"claude-code\",\"outcome\":\"useful\",\"reason\":\"found the source\"}]}\n```";
+        let ids = engine.record_learning_output_for_run(run_id, "shutdown diagnosis", output).unwrap();
+        assert_eq!(ids.len(), 2);
+        let run = engine.list_learning_runs().unwrap().into_iter().find(|run| run.run_id == run_id).unwrap();
+        assert_eq!(run.runtime, "claude-code");
+        assert_eq!(run.permission_mode, "plan");
+        assert_eq!(run.executor_sid.as_deref(), Some("exec-1"));
+        assert_eq!(run.status, "awaiting_review");
+        let candidate_files = fs::read_dir(dir.path().join("personal/candidates")).unwrap().count();
+        assert_eq!(candidate_files, 2);
+        let state = fs::read_to_string(dir.path().join("runs/learn_test/state.yaml")).unwrap();
+        assert!(state.contains("scope?"));
+        let candidates = fs::read_dir(dir.path().join("personal/candidates")).unwrap().filter_map(Result::ok).filter_map(|entry| fs::read_to_string(entry.path()).ok()).collect::<Vec<_>>();
+        assert!(candidates.iter().any(|candidate| candidate.contains("validated_by")));
+        assert!(candidates.iter().any(|candidate| candidate.contains("repo-survey")));
     }
 
     #[test]
-    fn graph_control_learn_task_returns_experience_and_5w2h_candidate() {
-        let (engine, dir) = engine_with(vec![]);
-        fs::create_dir_all(dir.path().join("graph/knowledge")).unwrap();
-        fs::write(dir.path().join("graph/knowledge/retries.md"), "---\nid: knowledge/retries\ntitle: Retry safety\nnode_type: knowledge\nstatus: committed\nsummary: Retry with idempotency keys\n---\n\n## Execute\nUse a stable key.\n").unwrap();
-        let task = engine.create_control_task("Learn retry safety", "learn", Some("claude-code")).unwrap();
-        let plan = engine.compile_capsule(&task.id, 1600).unwrap();
-        let launch = engine.record_native_handoff(&plan).unwrap();
-        engine.record_native_return(&launch, &task.id, "exit 0").unwrap();
-        engine.finalize_control_task(&task.id, "Validated an idempotency-key approach.").unwrap();
-        let nodes = engine.list_graph_nodes(None).unwrap();
-        assert!(nodes.iter().any(|node| node.id == format!("experience/{}", task.id.trim_start_matches("task_"))));
-        assert!(nodes.iter().any(|node| node.status.as_deref() == Some("candidate")));
-        assert_eq!(engine.store().get_task(&task.id).unwrap().unwrap().status, TaskStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn context_planner_accepts_only_catalog_node_ids() {
-        let (engine, dir) = engine_with(vec![ok_result(r#"{"selected_node_ids":["knowledge/retries","outside/catalog"],"rationale":"retry task"}"#)]);
-        fs::create_dir_all(dir.path().join("graph/knowledge")).unwrap();
-        fs::write(dir.path().join("graph/knowledge/retries.md"), "---\nid: knowledge/retries\ntitle: Retry safety\nnode_type: knowledge\nstatus: committed\nsummary: Retry with idempotency keys\n---\n\n## Execute\nUse a stable key.\n").unwrap();
-        let task = engine.create_control_task("Handle retries", "work", Some("claude-code")).unwrap();
-        let plan = engine.plan_context(&task.id).await.unwrap();
-        assert_eq!(plan.selected_node_ids, vec!["knowledge/retries"]);
-        assert_eq!(plan.rationale, "retry task");
-    }
-
-    #[tokio::test]
-    async fn run_task_persists_experience_file_and_completes() {
-        let events = vec![
-            RuntimeEvent::SessionStarted {
-                session_id: "exec-sid-1".to_string(),
-            },
-            RuntimeEvent::AssistantText {
-                text: "hello".to_string(),
-            },
-            RuntimeEvent::Result {
-                is_error: false,
-                text: "done".to_string(),
-                cost_usd: None,
-                usage: None,
-                session_id: Some("exec-sid-1".to_string()),
-                permission_denials: Vec::new(),
-            },
-        ];
-        let (engine, _dir) = engine_with(events);
-        let task = engine.create_task("goal", "goal", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-
-        let done = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(done.status, TaskStatus::Reviewing);
-
-        let sessions = engine.store().list_sessions_for_task(&task.id).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].executor_sid.as_deref(), Some("exec-sid-1"));
-        assert_eq!(sessions[0].status, SessionStatus::Exited);
-
-        let exps = engine.store().list_experiences().unwrap();
-        assert_eq!(exps.len(), 1);
-        let abs = engine.home().join(&exps[0].path);
-        assert!(abs.exists(), "experience file missing: {}", abs.display());
-        let body = fs::read_to_string(&abs).unwrap();
-        assert!(body.contains("done"));
-        let closed = engine.complete_review(&task.id).unwrap();
-        assert_eq!(closed.status, TaskStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn run_task_records_executor_usage() {
-        let events = vec![
-            RuntimeEvent::SessionStarted {
-                session_id: "exec-sid-1".to_string(),
-            },
-            RuntimeEvent::Result {
-                is_error: false,
-                text: "done".to_string(),
-                cost_usd: Some(0.04),
-                usage: Some(serde_json::json!({"input_tokens": 120, "output_tokens": 30})),
-                session_id: Some("exec-sid-1".to_string()),
-                permission_denials: Vec::new(),
-            },
-        ];
-        let (engine, _dir) = engine_with(events);
-        let task = engine.create_task("goal", "goal", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        let all = engine.usage_summary(false).unwrap();
-        assert_eq!(all.input_tokens, 120);
-        assert_eq!(all.output_tokens, 30);
-        assert!((all.cost_usd - 0.04).abs() < 1e-9);
-        assert_eq!(all.turns, 1);
-        let task_u = engine.store().usage_for_task(&task.id).unwrap();
-        assert_eq!(task_u.input_tokens, 120);
-    }
-
-    #[tokio::test]
-    async fn send_turn_resumes_after_reviewing() {
-        let (engine, _dir) =
-            engine_with_turns(vec![vec![ok_result("first")], vec![ok_result("second")]]);
-        let task = engine.create_task("goal", "goal", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-
-        let mut rx = engine
-            .send_turn(&task.id, "change it to methodus")
-            .await
-            .unwrap();
-        while rx.recv().await.is_some() {}
-
-        let done = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(done.status, TaskStatus::Reviewing);
-        let sessions = engine.store().list_sessions_for_task(&task.id).unwrap();
-        assert_eq!(sessions.len(), 2);
-        let events = engine.store().list_events(Some(&task.id), 80).unwrap();
-        assert!(events.iter().any(|e| e.event_type == "user.message"));
-    }
-
-    #[tokio::test]
-    async fn run_task_materializes_resolved_skill() {
-        let events = vec![ok_result("done")];
-        let (engine, dir) = engine_with(events);
-        fs::create_dir_all(dir.path().join("faces/general")).unwrap();
-        fs::write(
-            dir.path().join("faces/general/face.yaml"),
-            "id: general\nname: General\nintent_tags: [general]\nmethods: [general-software]\nskills: [workspace-hygiene]\n",
-        )
-        .unwrap();
-        fs::create_dir_all(dir.path().join("methods")).unwrap();
-        fs::write(
-            dir.path().join("methods/general-software.yaml"),
-            "id: general-software\nname: General software\nrecommended_skills: [workspace-hygiene]\n",
-        )
-        .unwrap();
-        fs::create_dir_all(dir.path().join("skills/workspace-hygiene")).unwrap();
-        fs::write(
-            dir.path().join("skills/workspace-hygiene/SKILL.md"),
-            "---\nname: workspace-hygiene\ndescription: stay in workspace\n---\n",
-        )
-        .unwrap();
-
-        let task = engine
-            .create_task("hygiene", "keep the workspace clean", None, None)
-            .unwrap();
-        let res = Resolution::parse_json(task.resolution.as_deref().unwrap()).unwrap();
-        assert!(res.skills.iter().any(|s| s.name == "workspace-hygiene"));
-
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-
-        let skill = dir
-            .path()
-            .join("workspaces")
-            .join(&task.id)
-            .join(".claude/skills/workspace-hygiene/SKILL.md");
-        assert!(skill.is_file(), "missing {}", skill.display());
-        assert!(dir
-            .path()
-            .join("workspaces")
-            .join(&task.id)
-            .join(".methodus/method.yaml")
-            .is_file());
-    }
-
-    #[tokio::test]
-    async fn run_task_injects_committed_face_knowledge() {
-        let (engine, dir) = engine_with(vec![ok_result("done")]);
-        let now = Utc::now();
-        let rel = "faces/general/knowledge/latch.md";
-        fs::create_dir_all(dir.path().join("faces/general/knowledge")).unwrap();
-        fs::write(
-            dir.path().join(rel),
-            "# Latch protocol\n\nThe latch uses gpio 4.\n",
-        )
-        .unwrap();
-        engine
-            .store()
-            .insert_knowledge(&KnowledgeItem {
-                id: "know_latch".into(),
-                face_id: Some("general".into()),
-                project_id: None,
-                path: rel.into(),
-                content_hash: "h".into(),
-                source: "experience".into(),
-                confidence: Some(0.8),
-                scope: None,
-                status: KnowledgeStatus::Committed,
-                conflict_of: None,
-                version: 1,
-                created_at: now,
-                updated_at: now,
-            })
-            .unwrap();
-
-        let task = engine
-            .create_task("debug latch", "debug the latch gpio", None, None)
-            .unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-
-        let ctx = fs::read_to_string(
-            dir.path()
-                .join("workspaces")
-                .join(&task.id)
-                .join(".methodus/selected-context.md"),
-        )
-        .unwrap();
-        assert!(ctx.contains("gpio 4"), "context missing knowledge: {ctx}");
-        assert!(ctx.contains("Face knowledge (committed)"));
-        assert!(ctx.contains("## Injected this turn"));
-        assert!(ctx.contains("**knowledge**"));
-        let injected = fs::read_to_string(
-            dir.path()
-                .join("workspaces")
-                .join(&task.id)
-                .join(".methodus/injected.md"),
-        )
-        .unwrap();
-        assert!(injected.contains("latch"));
-        let evs = engine.store().list_events(Some(&task.id), 80).unwrap();
-        assert!(
-            evs.iter()
-                .any(|e| e.event_type == crate::learning::INJECTED_EVENT),
-            "missing learning.injected: {evs:?}"
-        );
-        assert!(dir
-            .path()
-            .join("workspaces")
-            .join(&task.id)
-            .join("face-context/knowledge/latch.md")
-            .is_file());
-    }
-
-    #[tokio::test]
-    async fn inject_increments_note_hits_and_promotes() {
-        let (engine, dir) = engine_with_turns(vec![
-            vec![ok_result("ok1")],
-            vec![ok_result("ok2")],
-            vec![ok_result("ok3")],
-        ]);
-        let now = Utc::now();
-        let rel = "faces/general/notes/latch-gpio.md";
-        fs::create_dir_all(dir.path().join("faces/general/notes")).unwrap();
-        fs::write(
-            dir.path().join(rel),
-            "---\nkind: note\nhits: 0\nstatus: committed\n---\n\n# latch gpio\n\n- probe gpio 4 first\n",
-        )
-        .unwrap();
-        engine
-            .store()
-            .insert_knowledge(&KnowledgeItem {
-                id: "know_note".into(),
-                face_id: Some("general".into()),
-                project_id: None,
-                path: rel.into(),
-                content_hash: "h".into(),
-                source: crate::refine::HARNESS_NOTE_SOURCE.into(),
-                confidence: Some(0.55),
-                scope: Some("note".into()),
-                status: KnowledgeStatus::Committed,
-                conflict_of: None,
-                version: 1,
-                created_at: now,
-                updated_at: now,
-            })
-            .unwrap();
-
-        for title in ["debug latch a", "debug latch b", "debug latch c"] {
-            let task = engine
-                .create_task(title, "debug the latch gpio", None, None)
-                .unwrap();
-            let mut rx = engine.run_task(&task.id, false).await.unwrap();
-            while rx.recv().await.is_some() {}
-        }
-        let body = fs::read_to_string(dir.path().join(rel)).unwrap();
-        assert!(body.contains("hits: 3"), "{body}");
-        engine.tick_learning().unwrap();
-        let jobs = engine.store().list_jobs().unwrap();
-        assert!(
-            jobs.iter().any(|j| j.kind == JobKind::ProposeSkill),
-            "3 injections should enqueue skill promote: {jobs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn injection_miss_lowers_confidence() {
-        let (engine, dir) = engine_with(vec![ok_result(
-            "unknown: latch protocol still broken on gpio",
-        )]);
-        let now = Utc::now();
-        let rel = "faces/general/knowledge/latch.md";
-        fs::create_dir_all(dir.path().join("faces/general/knowledge")).unwrap();
-        fs::write(
-            dir.path().join(rel),
-            "# Latch protocol\n\nThe latch uses gpio 4.\n",
-        )
-        .unwrap();
-        engine
-            .store()
-            .insert_knowledge(&KnowledgeItem {
-                id: "know_latch".into(),
-                face_id: Some("general".into()),
-                project_id: None,
-                path: rel.into(),
-                content_hash: "h".into(),
-                source: "experience".into(),
-                confidence: Some(0.8),
-                scope: None,
-                status: KnowledgeStatus::Committed,
-                conflict_of: None,
-                version: 1,
-                created_at: now,
-                updated_at: now,
-            })
-            .unwrap();
-
-        let task = engine
-            .create_task("debug latch", "debug the latch gpio", None, None)
-            .unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        engine.tick_learning().unwrap();
-
-        let item = engine.store().get_knowledge("know_latch").unwrap().unwrap();
-        assert!(
-            item.confidence.unwrap() < 0.8,
-            "miss should downrank: {:?}",
-            item.confidence
-        );
-        let qs = engine.store().list_questions(None).unwrap();
-        assert!(
-            qs.iter()
-                .any(|q| q.question.contains("Injected") && q.question.contains("latch")),
-            "expected mentor question: {qs:?}"
-        );
-        let evs = engine.store().list_events(Some(&task.id), 200).unwrap();
-        assert!(evs
-            .iter()
-            .any(|e| e.event_type == crate::learning::INJECTION_MISSED_EVENT));
-    }
-
-    #[tokio::test]
-    async fn trajectory_skill_skips_experience_knowledge() {
-        let (engine, _dir) = engine_with(vec![
-            tool_start_with("Bash", serde_json::json!({"command": "ps aux | grep nginx"})),
-            tool_start_with("Read", serde_json::json!({"path": "/proc/1/stat"})),
-            tool_start_with("Grep", serde_json::json!({"pattern": "cpu"})),
-            ok_result(
-                "The latch on the carrier board uses gpio 4 with a 3.3V pull-up.",
-            ),
-        ]);
-        let task = engine
-            .create_task("sample cpu", "sample cpu of nginx", None, None)
-            .unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        engine.tick_learning().unwrap();
-        let experience_cands: Vec<_> = engine
-            .store()
-            .list_knowledge(Some(KnowledgeStatus::Candidate))
-            .unwrap()
-            .into_iter()
-            .filter(|k| k.source == "experience")
-            .collect();
-        assert!(
-            experience_cands.is_empty(),
-            "trajectory distill should not also mint knowledge: {experience_cands:?}"
-        );
-        assert!(engine
-            .store()
-            .list_knowledge(Some(KnowledgeStatus::Candidate))
-            .unwrap()
-            .iter()
-            .any(|k| k.source == crate::learning::SKILL_DRAFT_SOURCE));
-    }
-
-    #[tokio::test]
-    async fn run_task_injects_pack_knowledge() {
-        let (engine, dir) = engine_with(vec![ok_result("done")]);
-        let pack = dir.path().join("team-pack");
-        fs::create_dir_all(pack.join("knowledge")).unwrap();
-        fs::write(pack.join("pack.yaml"), "id: team-x\nname: Team X\n").unwrap();
-        fs::write(
-            pack.join("knowledge/latch.md"),
-            "# Latch protocol\n\nThe latch uses gpio 4.\n",
-        )
-        .unwrap();
-        crate::pack::add_pack(dir.path(), &pack).unwrap();
-
-        let task = engine
-            .create_task("debug latch", "debug the latch gpio", None, None)
-            .unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-
-        let ctx = fs::read_to_string(
-            dir.path()
-                .join("workspaces")
-                .join(&task.id)
-                .join(".methodus/selected-context.md"),
-        )
-        .unwrap();
-        assert!(ctx.contains("gpio 4"), "missing pack knowledge: {ctx}");
-        assert!(ctx.contains("team:team-x"));
-        assert!(dir
-            .path()
-            .join("workspaces")
-            .join(&task.id)
-            .join("face-context/knowledge/latch.md")
-            .is_file());
-    }
-
-    #[tokio::test]
-    async fn workspace_root_honors_config_yaml() {
-        let events = vec![ok_result("done")];
-        let (engine, dir) = engine_with(events);
-        drop(engine);
-        let runs = dir.path().join("custom-runs");
-        fs::write(
-            dir.path().join("config.yaml"),
-            format!("workspace_root: {}\n", runs.display()),
-        )
-        .unwrap();
-        let store = Arc::new(Store::open(&dir.path().join("state.db")).unwrap());
-        let adapter = Arc::new(MockAdapter {
-            turns: Mutex::new(vec![vec![ok_result("done")]].into()),
-            live: vec![],
-        });
-        let engine = Engine::new(store, adapter, dir.path().to_path_buf());
-        assert_eq!(engine.workspace_root(), runs);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        assert!(runs
-            .join(&task.id)
-            .join(".methodus/selected-context.md")
-            .is_file());
-        assert!(!dir.path().join("workspaces").join(&task.id).exists());
-    }
-
-    #[tokio::test]
-    async fn recover_marks_dead_running_session_interrupted() {
-        let (engine, _dir) = engine_with(vec![]);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        engine
-            .store()
-            .update_task_status(&task.id, TaskStatus::Planning)
-            .unwrap();
-        engine
-            .store()
-            .update_task_status(&task.id, TaskStatus::Running)
-            .unwrap();
-
-        let now = Utc::now();
-        engine
-            .store()
-            .insert_session(&Session {
-                id: "sess-1".to_string(),
-                task_id: task.id.clone(),
-                runtime: "claude-code".to_string(),
-                executor_sid: Some("exec-sid-1".to_string()),
-                transport: "subprocess".to_string(),
-                pid: Some(u32::MAX - 7),
-                cwd: "/tmp".to_string(),
-                status: SessionStatus::Running,
-                last_turn: None,
-                started_at: now,
-                ended_at: None,
-                updated_at: now,
-            })
-            .unwrap();
-
-        let rec = engine.recover().await.unwrap();
-        assert_eq!(rec.len(), 1);
-        assert!(!rec[0].still_live);
-
-        let session = engine.store().get_session("sess-1").unwrap().unwrap();
-        assert_eq!(session.status, SessionStatus::Interrupted);
-        let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::WaitingUser);
-    }
-
-    #[tokio::test]
-    async fn run_without_resume_after_interrupt_asks_for_flag() {
-        let (engine, _dir) = engine_with(vec![]);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        let now = Utc::now();
-        engine
-            .store()
-            .insert_session(&Session {
-                id: "sess-1".to_string(),
-                task_id: task.id.clone(),
-                runtime: "claude-code".to_string(),
-                executor_sid: Some("exec-sid-1".to_string()),
-                transport: "subprocess".to_string(),
-                pid: None,
-                cwd: "/tmp".to_string(),
-                status: SessionStatus::Interrupted,
-                last_turn: None,
-                started_at: now,
-                ended_at: Some(now),
-                updated_at: now,
-            })
-            .unwrap();
-
-        let err = engine.run_task(&task.id, false).await.unwrap_err();
-        assert!(matches!(err, CoreError::NeedsResume));
-    }
-
-    #[tokio::test]
-    async fn run_with_resume_starts_new_session_row() {
-        let events = vec![
-            RuntimeEvent::SessionStarted {
-                session_id: "exec-sid-1".to_string(),
-            },
-            RuntimeEvent::Result {
-                is_error: false,
-                text: "continued".to_string(),
-                cost_usd: None,
-                usage: None,
-                session_id: Some("exec-sid-1".to_string()),
-                permission_denials: Vec::new(),
-            },
-        ];
-        let (engine, _dir) = engine_with(events);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        let now = Utc::now();
-        engine
-            .store()
-            .insert_session(&Session {
-                id: "sess-old".to_string(),
-                task_id: task.id.clone(),
-                runtime: "claude-code".to_string(),
-                executor_sid: Some("exec-sid-1".to_string()),
-                transport: "subprocess".to_string(),
-                pid: None,
-                cwd: "/tmp".to_string(),
-                status: SessionStatus::Interrupted,
-                last_turn: None,
-                started_at: now,
-                ended_at: Some(now),
-                updated_at: now,
-            })
-            .unwrap();
-
-        let mut rx = engine.run_task(&task.id, true).await.unwrap();
-        while rx.recv().await.is_some() {}
-
-        let sessions = engine.store().list_sessions_for_task(&task.id).unwrap();
-        assert_eq!(sessions.len(), 2);
-        let newest = sessions
-            .iter()
-            .find(|s| s.id != "sess-old")
-            .expect("new session row");
-        assert_eq!(newest.executor_sid.as_deref(), Some("exec-sid-1"));
-        assert_eq!(newest.status, SessionStatus::Exited);
-        let done = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(done.status, TaskStatus::Reviewing);
-    }
-
-    #[tokio::test]
-    async fn destructive_bash_denial_pauses_for_approval_then_approve_continues() {
-        let deny = vec![
-            RuntimeEvent::SessionStarted {
-                session_id: "exec-sid-1".to_string(),
-            },
-            RuntimeEvent::Result {
-                is_error: false,
-                text: "need rm".to_string(),
-                cost_usd: None,
-                usage: None,
-                session_id: Some("exec-sid-1".to_string()),
-                permission_denials: vec![PermissionDenial {
-                    tool_name: "Bash".to_string(),
-                    tool_use_id: Some("tu1".to_string()),
-                    tool_input: serde_json::json!({"command": "rm -rf build/"}),
-                }],
-            },
-        ];
-        let (engine, _dir) = engine_with_turns(vec![deny, vec![ok_result("ran it")]]);
-        let task = engine
-            .create_task("clean build", "clean build", None, None)
-            .unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        let mut saw_approval = None;
-        while let Some(ev) = rx.recv().await {
-            if let RuntimeEvent::ApprovalRequested { id, tool_name, .. } = ev {
-                assert_eq!(tool_name, "Bash");
-                saw_approval = Some(id);
-            }
-        }
-        let appr_id = saw_approval.expect("approval event");
-        let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::WaitingUser);
-
-        let mut rx = engine
-            .approve(&appr_id, ApprovalDecision::Once, "user")
-            .await
-            .unwrap();
-        while rx.recv().await.is_some() {}
-        let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Reviewing);
-        let appr = engine.store().get_approval(&appr_id).unwrap().unwrap();
-        assert_eq!(appr.decision.as_deref(), Some("once"));
-    }
-
-    #[tokio::test]
-    async fn deny_abort_cancels_task() {
-        let deny = vec![RuntimeEvent::Result {
-            is_error: false,
-            text: "need bash".to_string(),
-            cost_usd: None,
-            usage: None,
-            session_id: Some("exec-sid-1".to_string()),
-            permission_denials: vec![PermissionDenial {
-                tool_name: "Bash".to_string(),
-                tool_use_id: None,
-                tool_input: serde_json::json!({"command": "rm -rf /"}),
-            }],
-        }];
-        let (engine, _dir) = engine_with(deny);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        let mut appr_id = None;
-        while let Some(ev) = rx.recv().await {
-            if let RuntimeEvent::ApprovalRequested { id, .. } = ev {
-                appr_id = Some(id);
-            }
-        }
-        engine
-            .approve(&appr_id.unwrap(), ApprovalDecision::Abort, "user")
-            .await
-            .unwrap();
-        let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn auto_allow_bash_git_does_not_pause() {
-        let first = vec![RuntimeEvent::Result {
-            is_error: false,
-            text: "need shell".to_string(),
-            cost_usd: None,
-            usage: None,
-            session_id: Some("exec-sid-1".to_string()),
-            permission_denials: vec![PermissionDenial {
-                tool_name: "Bash".to_string(),
-                tool_use_id: None,
-                tool_input: serde_json::json!({"command": "git status"}),
-            }],
-        }];
-        let (engine, _dir) = engine_with_turns(vec![first, vec![ok_result("ok")]]);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Reviewing);
-        assert!(engine
-            .store()
-            .list_pending_approvals(Some(&task.id))
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn auto_allow_read_does_not_pause() {
-        let first = vec![RuntimeEvent::Result {
-            is_error: false,
-            text: "need read".to_string(),
-            cost_usd: None,
-            usage: None,
-            session_id: Some("exec-sid-1".to_string()),
-            permission_denials: vec![PermissionDenial {
-                tool_name: "Read".to_string(),
-                tool_use_id: None,
-                tool_input: serde_json::json!({"path": "/tmp/a"}),
-            }],
-        }];
-        let (engine, _dir) = engine_with_turns(vec![first, vec![ok_result("ok")]]);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Reviewing);
-        assert!(engine
-            .store()
-            .list_pending_approvals(Some(&task.id))
-            .unwrap()
-            .is_empty());
+    fn team_promotion_moves_candidate_into_selected_team_before_commit() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("personal/candidates")).unwrap();
+        fs::create_dir_all(dir.path().join("teams/default")).unwrap();
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Engine::with_runtimes(store, dir.path().to_path_buf(), HashMap::new());
+        engine.record_learning_output("team rule", "```json\n{\"candidates\":[{\"type\":\"knowledge\",\"kind\":\"procedure\",\"title\":\"Team rule\",\"summary\":\"A reviewed rule\",\"learn\":\"Explain\",\"execute\":\"Do it\"}]}\n```").unwrap();
+        let candidate = engine.list_graph_nodes(Some("Team rule")).unwrap().into_iter().find(|node| node.status.as_deref() == Some("candidate")).unwrap();
+        engine.promote_candidate_to_team(&candidate.id).unwrap();
+        let moved = engine.list_graph_nodes(Some("Team rule")).unwrap().into_iter().find(|node| node.id == candidate.id).unwrap();
+        assert_eq!(moved.visibility, "team");
+        assert!(moved.path.starts_with("teams/default/"));
+        engine.promote_graph_candidate(&moved.id).unwrap();
+        let committed = engine.list_graph_nodes(Some("Team rule")).unwrap().into_iter().find(|node| node.id == candidate.id).unwrap();
+        assert_eq!(committed.status.as_deref(), Some("committed"));
+        assert!(committed.path.starts_with("teams/default/"));
     }
 
     #[test]
-    fn cancel_queued_task() {
-        let (engine, _dir) = engine_with(vec![]);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        engine.cancel_task(&task.id).unwrap();
-        let task = engine.store().get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Cancelled);
-        assert!(engine.cancel_task(&task.id).is_err());
-        engine.delete_task(&task.id).unwrap();
-        assert!(engine.store().get_task(&task.id).unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn task_complete_enqueues_learning_jobs() {
-        let (engine, _dir) = engine_with(vec![ok_result("unknown: latch protocol")]);
-        let task = engine.create_task("g", "g", None, None).unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        let jobs = engine.store().list_jobs().unwrap();
-        assert!(jobs.iter().any(|j| j.kind == JobKind::ExtractExperience));
-        assert!(
-            jobs.iter().any(|j| j.status == JobStatus::Done),
-            "finish_task should drain extract/detect/propose: {jobs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn learning_repeated_unknown_question_answer_and_conflict() {
-        let (engine, dir) = engine_with_turns(vec![
-            vec![ok_result("unknown: latch protocol\nuse gpio 4")],
-            vec![ok_result("unknown: latch protocol\nuse gpio 7")],
-        ]);
-        fs::create_dir_all(dir.path().join("faces/general/knowledge")).unwrap();
-
-        let t1 = engine.create_task("one", "one", None, None).unwrap();
-        let mut rx = engine.run_task(&t1.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        engine.tick_learning().unwrap();
-
-        let qs = engine.store().list_questions(None).unwrap();
-        assert_eq!(qs.len(), 1);
-        assert_eq!(qs[0].frequency, 1.0);
-        let cands = engine
-            .store()
-            .list_knowledge(Some(KnowledgeStatus::Candidate))
-            .unwrap()
-            .into_iter()
-            .filter(|k| k.source != crate::learning::SKILL_DRAFT_SOURCE)
-            .collect::<Vec<_>>();
-        assert!(!cands.is_empty());
-        let committed = engine
-            .review_knowledge(&cands[0].id, KnowledgeReviewAction::Commit)
-            .unwrap();
-        assert_eq!(committed.status, KnowledgeStatus::Committed);
-        let committed_body = fs::read_to_string(engine.home().join(&committed.path)).unwrap();
-        assert!(committed_body.contains("gpio 4"));
-
-        let t2 = engine.create_task("two", "two", None, None).unwrap();
-        let mut rx = engine.run_task(&t2.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        engine.tick_learning().unwrap();
-
-        let qs = engine.store().list_questions(None).unwrap();
-        let gap_q = qs
-            .iter()
-            .find(|q| q.question.starts_with("What should we know about"))
-            .expect("gap question");
-        assert!(
-            gap_q.frequency >= 2.0,
-            "gap frequency: {} qs={qs:?}",
-            gap_q.frequency
-        );
-        let conflicts = engine
-            .store()
-            .list_knowledge(Some(KnowledgeStatus::Conflicted))
-            .unwrap();
-        assert!(!conflicts.is_empty());
-        let still = fs::read_to_string(engine.home().join(&committed.path)).unwrap();
-        assert!(still.contains("gpio 4"));
-        assert!(!still.contains("gpio 7"));
-
-        let answered = engine
-            .answer_question(&gap_q.id, "the latch uses 3.3V pull-up")
-            .unwrap();
-        assert_eq!(answered.status, QuestionStatus::Answered);
-        let from_answer = engine
-            .store()
-            .list_knowledge(None)
-            .unwrap()
-            .into_iter()
-            .find(|k| k.source == "user_answer")
-            .expect("candidate from answer");
-        assert_eq!(from_answer.status, KnowledgeStatus::Candidate);
-    }
-
-    fn tool_start(name: &str) -> RuntimeEvent {
-        tool_start_with(name, serde_json::json!({}))
-    }
-
-    fn tool_start_with(name: &str, input: serde_json::Value) -> RuntimeEvent {
-        RuntimeEvent::ToolCallStarted {
-            id: name.to_string(),
-            name: name.to_string(),
-            input,
-        }
-    }
-
-    #[tokio::test]
-    async fn auto_skill_draft_then_review_installs_live_skill() {
-        let (engine, _dir) = engine_with(vec![
-            tool_start_with("Bash", serde_json::json!({"command": "ps aux | grep nginx"})),
-            tool_start_with("Read", serde_json::json!({"path": "/proc/1/stat"})),
-            tool_start_with("Grep", serde_json::json!({"pattern": "cpu"})),
-            ok_result("sampled"),
-        ]);
-        let task = engine
-            .create_task("sample cpu", "sample cpu of nginx", None, None)
-            .unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-
-        engine.tick_learning().unwrap();
-        let auto_drafts: Vec<_> = engine
-            .store()
-            .list_knowledge(Some(KnowledgeStatus::Candidate))
-            .unwrap()
-            .into_iter()
-            .filter(|k| k.source == crate::learning::SKILL_DRAFT_SOURCE)
-            .collect();
-        assert!(
-            !auto_drafts.is_empty(),
-            "expected propose_skill draft after 3 tool calls"
-        );
-
-        let draft = auto_drafts.into_iter().next().unwrap();
-        assert_eq!(draft.source, crate::learning::SKILL_DRAFT_SOURCE);
-        assert!(draft.path.contains(".candidates"));
-
-        let committed = engine
-            .review_knowledge(&draft.id, KnowledgeReviewAction::Commit)
-            .unwrap();
-        assert_eq!(committed.status, KnowledgeStatus::Committed);
-        assert!(committed.path.starts_with("skills/"));
-        assert!(!committed.path.contains(".candidates"));
-        assert!(engine.home().join(&committed.path).exists());
-        let catalog = crate::resolution::scan_skills(engine.home());
-        assert!(catalog.iter().any(|s| s.name.contains("sample")));
-
-        // Same trajectory against a live skill → incremental patch, not a parallel draft.
-        let again = crate::learning::propose_skill_from_task(
-            engine.store(),
-            engine.home(),
-            &task.id,
-            None,
-        )
-        .unwrap();
-        if let Some(patch) = again {
-            assert_eq!(patch.source, crate::refine::SKILL_PATCH_SOURCE);
-            let applied = engine
-                .review_knowledge(&patch.id, KnowledgeReviewAction::Commit)
-                .unwrap();
-            assert_eq!(applied.status, KnowledgeStatus::Committed);
-            assert!(applied.path.starts_with("skills/"));
-        }
-    }
-
-    #[tokio::test]
-    async fn empty_tool_calls_do_not_draft_skill() {
-        let (engine, _dir) = engine_with(vec![
-            tool_start("Bash"),
-            tool_start("Read"),
-            tool_start("Grep"),
-            ok_result("sampled"),
-        ]);
-        let task = engine
-            .create_task("sample cpu", "sample cpu of nginx", None, None)
-            .unwrap();
-        let mut rx = engine.run_task(&task.id, false).await.unwrap();
-        while rx.recv().await.is_some() {}
-        engine.tick_learning().unwrap();
-        let auto_drafts: Vec<_> = engine
-            .store()
-            .list_knowledge(Some(KnowledgeStatus::Candidate))
-            .unwrap()
-            .into_iter()
-            .filter(|k| {
-                k.source == crate::learning::SKILL_DRAFT_SOURCE
-                    || k.source == crate::refine::HARNESS_NOTE_SOURCE
-                    || k.source == crate::refine::SKILL_PATCH_SOURCE
-            })
-            .collect();
-        assert!(
-            auto_drafts.is_empty(),
-            "bare Use Tool steps must not distill"
-        );
-    }
-
-    #[tokio::test]
-    async fn tick_refine_llm_polishes_note() {
-        let polished = r#"{"skip":false,"rationale":"prefer ss -tnp","note_body":"- run ss -tnp before blaming the app"}"#;
-        let (engine, dir) = engine_with(vec![ok_result(polished)]);
-        let now = Utc::now();
-        let proposal = crate::refine::RefinementProposal {
-            target_kind: crate::refine::RefineTargetKind::Note,
-            target_id: "tcp-note".into(),
-            op: crate::refine::RefineOp::Create,
-            add_procedure: Vec::new(),
-            add_pitfalls: Vec::new(),
-            note_body: Some("- Use `Read`".into()),
-            evidence_refs: vec!["task_refine".into()],
-            rationale: "raw".into(),
-            hits: 1,
-            planner: "rules".into(),
-        };
-        let json = serde_json::to_string_pretty(&proposal).unwrap();
-        let rel = "faces/general/notes/.candidates/tcp-note.md";
-        let body = format!(
-            "---\nkind: note\nplanner: rules\nsource_task: task_refine\n---\n\n# tcp-note\n\n- Use `Read`\n\n## Proposal\n\n```json\n{json}\n```\n"
-        );
-        fs::create_dir_all(dir.path().join("faces/general/notes/.candidates")).unwrap();
-        fs::write(dir.path().join(rel), &body).unwrap();
-        engine
-            .store()
-            .insert_knowledge(&KnowledgeItem {
-                id: "know_refine".into(),
-                face_id: Some("general".into()),
-                project_id: None,
-                path: rel.into(),
-                content_hash: "h".into(),
-                source: crate::refine::HARNESS_NOTE_SOURCE.into(),
-                confidence: Some(0.5),
-                scope: Some("note".into()),
-                status: KnowledgeStatus::Candidate,
-                conflict_of: None,
-                version: 1,
-                created_at: now,
-                updated_at: now,
-            })
-            .unwrap();
-
-        let n = engine.tick_refine_llm().await.unwrap();
-        assert_eq!(n, 1);
-        let rewritten = fs::read_to_string(dir.path().join(rel)).unwrap();
-        assert!(rewritten.contains("planner: llm"), "{rewritten}");
-        assert!(rewritten.contains("prefer ss -tnp"), "{rewritten}");
-        assert!(rewritten.contains("ss -tnp before blaming"));
-    }
-
-    #[test]
-    fn recover_requeues_running_learning_job() {
-        let (engine, _dir) = engine_with(vec![]);
-        let now = Utc::now();
-        engine
-            .store()
-            .enqueue_job(&LearningJob {
-                id: "job_stuck".to_string(),
-                kind: JobKind::DetectGaps,
-                priority: 1,
-                dedupe_key: Some("detect:x".to_string()),
-                input_refs: "{}".to_string(),
-                status: JobStatus::Running,
-                attempts: 1,
-                not_before: None,
-                budget: None,
-                requires_approval: false,
-                created_at: now,
-                updated_at: now,
-            })
-            .unwrap();
-        let n = crate::scheduler::recover_jobs(engine.store()).unwrap();
-        assert_eq!(n, 1);
-        let job = engine.store().get_job("job_stuck").unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Queued);
+    fn projected_stale_nodes_can_be_revalidated_or_archived() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("personal/knowledge")).unwrap();
+        fs::write(dir.path().join("evidence.txt"), "one").unwrap();
+        let fingerprint = format!("{:x}", Sha256::digest(b"one"));
+        fs::write(dir.path().join("personal/knowledge/source.md"), format!(
+            "---\nid: knowledge/source\ntitle: Source\nnode_type: knowledge\nkind: signal\nstatus: committed\nvisibility: personal\nsummary: Source-backed rule\nsources:\n  - path: evidence.txt\n    fingerprint: sha256:{fingerprint}\n---\n\n## Execute\nUse it.\n"
+        )).unwrap();
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Engine::with_runtimes(store, dir.path().to_path_buf(), HashMap::new());
+        engine.sync_graph().unwrap();
+        fs::write(dir.path().join("evidence.txt"), "two").unwrap();
+        engine.sync_graph().unwrap();
+        let stale = engine.list_graph_nodes(Some("Source")).unwrap().pop().unwrap();
+        assert_eq!(stale.status.as_deref(), Some("stale"));
+        // Restore the evidence without editing the authored status. The
+        // projection should return to committed after explicit revalidation.
+        fs::write(dir.path().join("evidence.txt"), "one").unwrap();
+        engine.revalidate_graph_node(&stale.id, "checked source").unwrap();
+        assert_eq!(engine.list_graph_nodes(Some("Source")).unwrap().pop().unwrap().status.as_deref(), Some("committed"));
+        fs::write(dir.path().join("evidence.txt"), "two").unwrap();
+        engine.sync_graph().unwrap();
+        let stale = engine.list_graph_nodes(Some("Source")).unwrap().pop().unwrap();
+        engine.deprecate_graph_node(&stale.id, "superseded").unwrap();
+        assert_eq!(engine.list_graph_nodes(Some("Source")).unwrap().pop().unwrap().status.as_deref(), Some("deprecated"));
     }
 }

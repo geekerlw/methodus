@@ -10,8 +10,7 @@ pub mod usage;
 // Re-export key types at crate root for convenience.
 pub use approval::ApprovalDecision;
 pub use entity::{
-    Approval, ContextSelection, EvolutionCandidate, Experience, GraphEdge, GraphNode, Hypothesis,
-    KnowledgeItem, LearningJob, Question, Session, Task, TaskWorkspace,
+    Approval, ContextSelection, Experience, GraphEdge, GraphNode, Session, Task, TaskWorkspace,
 };
 pub use error::DomainError;
 pub use event::{PermissionDenial, RuntimeEvent};

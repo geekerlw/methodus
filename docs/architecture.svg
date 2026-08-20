@@ -1,145 +1,151 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">Methodus architecture</title>
+  <desc id="desc">Methodus is a maintainer knowledge studio with a focused Learn runtime and a read-only CLI connector for native coding agents.</desc>
   <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#172554"/>
+    </linearGradient>
+    <linearGradient id="studio" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#243b53"/>
+    </linearGradient>
+    <linearGradient id="memory" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#172554"/>
+      <stop offset="1" stop-color="#1e3a5f"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#020617" flood-opacity="0.28"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#93c5fd"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#86efac"/>
+    </marker>
     <style>
-      .title { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 20px; font-weight: 700; fill: #0f172a; }
-      .subtitle { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 12px; fill: #64748b; }
-      .region { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 11px; font-weight: 700; fill: #475569; letter-spacing: 0.06em; }
-      .label { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 13px; font-weight: 600; fill: #1e293b; }
-      .sub { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 11px; fill: #64748b; }
-      .alabel { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 10px; fill: #64748b; }
-      .legend { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 11px; fill: #475569; }
+      .title { font: 700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f8fafc; }
+      .subtitle { font: 400 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #bfdbfe; }
+      .group-title { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #dbeafe; letter-spacing: 1px; }
+      .node-title { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f8fafc; }
+      .node-copy { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #cbd5e1; }
+      .label { font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #bfdbfe; }
+      .legend { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #94a3b8; }
     </style>
-    <marker id="arrowBlue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#2563eb"/>
-    </marker>
-    <marker id="arrowOrange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#ea580c"/>
-    </marker>
-    <marker id="arrowGreen" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#059669"/>
-    </marker>
-    <marker id="arrowGray" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#6b7280"/>
-    </marker>
-    <marker id="arrowPurple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#7c3aed"/>
-    </marker>
   </defs>
-  <rect width="1200" height="760" fill="#ffffff"/>
-  <text x="600" y="28" class="title" text-anchor="middle">Methodus</text>
-  <text x="600" y="46" class="subtitle" text-anchor="middle">One process. Three loops. Human-gated self-improvement — brain in Rust, hands in an external agent.</text>
-  <rect x="40" y="72" width="1120" height="256" rx="14" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5" stroke-dasharray="6 4"/>
-  <text x="56" y="92" class="region">1  EXECUTION  ·  in-process brain, replaceable hands</text>
-  <rect x="40" y="348" width="1120" height="328" rx="14" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1.5" stroke-dasharray="6 4"/>
-  <text x="56" y="368" class="region">2  LEARNING  ·  continual harness, commit only via /inbox</text>
-  <rect x="372" y="108" width="400" height="184" rx="12" fill="#e0e7ff" stroke="#818cf8" stroke-width="1.5"/>
-  <text x="572" y="128" class="region" text-anchor="middle">ENGINE  ·  methodus-core</text>
-  <rect x="968" y="108" width="168" height="168" rx="12" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5" stroke-dasharray="5 3"/>
-  <text x="1052" y="128" class="region" text-anchor="middle">HANDS</text>
-  <path d="M160,182 L188,182" fill="none" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arrowOrange)"/>
-  <path d="M344,182 L372,182" fill="none" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arrowOrange)"/>
-  <text x="348" y="174" class="alabel">in-process</text>
-  <path d="M564,232 L786,232 L786,194 L800,194" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
-  <text x="640" y="224" class="alabel">spawn / resume</text>
-  <path d="M940,194 L968,194" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
-  <path d="M1052,276 L1052,288" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
-  <path d="M478,260 L478,332 L152,332 L152,392" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowBlue)"/>
-  <text x="168" y="326" class="alabel">events + experience</text>
-  <path d="M666,260 L666,342 L360,342 L360,392" fill="none" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrowPurple)"/>
-  <text x="470" y="338" class="alabel">learning queue</text>
-  <path d="M240,432 L272,432" fill="none" stroke="#059669" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrowGreen)"/>
-  <path d="M448,432 L496,432" fill="none" stroke="#059669" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrowGreen)"/>
-  <path d="M672,432 L712,432" fill="none" stroke="#059669" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
-  <path d="M888,432 L928,432" fill="none" stroke="#059669" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
-  <text x="250" y="424" class="alabel">distill</text>
-  <text x="456" y="424" class="alabel">propose</text>
-  <text x="678" y="424" class="alabel">commit</text>
-  <text x="894" y="424" class="alabel">inject</text>
-  <path d="M584,516 L584,480" fill="none" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arrowGray)"/>
-  <text x="594" y="504" class="alabel">ask</text>
-  <path d="M1016,480 L1016,516" fill="none" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrowPurple)"/>
-  <path d="M928,548 L672,548" fill="none" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arrowOrange)"/>
-  <text x="760" y="540" class="alabel">injection miss</text>
-  <path d="M1104,432 L1168,432 L1168,60 L478,60 L478,108" fill="none" stroke="#059669" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
-  <text x="980" y="54" class="alabel">next-task inject</text>
-  <rect x="60" y="150" width="100" height="64" rx="12" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
-  <circle cx="80" cy="174" r="6" fill="#1e40af"/>
-  <path d="M80,180 L80,198 M72,186 L88,186 M74,206 L80,198 L86,206" fill="none" stroke="#1e40af" stroke-width="1.6" stroke-linecap="round"/>
-  <text x="122" y="178" class="label" text-anchor="middle">You</text>
-  <text x="122" y="194" class="sub" text-anchor="middle">tmux</text>
-  <rect x="188" y="140" width="156" height="84" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
-  <rect x="188" y="140" width="156" height="18" rx="12" fill="#e2e8f0"/>
-  <rect x="188" y="149" width="156" height="9" fill="#e2e8f0"/>
-  <circle cx="202" cy="149" r="3.2" fill="#f87171"/>
-  <circle cx="214" cy="149" r="3.2" fill="#fbbf24"/>
-  <circle cx="226" cy="149" r="3.2" fill="#34d399"/>
-  <text x="266" y="153" class="sub" text-anchor="middle">ratatui TUI</text>
-  <text x="266" y="184" class="label" text-anchor="middle">Methodus</text>
-  <text x="266" y="200" class="sub" text-anchor="middle">/learn  /inbox</text>
-  <rect x="392" y="140" width="172" height="52" rx="8" fill="#ffffff" stroke="#818cf8" stroke-width="1.5"/>
-  <text x="478" y="162" class="label" text-anchor="middle">Resolver</text>
-  <text x="478" y="178" class="sub" text-anchor="middle">Face · Method · Skill</text>
-  <rect x="580" y="140" width="172" height="52" rx="8" fill="#ffffff" stroke="#818cf8" stroke-width="1.5"/>
-  <text x="666" y="162" class="label" text-anchor="middle">Policy</text>
-  <text x="666" y="178" class="sub" text-anchor="middle">allow / deny / ask</text>
-  <rect x="392" y="208" width="172" height="52" rx="8" fill="#ffffff" stroke="#818cf8" stroke-width="1.5"/>
-  <text x="478" y="230" class="label" text-anchor="middle">Session</text>
-  <text x="478" y="246" class="sub" text-anchor="middle">spawn · resume</text>
-  <rect x="580" y="208" width="172" height="52" rx="8" fill="#ffffff" stroke="#818cf8" stroke-width="1.5"/>
-  <text x="666" y="230" class="label" text-anchor="middle">Scheduler</text>
-  <text x="666" y="246" class="sub" text-anchor="middle">learn · curiosity</text>
-  <rect x="796" y="164" width="148" height="60" rx="12" fill="none" stroke="#fb923c" stroke-width="1.5"/>
-  <rect x="800" y="168" width="140" height="52" rx="10" fill="#fff7ed" stroke="#fb923c" stroke-width="1.5"/>
-  <text x="870" y="190" class="label" text-anchor="middle">Adapter</text>
-  <text x="870" y="206" class="sub" text-anchor="middle">Runtime trait</text>
-  <rect x="984" y="140" width="136" height="40" rx="8" fill="#ffffff" stroke="#fdba74" stroke-width="1.5"/>
-  <text x="1052" y="165" class="label" text-anchor="middle">Claude Code</text>
-  <rect x="984" y="188" width="136" height="40" rx="8" fill="#ffffff" stroke="#fdba74" stroke-width="1.5"/>
-  <text x="1052" y="213" class="label" text-anchor="middle">Codex</text>
-  <rect x="984" y="236" width="136" height="40" rx="8" fill="#ffffff" stroke="#fdba74" stroke-width="1.5"/>
-  <text x="1052" y="261" class="label" text-anchor="middle">Cursor</text>
-  <rect x="800" y="288" width="336" height="28" rx="8" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1.5"/>
-  <text x="968" y="307" class="sub" text-anchor="middle">isolated workspace  ·  selected-context.md</text>
-  <rect x="64" y="392" width="176" height="80" rx="10" fill="#ffffff" stroke="#34d399" stroke-width="1.5"/>
-  <text x="152" y="424" class="label" text-anchor="middle">Trajectory</text>
-  <text x="152" y="442" class="sub" text-anchor="middle">events · experience</text>
-  <text x="152" y="456" class="sub" text-anchor="middle">or /learn sources</text>
-  <rect x="272" y="392" width="176" height="80" rx="10" fill="#ffffff" stroke="#34d399" stroke-width="1.5"/>
-  <text x="360" y="424" class="label" text-anchor="middle">Distill</text>
-  <text x="360" y="442" class="sub" text-anchor="middle">1 note XOR patch</text>
-  <text x="360" y="456" class="sub" text-anchor="middle">XOR skill draft</text>
-  <rect x="492" y="388" width="184" height="88" rx="12" fill="none" stroke="#059669" stroke-width="1.5"/>
-  <rect x="496" y="392" width="176" height="80" rx="10" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/>
-  <text x="584" y="424" class="label" text-anchor="middle">/inbox</text>
-  <text x="584" y="442" class="sub" text-anchor="middle">human gate</text>
-  <text x="584" y="456" class="sub" text-anchor="middle">never silent commit</text>
-  <rect x="712" y="392" width="176" height="80" rx="10" fill="#ffffff" stroke="#34d399" stroke-width="1.5"/>
-  <text x="800" y="418" class="label" text-anchor="middle">Durable state</text>
-  <text x="800" y="436" class="sub" text-anchor="middle">notes · skills</text>
-  <text x="800" y="450" class="sub" text-anchor="middle">knowledge · SQLite</text>
-  <rect x="928" y="392" width="176" height="80" rx="10" fill="#ffffff" stroke="#34d399" stroke-width="1.5"/>
-  <text x="1016" y="424" class="label" text-anchor="middle">Inject</text>
-  <text x="1016" y="442" class="sub" text-anchor="middle">next-task context</text>
-  <text x="1016" y="456" class="sub" text-anchor="middle">count hits</text>
-  <rect x="496" y="516" width="176" height="64" rx="10" fill="#fef3c7" stroke="#fbbf24" stroke-width="1.5"/>
-  <text x="584" y="542" class="label" text-anchor="middle">Curiosity</text>
-  <text x="584" y="560" class="sub" text-anchor="middle">ask / snooze / dismiss</text>
-  <rect x="928" y="516" width="176" height="64" rx="10" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1.5"/>
-  <text x="1016" y="542" class="label" text-anchor="middle">Close the loop</text>
-  <text x="1016" y="560" class="sub" text-anchor="middle">hits ≥ 3 → skill</text>
-  <text x="600" y="644" class="sub" text-anchor="middle">Prompt is an interface, not a database. Policy, promotion, and conflict checks live in Rust.</text>
-  <rect x="40" y="684" width="1120" height="48" rx="10" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
-  <line x1="64" y1="708" x2="104" y2="708" stroke="#ea580c" stroke-width="1.5"/>
-  <text x="112" y="712" class="legend">You / TUI</text>
-  <line x1="220" y1="708" x2="260" y2="708" stroke="#2563eb" stroke-width="2"/>
-  <text x="268" y="712" class="legend">Execution</text>
-  <line x1="372" y1="708" x2="412" y2="708" stroke="#059669" stroke-width="1.5" stroke-dasharray="5 3"/>
-  <text x="420" y="712" class="legend">Write candidate</text>
-  <line x1="552" y1="708" x2="592" y2="708" stroke="#059669" stroke-width="1.5"/>
-  <text x="600" y="712" class="legend">Inject / commit</text>
-  <line x1="720" y1="708" x2="760" y2="708" stroke="#7c3aed" stroke-width="1.5"/>
-  <text x="768" y="712" class="legend">Learning loop</text>
-  <line x1="900" y1="708" x2="940" y2="708" stroke="#6b7280" stroke-width="1.5" stroke-dasharray="4 2"/>
-  <text x="948" y="712" class="legend">Curiosity / inbox</text>
+
+  <rect width="1200" height="760" rx="22" fill="url(#bg)"/>
+  <text x="52" y="54" class="title">Methodus architecture</text>
+  <text x="52" y="82" class="subtitle">Maintainer-curated engineering memory for native agent runtimes</text>
+
+  <!-- Actors -->
+  <g filter="url(#shadow)">
+    <rect x="52" y="144" width="220" height="108" rx="16" fill="#0b1220" stroke="#60a5fa" stroke-width="1.5"/>
+    <text x="76" y="180" class="node-title">Maintainer</text>
+    <text x="76" y="205" class="node-copy">Learn, review, curate</text>
+    <text x="76" y="224" class="node-copy">and publish engineering memory</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="52" y="496" width="220" height="108" rx="16" fill="#0b1220" stroke="#86efac" stroke-width="1.5"/>
+    <text x="76" y="532" class="node-title">Developer</text>
+    <text x="76" y="557" class="node-copy">Works in a native</text>
+    <text x="76" y="576" class="node-copy">Claude / Codex / Cursor session</text>
+  </g>
+
+  <!-- Maintainer studio -->
+  <g filter="url(#shadow)">
+    <rect x="326" y="116" width="456" height="306" rx="20" fill="url(#studio)" stroke="#60a5fa" stroke-width="1.5"/>
+    <text x="352" y="146" class="group-title">METHODUS TUI · SINGLE FOCUSED LEARN</text>
+
+    <rect x="352" y="168" width="190" height="94" rx="12" fill="#1d4ed8" fill-opacity="0.32" stroke="#60a5fa"/>
+    <text x="372" y="200" class="node-title">Learn conversation</text>
+    <text x="372" y="222" class="node-copy">Runtime-backed research</text>
+    <text x="372" y="240" class="node-copy">with durable events</text>
+
+    <rect x="566" y="168" width="190" height="94" rx="12" fill="#1d4ed8" fill-opacity="0.20" stroke="#60a5fa"/>
+    <text x="586" y="200" class="node-title">Review &amp; graph</text>
+    <text x="586" y="222" class="node-copy">Approve, reject, merge</text>
+    <text x="586" y="240" class="node-copy">and inspect relations</text>
+
+    <rect x="352" y="286" width="190" height="94" rx="12" fill="#1d4ed8" fill-opacity="0.20" stroke="#60a5fa"/>
+    <text x="372" y="318" class="node-title">Team &amp; health</text>
+    <text x="372" y="340" class="node-copy">Validate roots, diff,</text>
+    <text x="372" y="358" class="node-copy">and write publish plans</text>
+
+    <rect x="566" y="286" width="190" height="94" rx="12" fill="#1d4ed8" fill-opacity="0.20" stroke="#60a5fa"/>
+    <text x="586" y="318" class="node-title">Runtime controls</text>
+    <text x="586" y="340" class="node-copy">Claude, Codex, Cursor</text>
+    <text x="586" y="358" class="node-copy">permissions and resume</text>
+  </g>
+
+  <!-- Learning runtimes -->
+  <g filter="url(#shadow)">
+    <rect x="846" y="116" width="302" height="306" rx="20" fill="#172033" stroke="#fbbf24" stroke-width="1.5"/>
+    <text x="872" y="146" class="group-title">LEARNING RUNTIME ADAPTERS</text>
+    <rect x="872" y="168" width="250" height="64" rx="12" fill="#422006" fill-opacity="0.65" stroke="#fbbf24"/>
+    <text x="896" y="196" class="node-title">Claude Code</text>
+    <text x="896" y="216" class="node-copy">Focused Learn session only</text>
+    <rect x="872" y="248" width="250" height="64" rx="12" fill="#422006" fill-opacity="0.65" stroke="#fbbf24"/>
+    <text x="896" y="276" class="node-title">Codex</text>
+    <text x="896" y="296" class="node-copy">Focused Learn session only</text>
+    <rect x="872" y="328" width="250" height="64" rx="12" fill="#422006" fill-opacity="0.65" stroke="#fbbf24"/>
+    <text x="896" y="356" class="node-title">Cursor Agent</text>
+    <text x="896" y="376" class="node-copy">Focused Learn session only</text>
+  </g>
+
+  <!-- Canonical memory -->
+  <g filter="url(#shadow)">
+    <rect x="326" y="482" width="456" height="176" rx="20" fill="url(#memory)" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="352" y="512" class="group-title">CANONICAL MEMORY · MARKDOWN FIRST</text>
+    <rect x="352" y="532" width="128" height="86" rx="11" fill="#312e81" stroke="#a78bfa"/>
+    <text x="370" y="563" class="node-title">Personal</text>
+    <text x="370" y="585" class="node-copy">Drafts and</text>
+    <text x="370" y="601" class="node-copy">committed notes</text>
+    <rect x="498" y="532" width="128" height="86" rx="11" fill="#312e81" stroke="#a78bfa"/>
+    <text x="516" y="563" class="node-title">Team</text>
+    <text x="516" y="585" class="node-copy">Git-backed shared</text>
+    <text x="516" y="601" class="node-copy">knowledge roots</text>
+    <rect x="644" y="532" width="112" height="86" rx="11" fill="#312e81" stroke="#a78bfa"/>
+    <text x="662" y="563" class="node-title">Runs</text>
+    <text x="662" y="585" class="node-copy">Events, sources</text>
+    <text x="662" y="601" class="node-copy">and candidates</text>
+  </g>
+
+  <!-- Agent read path -->
+  <g filter="url(#shadow)">
+    <rect x="846" y="482" width="302" height="176" rx="20" fill="#052e16" stroke="#86efac" stroke-width="1.5"/>
+    <text x="872" y="512" class="group-title">READ-ONLY AGENT CONNECTOR</text>
+    <rect x="872" y="532" width="250" height="46" rx="11" fill="#14532d" stroke="#86efac"/>
+    <text x="896" y="561" class="node-title">Official connector Skill</text>
+    <rect x="872" y="592" width="250" height="46" rx="11" fill="#14532d" stroke="#86efac"/>
+    <text x="896" y="621" class="node-title">methodus agent CLI</text>
+  </g>
+
+  <!-- Flow arrows -->
+  <path d="M272 198 C294 198 302 198 326 198" fill="none" stroke="#93c5fd" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="278" y="185" class="label">maintain</text>
+
+  <path d="M542 188 C628 132 756 132 846 188" fill="none" stroke="#fbbf24" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="674" y="108" class="label">learn turn</text>
+
+  <path d="M456 422 L456 482" fill="none" stroke="#a78bfa" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="470" y="456" class="label">reviewed writes</text>
+
+  <path d="M672 422 L672 482" fill="none" stroke="#a78bfa" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="686" y="456" class="label">index / audit</text>
+
+  <path d="M272 550 L300 550 L300 452 L810 452 L810 550 L846 550" fill="none" stroke="#86efac" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+  <text x="514" y="445" class="label">read-only context</text>
+
+  <path d="M997 422 L997 482" fill="none" stroke="#86efac" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+  <text x="1012" y="456" class="label">native agent query</text>
+
+  <!-- Boundary notes -->
+  <path d="M326 694 L782 694" fill="none" stroke="#64748b" stroke-width="1" stroke-dasharray="5 5"/>
+  <text x="326" y="721" class="legend">TUI writes · CLI reads · native coding sessions stay in the runtime</text>
+  <circle cx="850" cy="718" r="5" fill="#fbbf24"/>
+  <text x="864" y="722" class="legend">managed Learn runtime</text>
+  <circle cx="1002" cy="718" r="5" fill="#86efac"/>
+  <text x="1016" y="722" class="legend">consumer read path</text>
 </svg>

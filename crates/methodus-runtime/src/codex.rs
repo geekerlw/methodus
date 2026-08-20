@@ -24,16 +24,16 @@ impl Default for CodexAdapter {
 
 pub(crate) fn codex_args(input: &SpawnInput, resume: Option<&str>) -> Vec<String> {
     let mut args = vec!["exec".to_string()];
+    if let Some(ref sandbox) = input.sandbox {
+        args.push("--sandbox".to_string());
+        args.push(sandbox.clone());
+    }
     if let Some(sid) = resume {
         args.push("resume".to_string());
         args.push("--json".to_string());
         args.push(sid.to_string());
     } else {
         args.push("--json".to_string());
-        if let Some(ref sandbox) = input.sandbox {
-            args.push("--sandbox".to_string());
-            args.push(sandbox.clone());
-        }
         args.push("-C".to_string());
         args.push(input.cwd.to_string_lossy().into_owned());
     }
@@ -287,7 +287,8 @@ mod tests {
         let args = codex_args(&sample_input(), Some("019fthread"));
         assert!(args.contains(&"resume".to_string()));
         assert!(args.contains(&"019fthread".to_string()));
-        assert!(!args.contains(&"--sandbox".to_string()));
+        assert!(args.contains(&"--sandbox".to_string()));
+        assert!(args.contains(&"workspace-write".to_string()));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! `@path` mentions: pick files/folders as task context, like Claude Code.
+//! `@path` mentions: pick files/folders as Learn evidence, like Claude Code.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -167,7 +167,8 @@ fn query_hits(query: &str, value: &str) -> bool {
     value == query || value == format!("{query}/")
 }
 
-/// Launch cwd + registered projects. Source stays on disk; nothing is copied.
+/// The launch repository is readable in place during Learn. Methodus does not
+/// maintain a project registry or copy source files into a task workspace.
 pub fn context_roots(home: &Path, launch_cwd: &Path) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();
@@ -182,23 +183,10 @@ pub fn context_roots(home: &Path, launch_cwd: &Path) -> Vec<(String, PathBuf)> {
         out.push((id, path));
     }
 
-    let home_canon = home.canonicalize().ok();
-    let ws_canon = home.join("workspaces").canonicalize().ok();
-    let user_home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|p| p.canonicalize().ok());
-
-    for proj in crate::project::list_projects(home) {
-        push(&mut out, &mut seen, proj.id, proj.root);
-    }
     if launch_cwd.is_dir() {
         if let Ok(canon) = launch_cwd.canonicalize() {
-            let skip = canon == Path::new("/")
-                || home_canon.as_ref().is_some_and(|h| &canon == h)
-                || ws_canon
-                    .as_ref()
-                    .is_some_and(|ws| &canon == ws || canon.starts_with(ws))
-                || user_home.as_ref().is_some_and(|h| &canon == h);
+            let home_canon = home.canonicalize().ok();
+            let skip = canon == Path::new("/") || home_canon.as_ref().is_some_and(|h| &canon == h);
             if !skip {
                 let name = launch_cwd
                     .file_name()
@@ -258,7 +246,7 @@ pub fn render_readable_dirs(roots: &[(String, PathBuf)]) -> String {
     }
     let mut out = String::from(
         "\n## Readable directories\n\n\
-         These are the user's real folders on disk. Do not copy them into this workspace; \
+         These are the user's real folders on disk. Do not copy them into a Methodus workspace; \
          Read / Glob / LS them in place.\n",
     );
     for (id, root) in roots {
@@ -523,13 +511,12 @@ mod tests {
     }
 
     #[test]
-    fn context_roots_dedupes_cwd_that_is_a_project() {
+    fn context_roots_exposes_launch_cwd_once() {
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
-        let info = crate::project::add_project(home.path(), proj.path()).unwrap();
         let roots = context_roots(home.path(), proj.path());
         assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].0, info.id);
+        assert_eq!(roots[0].0, proj.path().file_name().unwrap().to_string_lossy());
         let dirs = readable_dirs(&roots);
         assert_eq!(dirs.len(), 1);
         assert!(render_readable_dirs(&roots).contains("Readable directories"));

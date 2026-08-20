@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use methodus_domain::{Approval, Experience, Session, SessionStatus, Task, TaskStatus};
 
@@ -32,6 +32,13 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Open an existing database without creating files, changing pragmas, or
+    /// running migrations. Used by the machine-facing agent protocol.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     /// Open an in-memory SQLite database. Useful for testing.
@@ -587,12 +594,11 @@ impl Store {
             .lock()
             .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
         conn.execute(
-            "INSERT INTO experiences (id, task_id, face_id, path, content_hash, outcome, summary, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO experiences (id, task_id, path, content_hash, outcome, summary, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 exp.id,
                 exp.task_id,
-                exp.face_id,
                 exp.path,
                 exp.content_hash,
                 exp.outcome,
@@ -610,20 +616,19 @@ impl Store {
             .lock()
             .map_err(|e| StoreError::Migration(format!("mutex poisoned: {e}")))?;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, face_id, path, content_hash, outcome, summary, created_at, updated_at
+            "SELECT id, task_id, path, content_hash, outcome, summary, created_at, updated_at
              FROM experiences ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ExperienceRow {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
-                face_id: row.get(2)?,
-                path: row.get(3)?,
-                content_hash: row.get(4)?,
-                outcome: row.get(5)?,
-                summary: row.get(6)?,
-                created_at: row.get(7)?,
-                updated_at: row.get(8)?,
+                path: row.get(2)?,
+                content_hash: row.get(3)?,
+                outcome: row.get(4)?,
+                summary: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })?;
 
@@ -859,7 +864,6 @@ fn session_from_row(r: SessionRow) -> Result<Session, StoreError> {
 struct ExperienceRow {
     id: String,
     task_id: Option<String>,
-    face_id: Option<String>,
     path: String,
     content_hash: String,
     outcome: Option<String>,
@@ -877,7 +881,6 @@ fn experience_from_row(r: ExperienceRow) -> Result<Experience, StoreError> {
     Ok(Experience {
         id: r.id,
         task_id: r.task_id.unwrap_or_default(),
-        face_id: r.face_id,
         path: r.path,
         content_hash: r.content_hash,
         outcome: r.outcome,
@@ -1134,8 +1137,7 @@ mod tests {
         let exp = Experience {
             id: "exp-001".to_string(),
             task_id: "t-001".to_string(),
-            face_id: Some("rust-expert".to_string()),
-            path: "faces/rust-expert/experiences/exp-001.md".to_string(),
+            path: "personal/experiences/exp-001.md".to_string(),
             content_hash: "abc123".to_string(),
             outcome: Some("success".to_string()),
             summary: Some("Completed without issues".to_string()),
@@ -1151,7 +1153,7 @@ mod tests {
         assert_eq!(experiences[0].outcome, Some("success".to_string()));
         assert_eq!(
             experiences[0].path,
-            "faces/rust-expert/experiences/exp-001.md"
+            "personal/experiences/exp-001.md"
         );
     }
 
