@@ -76,6 +76,12 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         mark_applied(conn, 11)?;
     }
 
+    // V12: continuous-learning goals, schedules, attention, and budget rolls
+    if !is_applied(conn, 12)? {
+        apply_v12(conn)?;
+        mark_applied(conn, 12)?;
+    }
+
     Ok(())
 }
 
@@ -453,5 +459,77 @@ fn apply_v10(conn: &Connection) -> Result<(), StoreError> {
 /// Face was retired in favor of graph tags, scope, and visibility.
 fn apply_v11(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch("DROP TABLE IF EXISTS faces;")?;
+    Ok(())
+}
+
+/// Continuous learning per `docs/10`. These tables replace the JSON files an
+/// earlier prototype kept in the Methodus home (`goals.json`, `attentions.json`,
+/// `goal-usage.json`, `run-goals.json`), which could not be updated atomically.
+/// The retired V5 `learning_jobs` table is deliberately not reused.
+fn apply_v12(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "
+        CREATE TABLE learning_goals (
+            id                   TEXT PRIMARY KEY,
+            title                TEXT NOT NULL,
+            prompt               TEXT NOT NULL,
+            sources              TEXT NOT NULL DEFAULT '[]',
+            runtime              TEXT NOT NULL,
+            permission_mode      TEXT NOT NULL,
+            cadence              TEXT NOT NULL,
+            review_cadence       TEXT NOT NULL,
+            summary_cadence      TEXT NOT NULL,
+            source_check_cadence TEXT NOT NULL,
+            quiet_hours_start    TEXT,
+            quiet_hours_end      TEXT,
+            budget_usd           REAL NOT NULL,
+            review_policy        TEXT NOT NULL,
+            enabled              INTEGER NOT NULL DEFAULT 1,
+            next_run_at          TEXT,
+            next_review_at       TEXT,
+            next_summary_at      TEXT,
+            next_source_check_at TEXT,
+            created_at           TEXT NOT NULL,
+            updated_at           TEXT NOT NULL
+        );
+        CREATE INDEX idx_learning_goals_due ON learning_goals(enabled, next_run_at);
+
+        CREATE TABLE learning_attentions (
+            id          TEXT PRIMARY KEY,
+            run_id      TEXT NOT NULL,
+            goal_id     TEXT,
+            kind        TEXT NOT NULL,
+            title       TEXT NOT NULL,
+            prompt      TEXT NOT NULL,
+            context     TEXT,
+            tool_name   TEXT,
+            tool_input  TEXT,
+            status      TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            resolved_at TEXT,
+            response    TEXT
+        );
+        CREATE INDEX idx_attentions_run ON learning_attentions(run_id, status);
+        CREATE INDEX idx_attentions_open ON learning_attentions(status, created_at);
+
+        -- Past months are retained instead of reset in place so per-Goal spend
+        -- history stays inspectable.
+        CREATE TABLE goal_usage (
+            goal_id    TEXT NOT NULL,
+            month      TEXT NOT NULL,
+            spent_usd  REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (goal_id, month)
+        );
+
+        CREATE TABLE goal_runs (
+            run_id     TEXT PRIMARY KEY,
+            goal_id    TEXT NOT NULL,
+            work       TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_goal_runs_goal ON goal_runs(goal_id, created_at);
+        ",
+    )?;
     Ok(())
 }

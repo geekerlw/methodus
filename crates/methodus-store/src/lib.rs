@@ -1,4 +1,5 @@
 pub mod graph;
+pub mod learning;
 pub mod migration;
 pub mod store;
 pub mod usage;

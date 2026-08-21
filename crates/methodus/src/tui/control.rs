@@ -5,23 +5,32 @@
 //! user's native Agent runtime.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io::stdout;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
 
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use methodus_core::learning::parse_form;
 use methodus_core::{at_query, list_from_roots, Engine, MentionCandidate, UserConfig};
-use methodus_domain::{GraphEdge, GraphNode};
+use methodus_domain::{AttentionKind, GraphEdge, GraphNode, HumanAttention, LearningGoal, WorkKind};
 use ratatui::{
     prelude::{Alignment, Constraint, CrosstermBackend, Direction, Frame, Layout, Position, Rect, Terminal},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use tokio::runtime::Handle;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::notify;
+use crate::tui::background::{Background, BackgroundEvent};
 
 const MARK: &str = "◈";
 const WORDMARK: &str = "Methodus";
@@ -41,6 +50,8 @@ const RUNTIMES: &[RuntimeOption] = &[
 struct SlashCmd { name: &'static str, aliases: &'static [&'static str], summary: &'static str }
 
 const SLASH_COMMANDS: &[SlashCmd] = &[
+    SlashCmd { name: "attention", aliases: &["attn", "inbox"], summary: "Answer the questions unattended turns are blocked on" },
+    SlashCmd { name: "goal", aliases: &["goals"], summary: "Create a Goal with text, or manage continuous learning goals" },
     SlashCmd { name: "knowledge", aliases: &[], summary: "Browse the knowledge graph and related nodes" },
     SlashCmd { name: "method", aliases: &["methods"], summary: "Browse reusable working methods" },
     SlashCmd { name: "experience", aliases: &["experiences"], summary: "Review validated task experience" },
@@ -74,12 +85,22 @@ impl Theme {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
-    Chat, Help, Knowledge, Method, Experience, Review, Team, Health, Runtime,
+    Chat, Help, Knowledge, Method, Experience, Review, Team, Health, Runtime, Goals, Attention,
     KnowledgeDetail, ExperienceDetail, ReviewDetail, KnowledgeGraph, MergeTarget,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ConfirmAction { Commit, Reject, MarkTeam, Delete, Revalidate, Merge }
+enum ConfirmAction { Commit, Reject, MarkTeam, Delete, Revalidate, Merge, DeleteGoal, DismissAttention }
+
+/// A Goal form `$EDITOR` produced but validation rejected. Remembering which
+/// Goal it belonged to lets the next edit reopen the draft rather than throw
+/// away what the maintainer typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalDraft { New, Existing(String) }
+
+impl GoalDraft {
+    fn for_id(id: Option<&str>) -> Self { id.map_or(Self::New, |id| Self::Existing(id.to_string())) }
+}
 
 struct App {
     engine: Engine,
@@ -120,12 +141,29 @@ struct App {
     learning_session_id: Option<String>,
     learning_executor_sid: Option<String>,
     learning_goal: Option<String>,
+    /// The Goal the foreground Learn belongs to, when it came from a schedule.
+    /// Reported to the scheduler as occupied so a background turn cannot resume
+    /// the same executor session underneath the maintainer.
+    learning_goal_id: Option<String>,
     team: Option<methodus_core::TeamStatus>,
     confirmation: Option<ConfirmAction>,
+    background: Background,
+    attentions: Vec<HumanAttention>,
+    goals: Vec<LearningGoal>,
+    /// This month's spend per Goal, cached so the draw path stays free of queries.
+    goal_spend: HashMap<String, f64>,
+    goal_draft: Option<GoalDraft>,
+    /// The objective being typed in the Goals panel. `Some` puts the overlay
+    /// into compose mode and captures every key.
+    goal_compose: Option<String>,
+    /// The answer being typed in the attention queue. `Some` puts the overlay
+    /// into reply mode and captures every key.
+    attention_reply: Option<String>,
 }
 
 impl App {
-    fn new(engine: Engine) -> Self {
+    fn new(engine: Engine, runtime: Handle) -> Self {
+        let background = Background::new(engine.clone(), runtime);
         let recovered = engine.recover_pending_native_learning().unwrap_or_default();
         let config = UserConfig::load(engine.home());
         let resumable = engine.latest_resumable_learning().ok().flatten();
@@ -151,6 +189,7 @@ impl App {
             let candidates = recovered.iter().map(|(_, ids)| ids.len()).sum::<usize>();
             transcript.push(format!("Methodus: Recovered {} candidate(s) from a completed native Learn return. Open /review to inspect them.", candidates));
         }
+        let resumed_goal_id = resumable.as_ref().and_then(|run| engine.goal_run(&run.run_id).ok().flatten()).map(|link| link.goal_id);
         Self {
             engine, view: View::Chat, input: String::new(),
             transcript,
@@ -164,18 +203,44 @@ impl App {
             merge_candidate_id: None, mention_cache: Vec::new(), mention_dynamic: Vec::new(), mention_sel: 0,
             graph_nodes: Vec::new(), graph_edges: Vec::new(), graph_selected: 0, graph_return: View::Knowledge,
             pending_quit_at: None, learning_session_id: resumable.as_ref().map(|run| run.run_id.clone()), learning_executor_sid: resumable.as_ref().and_then(|run| run.executor_sid.clone()),
+            learning_goal_id: resumed_goal_id,
             learning_goal: resumable.map(|run| run.goal),
             team: None,
             confirmation: None,
+            background,
+            attentions: Vec::new(),
+            goals: Vec::new(),
+            goal_spend: HashMap::new(),
+            goal_draft: None,
+            goal_compose: None,
+            attention_reply: None,
         }
     }
     fn refresh(&mut self) {
         match self.engine.sync_graph().and_then(|_| self.engine.list_graph_nodes(None)) { Ok(nodes) => self.nodes = nodes, Err(error) => self.status = format!("Graph sync failed: {error}") }
+        self.refresh_attentions();
+        self.refresh_goals();
         self.selected = self.selected.min(self.items_len().saturating_sub(1));
         if self.view == View::Team { self.team = self.engine.team_status().ok(); }
     }
-    fn items_len(&self) -> usize { match self.view { View::Knowledge => filtered_nodes(self.engine.home(), &self.nodes, "knowledge", None, &self.knowledge_filter).len(), View::Method => filtered_nodes(self.engine.home(), &self.nodes, "method", None, &self.method_filter).len(), View::Experience => filtered_nodes(self.engine.home(), &self.nodes, "experience", None, &self.experience_filter).len(), View::Review => filtered_nodes(self.engine.home(), &self.nodes, "", Some("candidate"), &self.review_filter).len(), View::MergeTarget => filtered_nodes(self.engine.home(), &self.nodes, "knowledge", Some("committed"), &self.merge_filter).len(), _ => 0 } }
-    fn panel(&mut self, view: View) { self.view = view; self.selected = 0; self.confirmation = None; self.filtering = false; self.refresh(); }
+    fn refresh_attentions(&mut self) { self.attentions = self.engine.open_attentions().unwrap_or_default(); }
+    fn refresh_goals(&mut self) {
+        self.goals = self.engine.list_goals().unwrap_or_default();
+        self.goal_spend = self.goals.iter().map(|goal| (goal.id.clone(), self.engine.goal_spend(&goal.id).unwrap_or(0.0))).collect();
+    }
+    fn selected_goal(&self) -> Option<&LearningGoal> { self.goals.get(self.selected) }
+    fn goal_draft_is_for(&self, id: Option<&str>) -> bool { matches!((&self.goal_draft, id), (Some(GoalDraft::New), None)) || matches!((&self.goal_draft, id), (Some(GoalDraft::Existing(draft)), Some(id)) if draft == id) }
+    fn selected_attention(&self) -> Option<&HumanAttention> { self.attentions.get(self.selected) }
+    fn items_len(&self) -> usize { match self.view { View::Goals => self.goals.len(), View::Attention => self.attentions.len(), View::Knowledge => filtered_nodes(self.engine.home(), &self.nodes, "knowledge", None, &self.knowledge_filter).len(), View::Method => filtered_nodes(self.engine.home(), &self.nodes, "method", None, &self.method_filter).len(), View::Experience => filtered_nodes(self.engine.home(), &self.nodes, "experience", None, &self.experience_filter).len(), View::Review => filtered_nodes(self.engine.home(), &self.nodes, "", Some("candidate"), &self.review_filter).len(), View::MergeTarget => filtered_nodes(self.engine.home(), &self.nodes, "knowledge", Some("committed"), &self.merge_filter).len(), _ => 0 } }
+    fn panel(&mut self, view: View) {
+        self.view = view; self.selected = 0; self.confirmation = None; self.filtering = false;
+        self.attention_reply = None; self.goal_compose = None;
+        self.refresh();
+        // An empty Goals panel opens straight into the composer. There is
+        // nothing to select or act on yet, and the only useful thing a person
+        // can do is say what they want followed.
+        if view == View::Goals && self.goals.is_empty() { self.goal_compose = Some(String::new()); }
+    }
     fn say(&mut self, text: impl Into<String>) { self.show_welcome = false; self.transcript.push(text.into()); if self.transcript.len() > 200 { self.transcript.remove(0); } self.transcript_offset = 0; self.transcript_version = self.transcript_version.wrapping_add(1); }
     fn clear_input(&mut self) { self.input.clear(); self.input_cursor = 0; self.slash_sel = 0; self.mention_sel = 0; self.mention_dynamic.clear(); }
     fn clamp_cursor(&mut self) { self.input_cursor = floor_char_boundary(&self.input, self.input_cursor); }
@@ -187,23 +252,66 @@ impl App {
     fn sync_slash_sel(&mut self) { self.slash_sel = self.slash_sel.min(matching_slash(&self.input).len().saturating_sub(1)); }
     fn move_slash(&mut self, direction: isize) { let count = matching_slash(&self.input).len(); if count == 0 { self.slash_sel = 0; } else if direction < 0 { self.slash_sel = self.slash_sel.saturating_sub(1); } else { self.slash_sel = (self.slash_sel + 1).min(count - 1); } }
     fn complete_slash(&mut self) { if let Some(command) = matching_slash(&self.input).get(self.slash_sel) { let rest = slash_rest(&self.input); self.input = if rest.is_empty() { format!("/{} ", command.name) } else { format!("/{} {rest}", command.name) }; self.input_cursor = self.input.len(); self.slash_sel = 0; } }
-    fn sync_mention_sel(&mut self) { if mention_open(&self.input) { self.ensure_mention_cache(); self.mention_dynamic = absolute_path_candidates(at_query(&self.input).unwrap_or_default()); self.mention_sel = self.mention_sel.min(self.matching_mentions().len().saturating_sub(1)); } else { self.mention_dynamic.clear(); self.mention_sel = 0; } }
+    fn sync_mention_sel(&mut self) { let text = self.input.clone(); self.sync_mention_for(&text); }
+    fn sync_mention_for(&mut self, text: &str) { if mention_open(text) { self.ensure_mention_cache(); self.mention_dynamic = absolute_path_candidates(at_query(text).unwrap_or_default()); self.mention_sel = self.mention_sel.min(self.matching_mentions_for(text).len().saturating_sub(1)); } else { self.mention_dynamic.clear(); self.mention_sel = 0; } }
     fn ensure_mention_cache(&mut self) { if self.mention_cache.is_empty() { self.mention_cache = list_from_roots(&self.engine.context_roots(), 1500); } }
-    fn matching_mentions(&self) -> Vec<&MentionCandidate> { let query = at_query(&self.input).unwrap_or_default().to_lowercase(); let mut all = self.mention_cache.iter().collect::<Vec<_>>(); all.extend(self.mention_dynamic.iter()); let mut result = all.into_iter().filter(|candidate| candidate.label.to_lowercase().contains(&query)).collect::<Vec<_>>(); result.sort_by_key(|candidate| candidate.label.len()); result }
-    fn move_mention(&mut self, delta: isize) { let n = self.matching_mentions().len(); if n == 0 { self.mention_sel = 0; } else if delta < 0 { self.mention_sel = self.mention_sel.saturating_sub(delta.unsigned_abs()); } else { self.mention_sel = (self.mention_sel + delta as usize).min(n - 1); } }
-    fn accept_mention(&mut self) { self.ensure_mention_cache(); let Some(candidate) = self.matching_mentions().get(self.mention_sel).cloned() else { return; }; let Some(start) = mention_start(&self.input) else { return; }; let replacement = format!("@{}", candidate.label); self.input.replace_range(start..self.input_cursor, &replacement); self.input_cursor = start + replacement.len(); self.mention_sel = 0; }
+    fn matching_mentions(&self) -> Vec<&MentionCandidate> { self.matching_mentions_for(&self.input) }
+    fn matching_mentions_for(&self, text: &str) -> Vec<&MentionCandidate> { let query = at_query(text).unwrap_or_default().to_lowercase(); let mut all = self.mention_cache.iter().collect::<Vec<_>>(); all.extend(self.mention_dynamic.iter()); let mut result = all.into_iter().filter(|candidate| candidate.label.to_lowercase().contains(&query)).collect::<Vec<_>>(); result.sort_by_key(|candidate| candidate.label.len()); result }
+    fn move_mention(&mut self, delta: isize) { let text = self.input.clone(); self.move_mention_for(&text, delta); }
+    fn move_mention_for(&mut self, text: &str, delta: isize) { let n = self.matching_mentions_for(text).len(); if n == 0 { self.mention_sel = 0; } else if delta < 0 { self.mention_sel = self.mention_sel.saturating_sub(delta.unsigned_abs()); } else { self.mention_sel = (self.mention_sel + delta as usize).min(n - 1); } }
+    fn accept_mention(&mut self) { let mut text = std::mem::take(&mut self.input); let cursor = self.accept_mention_in(&mut text, self.input_cursor); self.input = text; self.input_cursor = cursor; }
+    fn accept_mention_for(&mut self, text: &mut String) { let _ = self.accept_mention_in(text, text.len()); }
+    fn accept_mention_in(&mut self, text: &mut String, cursor: usize) -> usize { self.ensure_mention_cache(); let label = self.matching_mentions_for(text).get(self.mention_sel).map(|candidate| candidate.label.clone()); let Some(label) = label else { return cursor; }; let Some(start) = mention_start(text) else { return cursor; }; let replacement = format!("@{label}"); let end = cursor.min(text.len()); text.replace_range(start..end, &replacement); self.mention_sel = 0; start + replacement.len() }
     fn handle_ctrl_c(&mut self) { if !self.input.is_empty() { self.clear_input(); self.pending_quit_at = None; self.status = "Input cleared".into(); return; } let now = Instant::now(); if ctrl_c_should_quit(self.pending_quit_at, now) { self.quit = true; } else { self.pending_quit_at = Some(now); self.view = View::Chat; self.status = "Press Ctrl+C again to quit".into(); } }
     fn scroll_transcript(&mut self, delta: isize) { if delta > 0 { self.transcript_offset = self.transcript_offset.saturating_add(delta as usize); } else { self.transcript_offset = self.transcript_offset.saturating_sub(delta.unsigned_abs()); } }
     fn retain_confirmation_for(&mut self, code: KeyCode) {
-        let keep = matches!((self.confirmation, code), (Some(ConfirmAction::Commit), KeyCode::Char('c')) | (Some(ConfirmAction::Reject), KeyCode::Char('r')) | (Some(ConfirmAction::MarkTeam), KeyCode::Char('t')) | (Some(ConfirmAction::Delete), KeyCode::Char('d')) | (Some(ConfirmAction::Revalidate), KeyCode::Char('v')) | (Some(ConfirmAction::Merge), KeyCode::Enter));
+        let keep = matches!((self.confirmation, code), (Some(ConfirmAction::Commit), KeyCode::Char('c')) | (Some(ConfirmAction::Reject), KeyCode::Char('r')) | (Some(ConfirmAction::MarkTeam), KeyCode::Char('t')) | (Some(ConfirmAction::Delete), KeyCode::Char('d')) | (Some(ConfirmAction::DeleteGoal), KeyCode::Char('d')) | (Some(ConfirmAction::DismissAttention), KeyCode::Char('d')) | (Some(ConfirmAction::Revalidate), KeyCode::Char('v')) | (Some(ConfirmAction::Merge), KeyCode::Enter));
         if !keep { self.confirmation = None; }
     }
 }
 
-pub fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, engine: Engine) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut app = App::new(engine); app.refresh();
-    loop { terminal.draw(|frame| draw(frame, &app))?; if app.quit { break; } if event::poll(Duration::from_millis(250))? { match event::read()? { Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => handle_key(terminal, &mut app, key)?, Event::Paste(text) if app.view == View::Chat => app.insert_paste(&text), _ => {} } } }
+pub fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, engine: Engine, runtime: Handle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut app = App::new(engine, runtime); app.refresh();
+    loop {
+        // Scheduling happens between frames. While the terminal is handed to a
+        // native runtime this loop is blocked, which is the behavior we want:
+        // no unattended turn starts while the maintainer is mid-conversation.
+        app.background.tick(app.learning_goal_id.as_deref());
+        apply_background(&mut app);
+        terminal.draw(|frame| draw(frame, &app))?;
+        if app.quit { break; }
+        if event::poll(Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => handle_key(terminal, &mut app, key)?,
+                Event::Paste(text) if app.view == View::Chat => app.insert_paste(&text),
+                _ => {}
+            }
+        }
+    }
     Ok(())
+}
+
+fn apply_background(app: &mut App) {
+    for event in app.background.drain() {
+        if let Some((title, body, urgency)) = event.notification() {
+            notify::send(&title, &body, urgency);
+        }
+        app.status = event.status_line();
+        // A turn merely starting is status-bar news; anything that changed the
+        // graph or needs a decision belongs in the scrollback.
+        match &event {
+            BackgroundEvent::TurnStarted { .. } | BackgroundEvent::SourcesChecked { .. } => {}
+            BackgroundEvent::TurnFinished(outcome) => {
+                // The core names what happened; only the surface knows where to
+                // send someone to act on it.
+                let next_step = if outcome.attention.is_some() { " Open /attention to answer." } else if !outcome.candidate_ids.is_empty() { " Open /review to inspect them." } else { "" };
+                app.say(format!("Methodus: {}{next_step}", event.status_line()));
+                if !outcome.candidate_ids.is_empty() { app.refresh(); }
+                if outcome.attention.is_some() { app.refresh_attentions(); }
+            }
+            _ => app.say(format!("Methodus: {}", event.status_line())),
+        }
+    }
 }
 
 fn handle_key(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App, key: KeyEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -220,6 +328,8 @@ fn handle_key(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &
             KeyCode::Backspace => app.backspace(), KeyCode::Delete => app.delete(), KeyCode::Left => app.move_cursor(-1), KeyCode::Right => app.move_cursor(1), KeyCode::Home => app.input_cursor = 0, KeyCode::End => app.input_cursor = app.input.len(), KeyCode::Char('a') if ctrl => app.input_cursor = 0, KeyCode::Char('e') if ctrl => app.input_cursor = app.input.len(), KeyCode::Char(ch) if !ctrl => app.insert_str(&ch.to_string()), _ => {}
         },
         View::Knowledge | View::Method | View::Experience | View::Review => handle_list_key(app, key, ctrl),
+        View::Goals => handle_goals_key(terminal, app, key, ctrl)?,
+        View::Attention => handle_attention_key(terminal, app, key, ctrl)?,
         View::Runtime => match key.code { KeyCode::Esc => app.view = View::Chat, KeyCode::Up => app.runtime_selected = app.runtime_selected.saturating_sub(1), KeyCode::Down => app.runtime_selected = (app.runtime_selected + 1).min(RUNTIMES.len().saturating_sub(1)), KeyCode::Enter => apply_selected_runtime(app), _ => {} },
         View::MergeTarget => match key.code { KeyCode::Esc => { app.merge_filter.clear(); app.merge_candidate_id = None; app.selected = 0; app.view = View::ReviewDetail; app.status = "Merge cancelled".into(); }, KeyCode::Enter => merge_into_selected_target(app), KeyCode::Up => app.selected = app.selected.saturating_sub(1), KeyCode::Down => app.selected = (app.selected + 1).min(app.items_len().saturating_sub(1)), KeyCode::Backspace => { app.merge_filter.pop(); app.selected = 0; }, KeyCode::Char(ch) if !ctrl => { app.merge_filter.push(ch); app.selected = 0; }, _ => {} },
         View::KnowledgeGraph => match key.code { KeyCode::Esc | KeyCode::Char('q') => app.view = app.graph_return, KeyCode::Up => app.graph_selected = app.graph_selected.saturating_sub(1), KeyCode::Down => app.graph_selected = (app.graph_selected + 1).min(app.graph_nodes.len().saturating_sub(1)), KeyCode::Enter => open_graph_node_detail(app), _ => {} },
@@ -259,6 +369,231 @@ fn handle_list_key(app: &mut App, key: KeyEvent, ctrl: bool) {
         KeyCode::Char('m') if view == View::Review => open_merge_target(app),
         KeyCode::Char('r') if view == View::Review => reject_candidate(app),
         KeyCode::Char('g') if view == View::Knowledge || view == View::Method => open_graph(app, view), KeyCode::Up => app.selected = app.selected.saturating_sub(1), KeyCode::Down => app.selected = (app.selected + 1).min(app.items_len().saturating_sub(1)), KeyCode::Backspace => { filter.pop(); app.selected = 0; }, KeyCode::Char(ch) if !ctrl => { filter.push(ch); app.selected = 0; }, _ => {}
+    }
+}
+
+fn handle_goals_key(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App, key: KeyEvent, ctrl: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if app.goal_compose.is_some() {
+        let mention_is_open = app.goal_compose.as_deref().is_some_and(mention_open);
+        match key.code {
+            KeyCode::Esc if mention_is_open => { app.mention_sel = 0; app.mention_dynamic.clear(); }
+            KeyCode::Tab if mention_is_open => {
+                if let Some(mut objective) = app.goal_compose.take() {
+                    app.accept_mention_for(&mut objective);
+                    app.sync_mention_for(&objective);
+                    app.goal_compose = Some(objective);
+                }
+            }
+            KeyCode::Up if mention_is_open => {
+                if let Some(objective) = app.goal_compose.clone() { app.move_mention_for(&objective, -1); }
+            }
+            KeyCode::Down if mention_is_open => {
+                if let Some(objective) = app.goal_compose.clone() { app.move_mention_for(&objective, 1); }
+            }
+            KeyCode::Enter if mention_is_open => {
+                if let Some(mut objective) = app.goal_compose.take() {
+                    app.accept_mention_for(&mut objective);
+                    app.sync_mention_for(&objective);
+                    app.goal_compose = Some(objective);
+                }
+            }
+            KeyCode::Esc => {
+                app.goal_compose = None;
+                app.mention_dynamic.clear();
+                if app.goals.is_empty() {
+                    // Nothing to manage yet; Esc backs out of the panel entirely
+                    // rather than leaving an empty shell that only says "press n".
+                    app.view = View::Chat;
+                    app.status = "Learn ready".into();
+                } else {
+                    app.status = "Cancelled".into();
+                }
+            }
+            KeyCode::Backspace => { if let Some(objective) = app.goal_compose.as_mut() { objective.pop(); } let text = app.goal_compose.clone().unwrap_or_default(); app.sync_mention_for(&text); }
+            KeyCode::Enter | KeyCode::Char('\n') if wants_newline(key) => { if let Some(objective) = app.goal_compose.as_mut() { objective.push('\n'); } let text = app.goal_compose.clone().unwrap_or_default(); app.sync_mention_for(&text); }
+            KeyCode::Enter if !app.goal_compose.as_deref().unwrap_or_default().trim().is_empty() => { let objective = app.goal_compose.take().unwrap_or_default(); create_goal_from_objective(app, &objective); }
+            KeyCode::Char(ch) if !ctrl => { if let Some(objective) = app.goal_compose.as_mut() { objective.push(ch); } let text = app.goal_compose.clone().unwrap_or_default(); app.sync_mention_for(&text); }
+            _ => {}
+        }
+        return Ok(());
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.view = View::Chat,
+        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Down => app.selected = (app.selected + 1).min(app.items_len().saturating_sub(1)),
+        KeyCode::Char('n') => { app.goal_compose = Some(String::new()); app.status = "Describe what Methodus should keep following · Enter creates it · ⇧Enter newline".into(); }
+        // Enter starts the first/next learning turn — same gesture as Learn.
+        // Policy refinement stays on `e`, so creating never forces a YAML round-trip.
+        KeyCode::Enter | KeyCode::Char('r') => request_goal_now(app, WorkKind::Learn),
+        KeyCode::Char('e') => { let id = app.selected_goal().map(|goal| goal.id.clone()); match id { Some(id) => author_goal(terminal, app, Some(&id))?, None => app.status = "No Goal selected · press n to describe one".into() } }
+        KeyCode::Char(' ') => toggle_goal(app),
+        KeyCode::Char('s') => request_goal_now(app, WorkKind::Summary),
+        KeyCode::Char('d') => delete_goal(app),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_attention_key(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App, key: KeyEvent, ctrl: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(reply) = app.attention_reply.as_mut() {
+        match key.code {
+            KeyCode::Esc => { app.attention_reply = None; app.status = "Answer discarded".into(); }
+            KeyCode::Backspace => { reply.pop(); }
+            KeyCode::Enter | KeyCode::Char('\n') if wants_newline(key) => reply.push('\n'),
+            KeyCode::Enter if !reply.trim().is_empty() => answer_attention(terminal, app)?,
+            KeyCode::Char(ch) if !ctrl => reply.push(ch),
+            _ => {}
+        }
+        return Ok(());
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.view = View::Chat,
+        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Down => app.selected = (app.selected + 1).min(app.items_len().saturating_sub(1)),
+        KeyCode::Enter | KeyCode::Char('a') => { if app.selected_attention().is_some() { app.attention_reply = Some(String::new()); app.status = "Type an answer · Enter resumes the session · ⇧Enter newline · Esc cancels".into(); } else { app.status = "Nothing is waiting on you".into(); } }
+        KeyCode::Char('d') => dismiss_attention(app),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Carry the typed answer back into the session that asked for it.
+///
+/// The attention is only resolved once the native turn has actually run, so a
+/// handoff that never launched leaves the question in the queue.
+fn answer_attention(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(answer) = app.attention_reply.take().map(|reply| reply.trim().to_string()) else { return Ok(()); };
+    let Some(attention) = app.selected_attention().cloned() else { app.status = "Nothing is waiting on you".into(); return Ok(()); };
+    let handoff = match app.engine.prepare_attention_handoff(&attention, &answer) {
+        Ok(handoff) => handoff,
+        Err(error) => { app.status = format!("Could not resume the session: {error}"); return Ok(()); }
+    };
+    app.view = View::Chat;
+    app.say(format!("You: {answer}"));
+    app.say(format!("Methodus: Resuming {} to deliver your answer to “{}”…", runtime_label(&handoff.runtime), attention.title));
+    app.status = format!("Handoff → {}", runtime_label(&handoff.runtime));
+    terminal.draw(|frame| draw(frame, app))?;
+    match run_native_learn_handoff(terminal, &handoff) {
+        Ok(exit_status) => {
+            let _ = app.engine.resolve_attention(&attention.id, &answer);
+            app.learning_session_id = Some(handoff.run_id.clone());
+            app.learning_executor_sid = handoff.executor_sid.clone();
+            app.learning_goal_id = attention.goal_id.clone();
+            match app.engine.complete_native_learning(&handoff, &exit_status) {
+                Ok(result) if !result.candidate_ids.is_empty() => { app.say(format!("Methodus: Answered and imported {} candidate(s). Open /review to inspect them.", result.candidate_ids.len())); app.status = format!("Answered · {} candidate(s) ready for review", result.candidate_ids.len()); }
+                Ok(_) => { app.say("Methodus: Answered; the session returned without a candidate set. It stays resumable.".to_string()); app.status = "Answered · session resumable".into(); }
+                Err(error) => { app.say(format!("Methodus: Answered, but the Learn record could not be finalized: {error}")); app.status = "Answer recorded; run needs attention".into(); }
+            }
+            app.refresh();
+        }
+        Err(error) => { app.attention_reply = Some(answer); app.say(format!("Methodus: Could not hand the terminal to {}: {error}", runtime_label(&handoff.runtime))); app.status = "Handoff failed · the question is still open".into(); }
+    }
+    Ok(())
+}
+
+/// Close a question without answering it, for the ones a maintainer decides are
+/// moot. The Goal unblocks and its next scheduled turn starts fresh.
+fn dismiss_attention(app: &mut App) {
+    let Some(attention) = app.selected_attention().cloned() else { app.status = "Nothing is waiting on you".into(); return; };
+    if !confirm_action(app, ConfirmAction::DismissAttention, &format!("Confirm dismissal of '{}'", attention.title)) { return; }
+    match app.engine.resolve_attention(&attention.id, "dismissed by the maintainer without an answer") {
+        Ok(_) => { app.refresh_attentions(); app.background.wake(); app.selected = app.selected.min(app.attentions.len().saturating_sub(1)); app.status = format!("Dismissed {}", attention.title); }
+        Err(error) => app.status = format!("Could not dismiss the question: {error}"),
+    }
+}
+
+/// Turn one typed sentence into a Goal, the way Learn turns one into a run.
+///
+/// Creation also queues the first learning turn immediately. A Goal that only
+/// exists on a weekly calendar feels dead on arrival; the cadence still governs
+/// every subsequent turn.
+fn create_goal_from_objective(app: &mut App, objective: &str) {
+    let objective = objective.trim().to_string();
+    if objective.is_empty() { return; }
+    match app.engine.create_goal_from_objective(&objective) {
+        Ok(goal) => {
+            let quiet = goal.is_quiet_at(chrono::Local::now().time());
+            // Bring the first Learn forward before the scheduler is woken, so
+            // the same tick that notices the new Goal also launches it.
+            let _ = app.engine.request_goal_now(&goal.id, WorkKind::Learn);
+            app.refresh_goals();
+            app.background.wake();
+            app.selected = app.goals.iter().position(|item| item.id == goal.id).unwrap_or(0);
+            app.status = if quiet {
+                format!("Created “{}” · first turn waits for quiet hours to end · e adjusts policy", goal.title)
+            } else {
+                format!("Created “{}” · first learning turn starting · e adjusts policy", goal.title)
+            };
+        }
+        Err(error) => { app.goal_compose = Some(objective); app.status = format!("Could not create the Goal: {error}"); }
+    }
+}
+
+/// Write a Goal through `$EDITOR`. `id` selects edit over create.
+///
+/// The draft lives in the Methodus home rather than a temp dir so a rejected
+/// form survives the round trip and the maintainer can fix it in place.
+fn author_goal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App, id: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rendered = match id { Some(id) => app.engine.goal_form(id), None => app.engine.new_goal_form() };
+    let template = match rendered { Ok(text) => text, Err(error) => { app.status = format!("Could not render the Goal form: {error}"); return Ok(()); } };
+    let path = app.engine.home().join("goal-form.yaml");
+    // A leftover draft is reused only when it belongs to this same Goal, so a
+    // rejected form can be fixed in place instead of being retyped.
+    let resume_draft = app.goal_draft_is_for(id) && path.exists();
+    if !resume_draft { if let Err(error) = fs::write(&path, &template) { app.status = format!("Could not write the Goal form: {error}"); return Ok(()); } }
+    app.goal_draft = None;
+    match run_editor(terminal, &path) {
+        Ok(status) if !status.success() => { app.status = format!("Editor exit code: {}", status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".into())); return Ok(()); }
+        Err(error) => { app.status = format!("Could not start editor: {error}"); return Ok(()); }
+        Ok(_) => {}
+    }
+    let edited = match fs::read_to_string(&path) { Ok(text) => text, Err(error) => { app.status = format!("Could not read the Goal form: {error}"); return Ok(()); } };
+    if !resume_draft && edited == template { let _ = fs::remove_file(&path); app.status = "Goal form left unchanged".into(); return Ok(()); }
+    let form = match parse_form(&edited) {
+        Ok(form) => form,
+        Err(error) => { app.goal_draft = Some(GoalDraft::for_id(id)); app.status = format!("Goal form rejected: {error} · press {} to fix the draft", if id.is_some() { "e" } else { "n" }); return Ok(()); }
+    };
+    let saved = match id { Some(id) => app.engine.edit_goal(id, form), None => app.engine.create_goal(form) };
+    match saved {
+        Ok(goal) => {
+            let _ = fs::remove_file(&path);
+            app.refresh_goals();
+            app.background.wake();
+            app.selected = app.goals.iter().position(|item| item.id == goal.id).unwrap_or(0);
+            app.status = format!("{} {}", if id.is_some() { "Updated" } else { "Created" }, goal.title);
+        }
+        Err(error) => { app.goal_draft = Some(GoalDraft::for_id(id)); app.status = format!("Could not save the Goal: {error}"); }
+    }
+    Ok(())
+}
+
+fn toggle_goal(app: &mut App) {
+    let Some(goal) = app.selected_goal() else { app.status = "No Goal selected".into(); return; };
+    let (id, enabled, title) = (goal.id.clone(), !goal.enabled, goal.title.clone());
+    match app.engine.set_goal_enabled(&id, enabled) {
+        Ok(_) => { app.refresh_goals(); app.background.wake(); app.status = format!("{title} {}", if enabled { "enabled · schedules restarted from now" } else { "paused" }); }
+        Err(error) => app.status = format!("Could not change the Goal: {error}"),
+    }
+}
+
+fn request_goal_now(app: &mut App, work: WorkKind) {
+    let Some(goal) = app.selected_goal() else { app.status = "No Goal selected".into(); return; };
+    if !goal.enabled { app.status = format!("{} is paused · press space to enable it", goal.title); return; }
+    let (id, title) = (goal.id.clone(), goal.title.clone());
+    let quiet = goal.is_quiet_at(chrono::Local::now().time());
+    match app.engine.request_goal_now(&id, work) {
+        Ok(_) => { app.refresh_goals(); app.background.wake(); app.status = if quiet { format!("{title}: {work} queued · starts when quiet hours end") } else { format!("{title}: {work} starting") }; }
+        Err(error) => app.status = format!("Could not queue the turn: {error}"),
+    }
+}
+
+fn delete_goal(app: &mut App) {
+    let Some(goal) = app.selected_goal() else { app.status = "No Goal selected".into(); return; };
+    let (id, title) = (goal.id.clone(), goal.title.clone());
+    if !confirm_action(app, ConfirmAction::DeleteGoal, &format!("Confirm deletion of Goal '{title}'")) { return; }
+    match app.engine.delete_goal(&id) {
+        Ok(_) => { app.refresh_goals(); app.selected = app.selected.min(app.goals.len().saturating_sub(1)); app.status = format!("Deleted {title}"); }
+        Err(error) => app.status = format!("Delete failed: {error}"),
     }
 }
 
@@ -329,7 +664,7 @@ fn run_native_learn_handoff(terminal: &mut Terminal<CrosstermBackend<std::io::St
     Ok(status.code().map(|code| format!("exit {code}")).unwrap_or_else(|| "terminated by signal".into()))
 }
 
-fn command(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { let matches = matching_slash(&app.input); let Some(command) = matches.get(app.slash_sel).copied() else { app.status = "Unknown command; type / to browse available commands".into(); return Ok(()); }; let rest = slash_rest(&app.input); app.clear_input(); match command.name { "knowledge" => app.panel(View::Knowledge), "method" => app.panel(View::Method), "experience" => app.panel(View::Experience), "review" => app.panel(View::Review), "team" => app.panel(View::Team), "health" => app.panel(View::Health), "runtime" => { if rest.is_empty() { open_runtime_picker(app); } else { select_runtime(app, &rest); } }, "open" => open_path(terminal, app, &rest)?, "help" => app.panel(View::Help), "new" => { close_current_learning(app); if !rest.is_empty() { app.input = rest; app.input_cursor = app.input.len(); return submit_chat(terminal, app); } }, "quit" => app.quit = true, _ => app.status = format!("Unknown command /{}", command.name) } Ok(()) }
+fn command(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { let matches = matching_slash(&app.input); let Some(command) = matches.get(app.slash_sel).copied() else { app.status = "Unknown command; type / to browse available commands".into(); return Ok(()); }; let rest = slash_rest(&app.input); app.clear_input(); match command.name { "attention" => app.panel(View::Attention), "goal" => { if rest.is_empty() { app.panel(View::Goals); } else { app.view = View::Goals; app.refresh(); create_goal_from_objective(app, &rest); } }, "knowledge" => app.panel(View::Knowledge), "method" => app.panel(View::Method), "experience" => app.panel(View::Experience), "review" => app.panel(View::Review), "team" => app.panel(View::Team), "health" => app.panel(View::Health), "runtime" => { if rest.is_empty() { open_runtime_picker(app); } else { select_runtime(app, &rest); } }, "open" => open_path(terminal, app, &rest)?, "help" => app.panel(View::Help), "new" => { close_current_learning(app); if !rest.is_empty() { app.input = rest; app.input_cursor = app.input.len(); return submit_chat(terminal, app); } }, "quit" => app.quit = true, _ => app.status = format!("Unknown command /{}", command.name) } Ok(()) }
 
 fn open_path(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App, requested: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = if requested.trim().is_empty() {
@@ -359,22 +694,27 @@ fn edit_current_node(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
         return Ok(());
     }
     let path = app.engine.home().join(relative);
-    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-    let mut command = editor.split_whitespace();
-    let Some(program) = command.next() else { app.status = "EDITOR is empty".into(); return Ok(()); };
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    let result = Command::new(program).args(command).arg(&path).status();
-    stdout().execute(EnterAlternateScreen)?;
-    enable_raw_mode()?;
-    terminal.clear()?;
-    match result {
+    match run_editor(terminal, &path) {
         Ok(status) if status.success() => { app.refresh(); app.status = format!("Reloaded {}", node.title); }
         Ok(status) => app.status = format!("Editor exit code: {}", status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".into())),
         Err(error) => app.status = format!("Could not start editor: {error}"),
     }
     Ok(())
 }
+/// Hand the terminal to `$EDITOR` for one file and take it back afterwards.
+fn run_editor(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, path: &Path) -> Result<ExitStatus, Box<dyn std::error::Error + Send + Sync>> {
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    let mut command = editor.split_whitespace();
+    let program = command.next().ok_or("EDITOR is empty")?;
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
+    let launch = Command::new(program).args(command).arg(path).status();
+    stdout().execute(EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+    Ok(launch?)
+}
+
 fn delete_node(app: &mut App) {
     let Some(node) = app.nodes.iter().find(|node| node.id == app.detail_node_id).cloned() else { app.status = "Current node not found".into(); return; };
     if !confirm_action(app, ConfirmAction::Delete, &format!("Confirm deletion of '{}' from the graph", node.title)) { return; }
@@ -426,9 +766,9 @@ fn open_merge_target(app: &mut App) {
 fn merge_into_selected_target(app: &mut App) { let Some(candidate_id) = app.merge_candidate_id.clone() else { app.status = "No candidate is waiting to be merged".into(); app.view = View::Review; return; }; let targets = filtered_nodes(app.engine.home(), &app.nodes, "knowledge", Some("committed"), &app.merge_filter); let Some(target) = targets.get(app.selected) else { app.status = "Select a committed knowledge target".into(); return; }; if !confirm_action(app, ConfirmAction::Merge, &format!("Confirm merging the candidate into '{}'", target.title)) { return; } match app.engine.merge_graph_candidate(&candidate_id, &target.id) { Ok(()) => { app.status = format!("Merged into {}", target.title); app.merge_candidate_id = None; app.merge_filter.clear(); app.selected = 0; app.view = View::Review; app.refresh(); }, Err(error) => app.status = format!("Merge failed: {error}") } }
 
 fn draw(frame: &mut Frame, app: &App) { let theme = Theme::current(); let area = frame.area(); frame.render_widget(Block::default().style(Style::default().bg(theme.surface)), area); if area.width < 80 || area.height < 24 { frame.render_widget(Paragraph::new(format!("{MARK}  {WORDMARK}\n\nterminal too small — need 80 × 24")).style(theme.dim()).alignment(Alignment::Center), area); return; } let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)]).split(area); draw_header(frame, rows[0], app, &theme); match app.view { View::Chat => draw_chat(frame, rows[1], app, &theme), View::KnowledgeDetail | View::ExperienceDetail | View::ReviewDetail => draw_detail(frame, rows[1], app, &theme), View::KnowledgeGraph => draw_graph(frame, rows[1], app, &theme), _ => frame.render_widget(Block::default().style(Style::default().bg(theme.overlay)), rows[1]) } if matches!(app.view, View::Help | View::Knowledge | View::Method | View::Experience | View::Review | View::Team | View::Health | View::Runtime | View::MergeTarget) { draw_overlay(frame, rows[1], app, &theme); } draw_footer(frame, rows[2], app, &theme); }
-fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let active = match app.view { View::Chat => "learn", View::Knowledge | View::KnowledgeDetail | View::KnowledgeGraph => "knowledge", View::Method => "method", View::Experience | View::ExperienceDetail => "experience", View::Review | View::ReviewDetail | View::MergeTarget => "review", View::Team => "team", View::Health => "health", View::Runtime => "runtime", View::Help => "help" }; let candidates = app.nodes.iter().filter(|node| node.status.as_deref() == Some("candidate")).count(); let line = Line::from(vec![Span::styled(format!(" {MARK} "), theme.accent()), Span::styled(WORDMARK, theme.accent()), Span::styled(format!("  {} · {active}", runtime_label(&app.runtime)), theme.dim()), Span::styled(format!("  graph:{}", app.nodes.len()), theme.dim()), Span::styled(if candidates == 0 { String::new() } else { format!("  ▣{candidates}") }, Style::default().fg(theme.warning))]); frame.render_widget(Paragraph::new(line).style(theme.text()), area); }
+fn draw_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let active = match app.view { View::Chat => "learn", View::Knowledge | View::KnowledgeDetail | View::KnowledgeGraph => "knowledge", View::Method => "method", View::Experience | View::ExperienceDetail => "experience", View::Review | View::ReviewDetail | View::MergeTarget => "review", View::Team => "team", View::Health => "health", View::Runtime => "runtime", View::Help => "help", View::Goals => "goals", View::Attention => "attention" }; let candidates = app.nodes.iter().filter(|node| node.status.as_deref() == Some("candidate")).count(); let line = Line::from(vec![Span::styled(format!(" {MARK} "), theme.accent()), Span::styled(WORDMARK, theme.accent()), Span::styled(format!("  {} · {active}", runtime_label(&app.runtime)), theme.dim()), Span::styled(format!("  graph:{}", app.nodes.len()), theme.dim()), Span::styled(if candidates == 0 { String::new() } else { format!("  ▣{candidates}") }, Style::default().fg(theme.warning)), Span::styled(if app.attentions.is_empty() { String::new() } else { format!("  ⚑{}", app.attentions.len()) }, Style::default().fg(theme.error)), Span::styled(match app.background.busy_count() { 0 => String::new(), running => format!("  ◇{running}") }, Style::default().fg(theme.info))]); frame.render_widget(Paragraph::new(line).style(theme.text()), area); }
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let style = if app.status.contains("failed") || app.status.contains("Failed") || app.status.contains("Could not") { Style::default().fg(theme.error).add_modifier(Modifier::BOLD) } else if app.status.starts_with("Deleted") || app.status.starts_with("Revalidated") || app.status.starts_with("Promoted") || app.status.starts_with("Rejected") || app.status.starts_with("Merged") || app.status.starts_with("Opened") || app.status.starts_with("Reloaded") || app.status.starts_with("Publish plan written") { Style::default().fg(theme.success) } else { Style::default().fg(theme.info) }; frame.render_widget(Paragraph::new(app.status.as_str()).style(style), area); }
-fn draw_chat(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let slash_open = slash_menu_open(&app.input); let mention_open = !slash_open && mention_open(&app.input); let slash_height = if slash_open { (matching_slash(&app.input).len().max(1) as u16 + 2).min(8) } else { 0 }; let mention_height = if mention_open { (app.matching_mentions().len().max(1) as u16 + 2).min(8) } else { 0 }; let composer_height = composer_height(&app.input, area.width); let mut constraints = vec![Constraint::Min(3)]; if slash_open { constraints.push(Constraint::Length(slash_height)); } if mention_open { constraints.push(Constraint::Length(mention_height)); } constraints.push(Constraint::Length(composer_height)); let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area); if app.show_welcome { draw_welcome(frame, rows[0], theme); } else { draw_transcript(frame, rows[0], app, theme); } let mut index = 1; if slash_open { draw_slash_menu(frame, rows[index], app, theme); index += 1; } if mention_open { draw_mention_menu(frame, rows[index], app, theme); index += 1; } draw_composer(frame, rows[index], app, theme); }
+fn draw_chat(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let slash_open = slash_menu_open(&app.input); let mention_open = !slash_open && mention_open(&app.input); let slash_height = if slash_open { (matching_slash(&app.input).len().max(1) as u16 + 2).min(8) } else { 0 }; let mention_height = if mention_open { (app.matching_mentions().len().max(1) as u16 + 2).min(8) } else { 0 }; let composer_height = composer_height(&app.input, area.width); let mut constraints = vec![Constraint::Min(3)]; if slash_open { constraints.push(Constraint::Length(slash_height)); } if mention_open { constraints.push(Constraint::Length(mention_height)); } constraints.push(Constraint::Length(composer_height)); let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area); if app.show_welcome { draw_welcome(frame, rows[0], theme); } else { draw_transcript(frame, rows[0], app, theme); } let mut index = 1; if slash_open { draw_slash_menu(frame, rows[index], app, theme); index += 1; } if mention_open { draw_mention_menu(frame, rows[index], app, theme, &app.input); index += 1; } draw_composer(frame, rows[index], app, theme); }
 
 fn draw_welcome(frame: &mut Frame, area: Rect, theme: &Theme) {
     const LOGO: [&str; 5] = [
@@ -448,12 +788,132 @@ fn draw_welcome(frame: &mut Frame, area: Rect, theme: &Theme) {
     ]);
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center).style(theme.text()), area);
 }
-fn draw_mention_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let matches = app.matching_mentions(); let items = if matches.is_empty() { vec![ListItem::new("  no matching path").style(theme.dim())] } else { matches.iter().map(|candidate| ListItem::new(format!("  {}{}", if candidate.is_dir { "▸ " } else { "· " }, candidate.label)).style(theme.text())).collect() }; let mut state = ListState::default(); if !matches.is_empty() { state.select(Some(app.mention_sel)); } frame.render_stateful_widget(List::new(items).block(Block::default().borders(Borders::TOP).border_style(theme.border(true)).title(" @  ↑↓ select · Tab complete · Enter attach ")).highlight_style(theme.selected()).highlight_symbol("› "), area, &mut state); }
+fn draw_mention_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, text: &str) { let matches = app.matching_mentions_for(text); let items = if matches.is_empty() { vec![ListItem::new("  no matching path").style(theme.dim())] } else { matches.iter().map(|candidate| ListItem::new(format!("  {}{}", if candidate.is_dir { "▸ " } else { "· " }, candidate.label)).style(theme.text())).collect() }; let mut state = ListState::default(); if !matches.is_empty() { state.select(Some(app.mention_sel)); } frame.render_stateful_widget(List::new(items).block(Block::default().borders(Borders::TOP).border_style(theme.border(true)).title(" @  ↑↓ select · Tab complete · Enter attach ")).highlight_style(theme.selected()).highlight_symbol("› "), area, &mut state); }
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let width = area.width.max(8) as usize; let cached = TRANSCRIPT_CACHE.with(|cache| { let mut cache = cache.borrow_mut(); if cache.version != app.transcript_version || cache.width != width { cache.rows = layout_transcript(&app.transcript, width); cache.version = app.transcript_version; cache.width = width; } cache.rows.clone() }); let height = area.height.max(1) as usize; let max_offset = cached.len().saturating_sub(height); let offset = app.transcript_offset.min(max_offset); let end = cached.len().saturating_sub(offset); let start = end.saturating_sub(height); let lines = if cached.is_empty() { vec![Line::default(), Line::from(Span::styled(format!("{MARK}  {WORDMARK}"), theme.accent()))] } else { cached[start..end].iter().map(|row| transcript_line(row, theme)).collect() }; frame.render_widget(Paragraph::new(lines).style(theme.text()), area); }
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let inner_width = area.width.saturating_sub(4).max(8) as usize; let (shown, cursor_col, cursor_row) = composer_view(&app.input, app.input_cursor, inner_width, COMPOSER_MAX_ROWS); let title = format!(" learn · permission: {} · ⇧Tab cycle · Enter send · ⇧Enter newline ", permission_label(&app.permission_mode)); frame.render_widget(Paragraph::new(shown.into_iter().map(Line::from).collect::<Vec<_>>()).style(theme.text()).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(theme.border(true)).title(title)), area); let x = area.x.saturating_add(1).saturating_add(cursor_col); let y = area.y.saturating_add(1).saturating_add(cursor_row); if x < area.right().saturating_sub(1) && y < area.bottom().saturating_sub(1) { frame.set_cursor_position(Position { x, y }); } }
 fn draw_slash_menu(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let matches = matching_slash(&app.input); let items = if matches.is_empty() { vec![ListItem::new("  no matching command").style(theme.dim())] } else { matches.iter().map(|command| ListItem::new(format!("  /{}  {}", command.name, command.summary)).style(theme.text())).collect() }; let mut state = ListState::default(); if !matches.is_empty() { state.select(Some(app.slash_sel)); } frame.render_stateful_widget(List::new(items).block(Block::default().borders(Borders::TOP).border_style(theme.border(true)).title(" /  ↑↓ select · Tab complete · Enter run ")).highlight_style(theme.selected()).highlight_symbol("› "), area, &mut state); }
 
-fn draw_overlay(frame: &mut Frame, base: Rect, app: &App, theme: &Theme) { let popup = centered(base, if app.view == View::Runtime { 68 } else { 88 }, if app.view == View::Runtime { 46 } else { 82 }); frame.render_widget(Clear, popup); let title = match app.view { View::Help => " help · commands & controls ".into(), View::Knowledge => format!(" knowledge · filter: {} ", display_filter(&app.knowledge_filter)), View::Method => format!(" method · filter: {} ", display_filter(&app.method_filter)), View::Experience => format!(" experience · filter: {} ", display_filter(&app.experience_filter)), View::Review => format!(" review · filter: {} ", display_filter(&app.review_filter)), View::MergeTarget => format!(" merge target · filter: {} ", display_filter(&app.merge_filter)), View::Team => " team · local Markdown roots ".into(), View::Health => " health · runtime and index checks ".into(), View::Runtime => " runtime · ↑↓ select · Enter apply · Esc cancel ".into(), _ => return }; let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(theme.border(true)).style(Style::default().bg(theme.overlay).fg(theme.overlay_fg)).title(Span::styled(title, theme.accent())); let inner = block.inner(popup); frame.render_widget(block, popup); match app.view { View::Help => draw_help(frame, inner, theme), View::Team => draw_team(frame, inner, app, theme), View::Health => draw_health(frame, inner, app, theme), View::Runtime => draw_runtime_picker(frame, inner, app, theme), _ => draw_nodes(frame, inner, app, theme) } }
+fn draw_overlay(frame: &mut Frame, base: Rect, app: &App, theme: &Theme) { let popup = centered(base, if app.view == View::Runtime { 68 } else { 88 }, if app.view == View::Runtime { 46 } else { 82 }); frame.render_widget(Clear, popup); let title = match app.view { View::Help => " help · commands & controls ".into(), View::Knowledge => format!(" knowledge · filter: {} ", display_filter(&app.knowledge_filter)), View::Method => format!(" method · filter: {} ", display_filter(&app.method_filter)), View::Experience => format!(" experience · filter: {} ", display_filter(&app.experience_filter)), View::Review => format!(" review · filter: {} ", display_filter(&app.review_filter)), View::MergeTarget => format!(" merge target · filter: {} ", display_filter(&app.merge_filter)), View::Team => " team · local Markdown roots ".into(), View::Health => " health · runtime and index checks ".into(), View::Goals => " goals · continuous learning schedule ".into(), View::Attention => format!(" attention · {} waiting on you ", app.attentions.len()), View::Runtime => " runtime · ↑↓ select · Enter apply · Esc cancel ".into(), _ => return }; let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(theme.border(true)).style(Style::default().bg(theme.overlay).fg(theme.overlay_fg)).title(Span::styled(title, theme.accent())); let inner = block.inner(popup); frame.render_widget(block, popup); match app.view { View::Help => draw_help(frame, inner, theme), View::Team => draw_team(frame, inner, app, theme), View::Health => draw_health(frame, inner, app, theme), View::Goals => draw_goals(frame, inner, app, theme), View::Attention => draw_attention(frame, inner, app, theme), View::Runtime => draw_runtime_picker(frame, inner, app, theme), _ => draw_nodes(frame, inner, app, theme) } }
+
+fn draw_attention(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let reply_lines = app.attention_reply.as_ref().map(|reply| reply.lines().count().max(1)).unwrap_or(0);
+    // Two chrome lines (hint + border) plus one row per line of the reply, capped
+    // so a long answer cannot push the list off the screen.
+    let footer_height = if reply_lines == 0 { 3 } else { (2 + reply_lines as u16).min(8) };
+    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(5), Constraint::Length(footer_height)]).split(area);
+    let cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(44), Constraint::Percentage(56)]).split(rows[0]);
+    let now = Utc::now();
+    let items = app.attentions.iter().map(|attention| {
+        let kind = match attention.kind { AttentionKind::Permission => "permission", AttentionKind::Question => "question" };
+        ListItem::new(Line::from(vec![Span::styled(format!("{kind:<11}"), Style::default().fg(theme.warning)), Span::styled(&attention.title, theme.text()), Span::styled(format!("   {}", elapsed_since(attention.created_at, now)), theme.dim())]))
+    }).collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !app.attentions.is_empty() { state.select(Some(app.selected)); }
+    frame.render_stateful_widget(List::new(items).highlight_style(theme.selected()).highlight_symbol("› "), cols[0], &mut state);
+    let detail = app.attentions.get(app.selected).map(|attention| {
+        let goal = attention.goal_id.as_ref().and_then(|id| app.goals.iter().find(|goal| &goal.id == id)).map(|goal| goal.title.as_str()).unwrap_or("—");
+        format!(
+            "{}\n\n{}\n\ngoal        {}\nasked       {}\nrun         {}\ncontext     {}\ntool        {}\n\nYour answer is delivered by resuming this very session, so the turn picks up where it stopped.",
+            attention.title, attention.prompt, goal, elapsed_since(attention.created_at, now), attention.run_id,
+            attention.context.as_deref().unwrap_or("—"),
+            attention.tool_name.as_deref().unwrap_or("—"),
+        )
+    }).unwrap_or_else(|| "Nothing is waiting on you.\n\nWhen an unattended turn hits a decision it cannot make alone, it stops and asks here instead of guessing.".into());
+    frame.render_widget(Paragraph::new(detail).style(theme.overlay_text()).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::LEFT).border_style(theme.border(false))), cols[1]);
+    let footer = match (&app.attention_reply, app.confirmation) {
+        (Some(reply), _) => {
+            let preview = if reply.is_empty() { "▏".to_string() } else { format!("{reply}▏") };
+            format!(" answer · Enter resume · ⇧Enter newline · Esc cancel\n› {preview}")
+        }
+        (None, Some(ConfirmAction::DismissAttention)) => " Confirm dismissal: press d again\n [Enter] answer and resume   [d] dismiss · Esc back".into(),
+        (None, _) => " Answering hands the terminal to the runtime holding this session\n [Enter] answer and resume   [d] dismiss · Esc back".into(),
+    };
+    frame.render_widget(Paragraph::new(footer).style(theme.overlay_text()).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::TOP).border_style(theme.border(true))), rows[1]);
+}
+
+/// How long ago something happened, at the granularity a person cares about.
+fn elapsed_since(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = (now - at).num_seconds().max(0);
+    match seconds {
+        ..=90 => "just now".into(),
+        ..=5400 => format!("{}m ago", seconds / 60),
+        ..=172_800 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+fn draw_goals(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let compose_lines = app.goal_compose.as_ref().map(|text| text.lines().count().max(1)).unwrap_or(0);
+    let footer_height = if compose_lines == 0 { 3 } else { (2 + compose_lines as u16).min(8) };
+    let goal_text = app.goal_compose.as_deref().unwrap_or_default();
+    let goal_mention_open = app.goal_compose.as_deref().is_some_and(mention_open);
+    let mention_height = if goal_mention_open { (app.matching_mentions_for(goal_text).len().max(1) as u16 + 2).min(8) } else { 0 };
+    let mut constraints = vec![Constraint::Min(5)];
+    if goal_mention_open { constraints.push(Constraint::Length(mention_height)); }
+    constraints.push(Constraint::Length(footer_height));
+    let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+    let cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(44), Constraint::Percentage(56)]).split(rows[0]);
+    let now = Utc::now();
+    let items = app.goals.iter().map(|goal| {
+        let (marker, marker_style) = if !goal.enabled { ("paused ", theme.dim()) } else if app.background.is_running(&goal.id) { ("running", Style::default().fg(theme.info)) } else { ("ready  ", Style::default().fg(theme.success)) };
+        ListItem::new(Line::from(vec![Span::styled(format!("{marker}  "), marker_style), Span::styled(&goal.title, theme.text()), Span::styled(format!("   {}", relative_time(goal.next_at(WorkKind::Learn), now)), theme.dim())]))
+    }).collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !app.goals.is_empty() { state.select(Some(app.selected)); }
+    frame.render_stateful_widget(List::new(items).highlight_style(theme.selected()).highlight_symbol("› "), cols[0], &mut state);
+    let detail = match (&app.goal_compose, app.goals.get(app.selected)) {
+        (Some(_), _) => "A Goal is a standing question Methodus keeps working on by itself.\n\nSay it the way you would say a learning goal — one or two sentences about what you want followed and why it matters. Use @ to attach evidence sources.\n\nEnter creates it and starts the first learning turn now. Later turns follow the default cadence. Press e afterwards to change cadence, sources, quiet hours, or budget.".into(),
+        (None, Some(goal)) => goal_detail(goal, app, now),
+        (None, None) => "No Goals yet.\n\nPress n and describe what Methodus should keep following.".into(),
+    };
+    frame.render_widget(Paragraph::new(detail).style(theme.overlay_text()).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::LEFT).border_style(theme.border(false))), cols[1]);
+    let mut footer_index = 1;
+    if goal_mention_open {
+        draw_mention_menu(frame, rows[footer_index], app, theme, goal_text);
+        footer_index += 1;
+    }
+    let footer = match (&app.goal_compose, app.confirmation) {
+        (Some(objective), _) => {
+            let preview = if objective.is_empty() { "▏".to_string() } else { format!("{objective}▏") };
+            format!(" what should Methodus keep following? · @ attach source · Enter create · ⇧Enter newline · Esc cancel\n› {preview}")
+        }
+        (None, Some(ConfirmAction::DeleteGoal)) => " Confirm deletion: press d again\n [n] new   [Enter/r] learn now   [e] edit policy   [space] pause   [s] summarize now   [d] delete · Esc back".into(),
+        (None, _) => " Turns run headless; their results land in /review\n [n] new   [Enter/r] learn now   [e] edit policy   [space] pause   [s] summarize now   [d] delete · Esc back".into(),
+    };
+    frame.render_widget(Paragraph::new(footer).style(theme.overlay_text()).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::TOP).border_style(theme.border(true))), rows[footer_index]);
+}
+
+fn goal_detail(goal: &LearningGoal, app: &App, now: DateTime<Utc>) -> String {
+    let spent = app.goal_spend.get(&goal.id).copied().unwrap_or(0.0);
+    let schedule = WorkKind::ALL.iter().map(|work| format!("{:<12}{} · {}", work.to_string(), goal.cadence_for(*work), relative_time(goal.next_at(*work), now))).collect::<Vec<_>>().join("\n");
+    let sources = if goal.sources.is_empty() { "—".into() } else { goal.sources.join("\n            ") };
+    format!(
+        "{}\n\n{}\n\nstate       {}\nruntime     {} · {}\n{}\nquiet       {}\nbudget      ${:.2} of ${:.2} this month\nreview      {}\nsources     {}",
+        goal.title,
+        goal.prompt,
+        if goal.enabled { "enabled" } else { "paused" },
+        runtime_label(&goal.runtime), permission_label(&goal.permission_mode),
+        schedule,
+        goal.quiet_hours.map(|window| window.to_string()).unwrap_or_else(|| "—".into()),
+        spent, goal.budget_usd,
+        goal.review_policy,
+        sources,
+    )
+}
+
+/// A due timestamp as a person reads it. `None` means the cadence is manual, so
+/// the turn only happens when someone asks for it.
+fn relative_time(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(at) = at else { return "on request".into() };
+    let seconds = (at - now).num_seconds();
+    if seconds <= 0 { return "due now".into(); }
+    match seconds {
+        ..=90 => "in under a minute".into(),
+        ..=5400 => format!("in {}m", seconds / 60),
+        ..=172_800 => format!("in {}h", seconds / 3600),
+        _ => format!("in {}d", seconds / 86_400),
+    }
+}
 fn draw_nodes(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let (content, actions_area) = if app.view == View::Review {
         let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(5), Constraint::Length(3)]).split(area);
@@ -481,7 +941,7 @@ fn draw_nodes(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     }
 }
-fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) { let lines = vec![Line::from(Span::styled("Commands", theme.accent())), Line::from("Plain input   Start or continue the current Learn"), Line::from("/new          Close the current context and start a new Learn"), Line::from("/knowledge    Browse the knowledge graph and related nodes"), Line::from("/method       Browse reusable working methods"), Line::from("/experience   Browse validated task experience"), Line::from("/review       Review candidates and approve promotion"), Line::from("/team         Inspect the Personal / Team roots"), Line::from("/health       Check sources, indexes, and connector status"), Line::from("/runtime      Open the runtime picker; /runtime codex also works"), Line::from("/open         Open the current node or a path"), Line::from("/quit         Exit Methodus; q does not quit"), Line::default(), Line::from(Span::styled("Navigation", theme.accent())), Line::from("/             Open the command palette; ↑↓ select; Tab complete; Enter run"), Line::from("Lists         f filter; Enter read; g opens the selected graph neighborhood"), Line::from("Review        Enter inspect; c approve; t Team; m merge; r reject"), Line::from("Detail        e edit; d delete (actions confirm twice)"), Line::from("Composer      Enter send; Shift+Enter newline; Shift+Tab cycle permission"), Line::from("Exit          Ctrl+C clears input; press it again within three seconds to quit")]; frame.render_widget(Paragraph::new(lines).style(theme.overlay_text()).wrap(Wrap { trim: false }), area); }
+fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) { let lines = vec![Line::from(Span::styled("Commands", theme.accent())), Line::from("Plain input   Start or continue the current Learn"), Line::from("/goal [text]  Create a Goal; with no text open management; @ attaches sources"), Line::from("/goals        Alias for /goal"), Line::from("/new          Close the current context and start a new Learn"), Line::from("/attention    Answer the questions unattended turns are blocked on"), Line::from("/knowledge    Browse the knowledge graph and related nodes"), Line::from("/method       Browse reusable working methods"), Line::from("/experience   Browse validated task experience"), Line::from("/review       Review candidates and approve promotion"), Line::from("/team         Inspect the Personal / Team roots"), Line::from("/health       Check sources, indexes, and connector status"), Line::from("/runtime      Open the runtime picker; /runtime codex also works"), Line::from("/open         Open the current node or a path"), Line::from("/quit         Exit Methodus; q does not quit"), Line::default(), Line::from(Span::styled("Navigation", theme.accent())), Line::from("/             Open the command palette; ↑↓ select; Tab complete; Enter run"), Line::from("Lists         f filter; Enter read; g opens the selected graph neighborhood"), Line::from("Review        Enter inspect; c approve; t Team; m merge; r reject"), Line::from("Goals         n new; Enter/r learn now; e edit policy; space pause; d delete"), Line::from("Attention     Enter answers (⇧Enter newline) and resumes; d dismisses"), Line::from("Detail        e edit; d delete (actions confirm twice)"), Line::from("Composer      Enter send; Shift+Enter newline; Shift+Tab cycle permission"), Line::from("Exit          Ctrl+C clears input; press it again within three seconds to quit")]; frame.render_widget(Paragraph::new(lines).style(theme.overlay_text()).wrap(Wrap { trim: false }), area); }
 fn draw_runtime_picker(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) { let mut lines = vec![Line::from(Span::styled("Choose the runtime for the next Learn", theme.overlay_text())), Line::default()]; for (index, runtime) in RUNTIMES.iter().enumerate() { let current = if runtime.id == app.runtime { "●" } else { "○" }; let marker = if index == app.runtime_selected { "›" } else { " " }; let style = if index == app.runtime_selected { theme.selected() } else { theme.overlay_text() }; lines.push(Line::from(Span::styled(format!("{marker} {current} {:<14}  {}", runtime.label, runtime.detail), style))); } if app.learning_session_id.is_some() { lines.push(Line::default()); lines.push(Line::from(Span::styled(format!("Current Learn is bound to {}; enter /new before switching", runtime_label(&app.runtime)), Style::default().fg(theme.warning).bg(theme.overlay)))); } frame.render_widget(Paragraph::new(lines).style(theme.overlay_text()).wrap(Wrap { trim: false }), area); }
 fn draw_team(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let personal = app.engine.home().join("personal");
@@ -540,7 +1000,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Some(ConfirmAction::Commit) => "Confirm approval: press c again",
         Some(ConfirmAction::MarkTeam) => "Confirm Team visibility: press t again",
         Some(ConfirmAction::Reject) => "Confirm rejection: press r again",
-        Some(ConfirmAction::Delete) => "Confirm deletion: press d again",
+        Some(ConfirmAction::Delete) | Some(ConfirmAction::DeleteGoal) | Some(ConfirmAction::DismissAttention) => "Confirm deletion: press d again",
         Some(ConfirmAction::Revalidate) => "Confirm revalidation: press v again",
         Some(ConfirmAction::Merge) => "Confirm merge: press Enter again",
         None => match app.view {
@@ -615,11 +1075,14 @@ fn cycle_permission(app: &mut App) {
 fn close_current_learning(app: &mut App) {
     let had_run = app.learning_session_id.is_some();
     if let Some(run_id) = app.learning_session_id.as_deref() { let _ = app.engine.record_learning_event(run_id, "methodus", "Learn closed by maintainer with /new"); let _ = app.engine.mark_learning_status(run_id, "closed"); }
-    app.learning_session_id = None; app.learning_executor_sid = None; app.learning_goal = None; app.view = View::Chat; app.status = "New Learn ready · enter a learning goal and use @ to attach sources".into(); if had_run { app.say("Methodus: Closed the previous learning context; the next input will create a new Learn.".to_string()); }
+    app.learning_session_id = None; app.learning_executor_sid = None; app.learning_goal = None; app.learning_goal_id = None; app.view = View::Chat; app.status = "New Learn ready · enter a learning goal and use @ to attach sources".into(); if had_run { app.say("Methodus: Closed the previous learning context; the next input will create a new Learn.".to_string()); }
 }
 
 fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect { let width = area.width.saturating_mul(width_pct).saturating_div(100).max(50).min(area.width); let height = area.height.saturating_mul(height_pct).saturating_div(100).max(10).min(area.height); Rect { x: area.x + area.width.saturating_sub(width) / 2, y: area.y + area.height.saturating_sub(height) / 2, width, height } }
-fn slash_menu_open(input: &str) -> bool { input.trim_start().starts_with('/') }
+fn slash_menu_open(input: &str) -> bool {
+    let Some(command_input) = input.trim_start().strip_prefix('/') else { return false };
+    !command_input.chars().any(|character| character.is_whitespace())
+}
 fn mention_open(input: &str) -> bool { at_query(input).is_some() }
 fn mention_start(input: &str) -> Option<usize> { let query = at_query(input)?; Some(input.len().saturating_sub(query.len() + 1)) }
 fn absolute_path_candidates(query: &str) -> Vec<MentionCandidate> { let (display_prefix, path_query) = if query == "~" || query.starts_with("~/") { let home = std::env::var_os("HOME").map(std::path::PathBuf::from); ("~".to_string(), home.map(|home| home.join(query.trim_start_matches("~/").trim_start_matches('~')))) } else if query.starts_with('/') { (String::new(), Some(std::path::PathBuf::from(query))) } else { return Vec::new() }; let path_query = path_query.unwrap_or_default(); let (parent, partial) = if path_query.is_dir() { (path_query.clone(), String::new()) } else { (path_query.parent().unwrap_or(std::path::Path::new("/")).to_path_buf(), path_query.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default()) }; let Ok(entries) = fs::read_dir(&parent) else { return Vec::new() }; entries.flatten().filter_map(|entry| { let name = entry.file_name().to_string_lossy().into_owned(); if name.starts_with('.') || (!partial.is_empty() && !name.to_lowercase().contains(&partial)) { return None }; let path = entry.path(); let is_dir = path.is_dir(); let label = if display_prefix == "~" { format!("~/{}{}", path.strip_prefix(std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default()).ok()?.display(), if is_dir { "/" } else { "" }) } else { format!("{}{}", path.display(), if is_dir { "/" } else { "" }) }; Some(MentionCandidate { rel: label.clone(), label, is_dir, abs: path }) }).take(80).collect() }
@@ -641,10 +1104,40 @@ fn ctrl_c_should_quit(pending: Option<Instant>, now: Instant) -> bool { pending.
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn slash_palette_exposes_management_commands() { let names = matching_slash("/").into_iter().map(|command| command.name).collect::<Vec<_>>(); for required in ["knowledge", "method", "experience", "team", "health", "runtime", "review", "new", "open", "quit"] { assert!(names.contains(&required)); } assert!(!names.contains(&"graph")); assert!(!names.contains(&"learn")); assert_eq!(matching_slash("/exit")[0].name, "quit"); }
+    #[test] fn slash_palette_exposes_management_commands() { let names = matching_slash("/").into_iter().map(|command| command.name).collect::<Vec<_>>(); for required in ["goal", "attention", "knowledge", "method", "experience", "team", "health", "runtime", "review", "new", "open", "quit"] { assert!(names.contains(&required)); } assert!(!names.contains(&"goals")); assert!(!names.contains(&"graph")); assert!(!names.contains(&"learn")); assert_eq!(matching_slash("/exit")[0].name, "quit"); assert_eq!(matching_slash("/goal")[0].name, "goal"); assert_eq!(matching_slash("/goals")[0].name, "goal"); }
+    #[test] fn slash_menu_closes_once_command_arguments_begin() { assert!(slash_menu_open("/")); assert!(slash_menu_open("/goal")); assert!(!slash_menu_open("/goal ")); assert!(!slash_menu_open("/goal investigate @src/runtime")); assert!(mention_open("/goal investigate @src/runtime")); }
+    #[test] fn goal_alias_preserves_a_text_argument() { assert_eq!(slash_rest("/goal investigate @src/runtime"), "investigate @src/runtime"); }
     #[test] fn runtime_and_permission_labels_are_concrete() { assert_eq!(runtime_label("claude-code"), "Claude Code"); assert_eq!(runtime_index("codex"), 1); assert_eq!(permission_label("plan"), "Read-only plan"); assert_eq!(permission_label("cautious"), "Cautious execution"); assert_eq!(permission_label("acceptEdits"), "Auto-edit"); }
     #[test] fn only_shift_enter_creates_multiline_input() { assert!(wants_newline(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))); assert!(!wants_newline(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))); assert!(!wants_newline(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))); }
     #[test] fn composer_cursor_uses_unicode_display_columns() { let (rows, column, row) = composer_view("hello", 2, 20, 8); assert_eq!(rows, vec!["› hello"]); assert_eq!(column, 4); assert_eq!(row, 0); assert_eq!(next_char_boundary("hello", 0), 1); }
     #[test] fn transcript_wraps_by_terminal_width() { assert_eq!(wrap_text("one two three four", 8), vec!["one two ", "three fo", "ur"]); }
     #[test] fn ctrl_c_requires_second_press_inside_window() { let now = Instant::now(); assert!(!ctrl_c_should_quit(None, now)); assert!(ctrl_c_should_quit(Some(now), now)); assert!(!ctrl_c_should_quit(Some(now - Duration::from_secs(4)), now)); }
+
+    #[test]
+    fn a_schedule_reads_as_a_wait_not_a_timestamp() {
+        let now = DateTime::parse_from_rfc3339("2026-08-21T12:00:00Z").unwrap().with_timezone(&Utc);
+        let at = |offset: i64| relative_time(Some(now + chrono::Duration::seconds(offset)), now);
+        assert_eq!(relative_time(None, now), "on request");
+        assert_eq!(at(-60), "due now");
+        assert_eq!(at(30), "in under a minute");
+        assert_eq!(at(45 * 60), "in 45m");
+        assert_eq!(at(6 * 3600), "in 6h");
+        assert_eq!(at(9 * 86_400), "in 9d");
+    }
+
+    #[test]
+    fn an_open_question_reads_as_an_age_not_a_timestamp() {
+        let now = DateTime::parse_from_rfc3339("2026-08-21T12:00:00Z").unwrap().with_timezone(&Utc);
+        let ago = |offset: i64| elapsed_since(now - chrono::Duration::seconds(offset), now);
+        assert_eq!(ago(-30), "just now");
+        assert_eq!(ago(20 * 60), "20m ago");
+        assert_eq!(ago(5 * 3600), "5h ago");
+        assert_eq!(ago(4 * 86_400), "4d ago");
+    }
+
+    #[test]
+    fn a_rejected_draft_is_only_reopened_for_the_goal_it_came_from() {
+        assert!(matches!(GoalDraft::for_id(None), GoalDraft::New));
+        assert_eq!(GoalDraft::for_id(Some("g1")), GoalDraft::Existing("g1".into()));
+    }
 }

@@ -119,7 +119,38 @@ visualization is a focused neighborhood, not a full force-directed rendering. Em
 or background services are considered only after real engineering-query evaluation
 shows that lexical/tag/scope retrieval is insufficient.
 
-## D10 — What success looks like
+## D10 — One maintainer surface, and it is the terminal
+
+A Tauri desktop app was built and then dropped. Continuous learning — Goals, cadences,
+budgets, the attention queue, and OS notifications — lives in the TUI instead.
+
+The desktop app was justified by three capabilities the TUI was assumed to lack:
+scheduling, notification, and a place to review knowledge calmly. None of the three
+turned out to require a window. A TUI holding a Tokio runtime schedules work between
+frames; `osascript` and `notify-send` reach the same notification centre; review was
+already a TUI panel.
+
+What the desktop app could not do is the thing the product depends on most. Answering a
+blocked runtime means resuming its session, and a native runtime needs a real TTY. The
+desktop version would have had to either embed a PTY and reimplement a terminal, or
+imitate the runtime's interface with a chat component and lose everything the runtime's
+own UI does well. The terminal already is a terminal.
+
+So the split was inverted. All policy — which turn is due, whether a budget is spent,
+whether a Goal is blocked on a person, what a turn's outcome means — moved into
+`methodus-core::learning`, where it is surface-independent and directly testable. The
+TUI renders those decisions and owns the sessions. A second surface remains possible
+and would be cheap; it is simply not needed to ship the behavior.
+
+Two consequences follow, and both are deliberate:
+
+- Scheduled work only runs while Methodus is running. Keep it open in `tmux`. A
+  background service (`methodusd`) is the answer if that ever stops being acceptable,
+  not a second GUI.
+- Goals are edited as YAML in `$EDITOR`, not through a form. The editable document is
+  defined once in core and excludes every system-owned field.
+
+## D11 — What success looks like
 
 One maintainer can turn code, Git history, docs, logs, incidents, and design evidence
 into reviewed, reusable engineering memory. A developer's native agent can retrieve

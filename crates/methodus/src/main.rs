@@ -10,6 +10,7 @@ use methodus_core::{ensure_home, methodus_home, AgentQuery, Engine, InstanceLock
 use methodus_runtime::{ClaudeCodeAdapter, CodexAdapter, CursorAdapter, RuntimeAdapter};
 use methodus_store::Store;
 
+mod notify;
 mod tui;
 
 #[derive(Parser)]

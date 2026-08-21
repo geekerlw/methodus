@@ -12,7 +12,7 @@ can retrieve on demand.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status: early development](https://img.shields.io/badge/status-early%20development-yellow.svg)](docs/04-roadmap.md)
 
-[Product contract](docs/00-product.md) · [Architecture](docs/02-architecture.md) · [TUI guide](docs/05-tui.md)
+[Product contract](docs/00-product.md) · [Architecture](docs/02-architecture.md) · [TUI guide](docs/05-tui.md) · [Continuous learning](docs/10-continuous-learning.md)
 
 </div>
 
@@ -36,7 +36,7 @@ terminal workflow.
 
 ```text
 Maintainer
-  → focused Learn conversation
+  → focused Learn conversation, or a Goal on a cadence
   → evidence, counterexamples, and open questions
   → structured CandidateSet
   → Review: edit, approve, reject, merge
@@ -49,8 +49,8 @@ Developer in a native agent runtime
   → native runtime continues the task
 ```
 
-The TUI is the maintainer write surface. The Agent CLI is the consumer read surface.
-Markdown and Git remain inspectable sources of truth; SQLite is a rebuildable index.
+The TUI is the maintainer surface; the Agent CLI is the consumer read surface. Markdown
+and Git remain inspectable sources of truth; SQLite is a rebuildable index.
 
 ## Quick start
 
@@ -75,6 +75,9 @@ cargo run -p methodus -- doctor
 The first launch creates `~/.methodus/` and seeds a small Personal graph. The
 connector contains instructions only—it does not contain your knowledge graph.
 
+Keep the process open in `tmux`. Methodus schedules its own work while it runs, so a
+closed terminal is a paused system.
+
 ## Learn in the TUI
 
 The home screen starts a focused learning conversation. Type an ordinary message to
@@ -92,6 +95,8 @@ Runtime and Methodus restores the TUI to import the candidate set.
 | Switch Runtime | `/runtime` or `/runtime codex` |
 | Start a fresh learning goal | `/new` |
 | Browse knowledge and review | `/knowledge`, `/method`, `/experience`, `/review` |
+| Create or manage scheduled learning | `/goal [text]` (`/goals` is an alias) |
+| Answer a blocked scheduled turn | `/attention` |
 | Inspect graph relations | Select an active node, then press `g` |
 | Leave Methodus | `/quit`; `Ctrl+C` twice is the escape hatch |
 
@@ -100,9 +105,49 @@ evidence, seek counterexamples, separate fact from inference, and return a struc
 CandidateSet only when the evidence is sufficient. Methodus does not proxy this
 conversation, so runtime tool views, approvals, and multi-turn interaction stay native.
 
+`/goal <text>` creates a persistent Goal using the same natural-language input and `@`
+source attachments as Learn. Cadence, budget, and other policy fields are filled with
+their defaults. `/goal` without text opens the management view; `/goals` remains a
+compatible alias, and `e` opens advanced YAML editing.
+
 `/new` closes the current Learn context. `quit` only exits the TUI: an active Learn run
 is restored on the next launch, while a run waiting for Review remains a review record
 instead of reopening a Runtime conversation.
+
+## Keep learning on a cadence
+
+A Goal is a standing question rather than a task. You create one the same way you start
+a Learn run — type `/goal` followed by what you want followed:
+
+```text
+/goal Understand Rust async cancellation and scheduling behavior in our services @src/runtime
+```
+
+It starts out investigating weekly, reviewing what it published weekly, consolidating
+monthly, and checking its sources daily, under a $20 monthly ceiling. The first
+learning turn starts immediately; later turns follow the cadence. Press `e` to open
+the Goal as YAML in `$EDITOR` and change any of that:
+
+```yaml
+title: Understand Rust async cancellation and scheduling behavior in our services
+prompt: Understand Rust async cancellation and scheduling behavior in our services.
+sources: [docs/async, src/runtime]
+cadence: weekly              # investigate
+review_cadence: weekly       # re-check what is already published
+summary_cadence: monthly     # consolidate
+source_check_cadence: daily  # detect drift
+quiet_hours: {start: "22:00", end: "07:00"}
+budget_usd: 20
+```
+
+Due turns run headless while you keep using the terminal, and only interrupt you when
+they need a judgment, fail, or produce candidates. `r` starts a learning turn
+immediately, `s` a consolidation one. A turn that gets stuck on a decision
+stops and asks; `/attention` shows the queue, and answering resumes the very session
+that asked, natively, with your answer as the next message.
+
+See [Continuous learning](docs/10-continuous-learning.md) for the scheduling policy,
+budget accounting, and session-ownership rules.
 
 ## Give native agents reviewed memory
 
@@ -176,7 +221,7 @@ changes.
 
 ### It is
 
-- A maintainer-facing Learn and Review TUI
+- A terminal Learn, Schedule, and Review workbench
 - A Markdown-first Knowledge / Method / Experience graph
 - A local evidence and freshness tracker
 - A bounded, deterministic Agent retrieval CLI
@@ -185,7 +230,7 @@ changes.
 ### It is not
 
 - A replacement coding agent or general chat client
-- An MCP server or background daemon
+- An MCP server or an independent background daemon
 - A task workspace or repository-copy manager
 - A proxy for native Claude/Codex/Cursor interaction
 - A generic Skill marketplace or automatic Skill generator
@@ -205,6 +250,7 @@ changes.
 | [Learning protocol](docs/07-learning-vs-refine.md) | Deliberate learning and CandidateSet generation |
 | [Development contract](docs/08-development-contract.md) | Invariants and change checklist |
 | [Architecture decisions](docs/09-decisions.md) | Locked product and technical decisions |
+| [Continuous learning](docs/10-continuous-learning.md) | Goals, cadences, budgets, unattended turns, and the attention queue |
 
 The architecture diagram is available as [SVG](docs/architecture.svg) and
 [PNG](docs/architecture.png).
@@ -218,9 +264,9 @@ cargo check --workspace
 git diff --check
 ```
 
-The active implementation intentionally stays narrow: one foreground TUI, one
-focused Learn conversation, one official connector, and no hidden writes. New work
-should preserve those boundaries.
+The active implementation keeps writes explicit: scheduling can launch bounded native
+Learn sessions, but only Review can publish canonical graph content. New work should
+preserve that boundary.
 
 ## License
 

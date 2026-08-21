@@ -5,17 +5,20 @@
 //! Team promotion. Ordinary coding tasks, workspaces, handoff sessions, and
 //! runtime Skill management are not part of the active product surface.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use methodus_domain::{GraphEdge, GraphNode, RuntimeEvent};
+use methodus_domain::{
+    GoalRun, GraphEdge, GraphNode, HumanAttention, LearningGoal, PermissionDenial, RuntimeEvent,
+    UsageDelta, WorkKind,
+};
 use methodus_runtime::{RuntimeAdapter, SessionHandle, SpawnInput};
 use methodus_store::Store;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,6 +27,7 @@ use uuid::Uuid;
 
 use crate::config::UserConfig;
 use crate::error::CoreError;
+use crate::learning::{self, GoalForm};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -291,6 +295,253 @@ impl Engine {
     pub fn sync_graph(&self) -> Result<usize, CoreError> { Ok(crate::graph::sync_graph(&self.store, &self.home)?) }
     pub fn list_graph_nodes(&self, query: Option<&str>) -> Result<Vec<GraphNode>, CoreError> { Ok(self.store.list_graph_nodes(query)?) }
     pub fn graph_edges_for(&self, node_id: &str) -> Result<Vec<GraphEdge>, CoreError> { Ok(self.store.graph_edges_for(node_id)?) }
+
+    // ─── Continuous learning ─────────────────────────────────────────────
+    // Thin delegation to `crate::learning`, which owns all of the policy.
+
+    pub fn list_goals(&self) -> Result<Vec<LearningGoal>, CoreError> { Ok(self.store.list_learning_goals()?) }
+    pub fn goal(&self, id: &str) -> Result<Option<LearningGoal>, CoreError> { Ok(self.store.learning_goal(id)?) }
+    pub fn delete_goal(&self, id: &str) -> Result<bool, CoreError> { Ok(self.store.delete_learning_goal(id)?) }
+
+    /// The YAML document handed to `$EDITOR` for a new Goal.
+    pub fn new_goal_form(&self) -> Result<String, CoreError> { learning::render_form(&GoalForm::default()) }
+
+    /// The YAML document handed to `$EDITOR` for an existing Goal.
+    pub fn goal_form(&self, id: &str) -> Result<String, CoreError> {
+        let goal = self.require_goal(id)?;
+        learning::render_form(&GoalForm::from_goal(&goal))
+    }
+
+    /// Create a Goal from one stretch of natural language. Policy fields take
+    /// their defaults; any resolved `@` paths become durable authorized sources.
+    pub fn create_goal_from_objective(&self, objective: &str) -> Result<LearningGoal, CoreError> {
+        let mut form = GoalForm::from_objective(objective);
+        let roots = self.context_roots();
+        form.sources = crate::mentions::resolve_named(objective, &roots)
+            .into_iter()
+            .map(|mention| mention.raw)
+            .fold(Vec::new(), |mut sources, source| {
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+                sources
+            });
+        self.create_goal(form)
+    }
+
+    pub fn create_goal(&self, form: GoalForm) -> Result<LearningGoal, CoreError> {
+        let goal = form.into_new_goal(Utc::now())?;
+        self.store.upsert_learning_goal(&goal)?;
+        Ok(goal)
+    }
+
+    pub fn edit_goal(&self, id: &str, form: GoalForm) -> Result<LearningGoal, CoreError> {
+        let mut goal = self.require_goal(id)?;
+        form.apply_to(&mut goal, Utc::now())?;
+        self.store.upsert_learning_goal(&goal)?;
+        Ok(goal)
+    }
+
+    /// Flip a Goal on or off without going through the editor.
+    pub fn set_goal_enabled(&self, id: &str, enabled: bool) -> Result<LearningGoal, CoreError> {
+        let mut goal = self.require_goal(id)?;
+        let now = Utc::now();
+        goal.enabled = enabled;
+        goal.reschedule_all(now);
+        goal.updated_at = now;
+        self.store.upsert_learning_goal(&goal)?;
+        Ok(goal)
+    }
+
+    /// Bring a Goal's next turn forward so the upcoming tick picks it up. Going
+    /// through the schedule rather than launching directly keeps one dispatch
+    /// path, so occupancy, attention and budget checks still apply.
+    pub fn request_goal_now(&self, id: &str, work: WorkKind) -> Result<LearningGoal, CoreError> {
+        let mut goal = self.require_goal(id)?;
+        let now = Utc::now();
+        goal.set_next_at(work, Some(now));
+        goal.updated_at = now;
+        self.store.upsert_learning_goal(&goal)?;
+        Ok(goal)
+    }
+
+    /// Decide which learning turns are due. `occupied_goal_ids` are the Goals
+    /// whose runtime session the caller is already running.
+    pub fn plan_learning_tick(&self, occupied_goal_ids: HashSet<String>) -> Result<learning::TickPlan, CoreError> {
+        learning::plan_tick(&self.store, &learning::TickInput {
+            occupied_goal_ids,
+            now: Utc::now(),
+            local_time: Local::now().time(),
+        })
+    }
+
+    pub fn record_goal_spend(&self, goal_id: &str, cost_usd: f64) -> Result<f64, CoreError> {
+        learning::record_spend(&self.store, goal_id, cost_usd, Utc::now())
+    }
+
+    pub fn goal_spend(&self, goal_id: &str) -> Result<f64, CoreError> {
+        learning::goal_spend(&self.store, goal_id, Utc::now())
+    }
+
+    pub fn link_goal_run(&self, run_id: &str, goal_id: &str, work: WorkKind) -> Result<(), CoreError> {
+        Ok(self.store.link_goal_run(&GoalRun {
+            run_id: run_id.to_string(),
+            goal_id: goal_id.to_string(),
+            work,
+            created_at: Utc::now(),
+        })?)
+    }
+
+    pub fn goal_run(&self, run_id: &str) -> Result<Option<GoalRun>, CoreError> { Ok(self.store.goal_run(run_id)?) }
+    pub fn list_goal_runs(&self, goal_id: &str, limit: usize) -> Result<Vec<GoalRun>, CoreError> { Ok(self.store.list_goal_runs(goal_id, limit)?) }
+
+    pub fn open_attentions(&self) -> Result<Vec<HumanAttention>, CoreError> { Ok(self.store.list_open_attentions()?) }
+    pub fn attention_for_run(&self, run_id: &str) -> Result<Option<HumanAttention>, CoreError> { learning::attention_for_run(&self.store, run_id) }
+    pub fn resolve_attention(&self, id: &str, response: &str) -> Result<bool, CoreError> { Ok(self.store.resolve_attention(id, response, Utc::now())?) }
+
+    /// Prepare the native turn that carries a maintainer's answer back into the
+    /// run that asked the question.
+    ///
+    /// An answer is only useful inside the session that is blocked on it, and
+    /// only the native handoff can resume one, so answering and resuming are the
+    /// same act. The caller resolves the attention once the handoff has run, so
+    /// a failed launch leaves the question open rather than swallowing the reply.
+    pub fn prepare_attention_handoff(&self, attention: &HumanAttention, answer: &str) -> Result<NativeLearnHandoff, CoreError> {
+        let run = self.list_learning_runs()?.into_iter().find(|run| run.run_id == attention.run_id)
+            .ok_or_else(|| CoreError::Other(format!("Learn run not found: {}", attention.run_id)))?;
+        let sources = attention.goal_id.as_deref()
+            .and_then(|goal_id| self.store.learning_goal(goal_id).ok().flatten())
+            .map(|goal| goal.sources)
+            .unwrap_or_default();
+        let follow_up = format!(
+            "Maintainer answer to \"{}\":\n\n{answer}\n\nTreat this as settled and continue the learning turn.",
+            attention.title
+        );
+        self.continue_native_learning_with_sources(&run.runtime, &run.permission_mode, &run.run_id, run.executor_sid.as_deref(), &follow_up, &sources)
+    }
+
+    /// Record a hand-off if a turn's output carries an attention envelope.
+    /// Returns `None` when the turn simply finished.
+    pub fn record_attention(&self, run_id: &str, output: &str) -> Result<Option<HumanAttention>, CoreError> {
+        let Some(envelope) = learning::parse_envelope(output) else { return Ok(None) };
+        let goal_id = self.store.goal_run(run_id)?.map(|link| link.goal_id);
+        learning::open_attention(&self.store, run_id, goal_id, &envelope, Utc::now()).map(Some)
+    }
+
+    fn require_goal(&self, id: &str) -> Result<LearningGoal, CoreError> {
+        self.store.learning_goal(id)?.ok_or_else(|| CoreError::Other(format!("goal not found: {id}")))
+    }
+
+    /// Run one scheduled turn to completion without a terminal.
+    ///
+    /// Unattended turns are the point of a cadence: they happen while nobody is
+    /// watching, so whatever they produce lands in Review or the attention queue
+    /// instead of on screen. A maintainer who wants to dig in afterwards resumes
+    /// the same executor session through the native handoff.
+    pub async fn run_scheduled_turn(&self, turn: &learning::ScheduledTurn) -> Result<learning::TurnOutcome, CoreError> {
+        let goal = &turn.goal;
+        let (handle, mut events) = self
+            .start_learning_with_sources(Some(&goal.runtime), &goal.permission_mode, &turn.prompt, &goal.sources)
+            .await?;
+        let run_id = handle.session_id.clone();
+        self.link_goal_run(&run_id, &goal.id, turn.work)?;
+
+        let mut transcript = learning::TurnTranscript::default();
+        let mut stream_error: Option<String> = None;
+        let mut result: Option<(bool, String, Vec<PermissionDenial>)> = None;
+        let mut cost_usd = 0.0;
+        while let Some(event) = events.recv().await {
+            self.record_runtime_event(&run_id, &event);
+            match event {
+                RuntimeEvent::SessionStarted { session_id } => { let _ = self.update_learning_executor_sid(&run_id, &session_id); }
+                RuntimeEvent::AssistantText { text } => transcript.push_assistant(&text),
+                RuntimeEvent::Error { message } => stream_error = Some(message),
+                RuntimeEvent::Result { is_error, text, cost_usd: cost, usage, session_id, permission_denials } => {
+                    if let Some(session_id) = session_id.as_deref() { let _ = self.update_learning_executor_sid(&run_id, session_id); }
+                    cost_usd = cost.unwrap_or_default();
+                    let delta = UsageDelta::from_result(cost, usage.as_ref());
+                    if !delta.is_empty() {
+                        let _ = self.store.insert_usage(Some(&run_id), Some(&run_id), Some(&goal.runtime), &delta);
+                    }
+                    result = Some((is_error, text, permission_denials));
+                }
+                _ => {}
+            }
+        }
+
+        let output = transcript.finish(result.as_ref().map(|(_, text, _)| text.as_str()).unwrap_or_default());
+        let disposition = match (stream_error, &result) {
+            (Some(message), _) => learning::TurnDisposition::Failed { message },
+            (None, Some((is_error, _, denials))) => learning::classify(&output, *is_error, denials),
+            (None, None) => learning::TurnDisposition::Failed { message: "the runtime exited without returning a result".into() },
+        };
+
+        let mut candidate_ids = Vec::new();
+        let mut attention = None;
+        let mut failure = None;
+        match disposition {
+            learning::TurnDisposition::Failed { message } => {
+                let _ = self.mark_learning_status(&run_id, "failed");
+                failure = Some(message);
+            }
+            learning::TurnDisposition::AwaitingInput { envelope } => {
+                let _ = self.mark_learning_status(&run_id, "awaiting_input");
+                attention = Some(learning::open_attention(&self.store, &run_id, Some(goal.id.clone()), &envelope, Utc::now())?);
+            }
+            learning::TurnDisposition::Completed if output.trim().is_empty() => {
+                let _ = self.mark_learning_status(&run_id, "failed");
+                failure = Some("the runtime returned no output".into());
+            }
+            learning::TurnDisposition::Completed => {
+                candidate_ids = self.record_learning_output_for_run(&run_id, &turn.prompt, &output)?;
+            }
+        }
+
+        let spent_usd = learning::record_spend(&self.store, &goal.id, cost_usd, Utc::now())?;
+        Ok(learning::TurnOutcome {
+            run_id,
+            goal_id: goal.id.clone(),
+            goal_title: goal.title.clone(),
+            work: turn.work,
+            candidate_ids,
+            attention,
+            failure,
+            cost_usd,
+            spent_usd,
+            budget_usd: goal.budget_usd,
+        })
+    }
+
+    /// Append one runtime event to a run transcript. Best effort on purpose: a
+    /// transcript write must never abort a turn that is otherwise progressing.
+    fn record_runtime_event(&self, run_id: &str, event: &RuntimeEvent) {
+        let (role, text) = match event {
+            RuntimeEvent::SessionStarted { session_id } => ("runtime", format!("session started: {session_id}")),
+            RuntimeEvent::UserText { text } => ("user", text.clone()),
+            RuntimeEvent::AssistantText { text } => ("assistant", text.clone()),
+            RuntimeEvent::Thinking { text } => ("thinking", text.clone()),
+            RuntimeEvent::ToolCallStarted { name, .. } => ("tool", format!("started {name}")),
+            RuntimeEvent::ToolCallCompleted { id, exit_code, .. } => ("tool", match exit_code {
+                Some(code) => format!("completed {id} (exit {code})"),
+                None => format!("completed {id}"),
+            }),
+            RuntimeEvent::TurnCompleted { stop_reason } => ("runtime", match stop_reason {
+                Some(reason) => format!("turn completed: {reason}"),
+                None => "turn completed".to_string(),
+            }),
+            RuntimeEvent::ApprovalRequested { tool_name, .. } => ("runtime", format!("approval requested: {tool_name}")),
+            RuntimeEvent::Error { message } => ("runtime", format!("error: {message}")),
+            RuntimeEvent::Result { is_error, .. } => ("runtime", format!("result (error: {is_error})")),
+        };
+        let _ = self.record_learning_event(run_id, role, &text);
+    }
+    /// Read an indexed Markdown graph document for maintainer-facing detail
+    /// views through the same managed-root safety check used by Review.
+    pub fn graph_document(&self, node_id: &str) -> Result<crate::graph::GraphDocument, CoreError> {
+        let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
+        let path = self.node_path(&node)?;
+        Ok(crate::graph::read_graph_document(&self.home, &path)?)
+    }
     pub fn team_id(&self) -> String { UserConfig::load(&self.home).selected_team().to_string() }
     pub fn team_root(&self) -> PathBuf { self.home.join("teams").join(self.team_id()) }
 
@@ -378,9 +629,59 @@ impl Engine {
         Ok(())
     }
 
+    /// Append Goal-authorized roots to a run's source manifest without relying on
+    /// whitespace tokenization (paths may contain spaces, and URLs are preserved).
+    pub fn record_learning_authorized_sources(&self, run_id: &str, sources: &[String]) -> Result<(), CoreError> {
+        let root = self.home.join("runs").join(run_id);
+        fs::create_dir_all(&root)?;
+        let mut entries = fs::read_to_string(root.join("sources.yaml"))
+            .ok()
+            .and_then(|raw| serde_yaml::from_str::<SourceManifest>(&raw).ok())
+            .map(|manifest| manifest.sources)
+            .unwrap_or_default();
+        let mut seen = entries.iter().map(|entry| entry.locator.clone()).collect::<std::collections::BTreeSet<_>>();
+        for source in sources.iter().map(|source| source.trim()).filter(|source| !source.is_empty()) {
+            if !seen.insert(source.to_string()) { continue; }
+            if source.contains("://") {
+                entries.push(SourceManifestEntry { locator: source.to_string(), path: source.to_string(), fingerprint: None, status: "remote".into() });
+                continue;
+            }
+            let (path, display) = resolve_source_path(&self.launch_cwd, source);
+            let (fingerprint, status) = if path.is_dir() {
+                (None, "current")
+            } else {
+                match fs::read(&path) {
+                    Ok(bytes) => (Some(format!("sha256:{:x}", Sha256::digest(bytes))), "current"),
+                    Err(_) => (None, "missing"),
+                }
+            };
+            entries.push(SourceManifestEntry { locator: display, path: path.display().to_string(), fingerprint, status: status.into() });
+        }
+        fs::write(root.join("sources.yaml"), serde_yaml::to_string(&SourceManifest { sources: entries }).map_err(|error| CoreError::Other(format!("serialize source manifest: {error}")))?)?;
+        Ok(())
+    }
+
     pub fn mark_learning_status(&self, run_id: &str, status: &str) -> Result<(), CoreError> {
         let Some(run) = self.list_learning_runs()?.into_iter().find(|run| run.run_id == run_id) else { return Err(CoreError::Other(format!("Learn run not found: {run_id}"))); };
         self.write_learn_state(&run.run_id, &run.goal, &run.runtime, Some(&run.permission_mode), status, run.executor_sid.as_deref())
+    }
+
+    /// Persist the executor-owned session id as soon as a runtime reports it.
+    /// Adapters are allowed to negotiate a different id than the one Methodus
+    /// requested (notably Codex), so the first `SessionStarted` event is the
+    /// source of truth for later app-only resume.
+    pub fn update_learning_executor_sid(&self, run_id: &str, executor_sid: &str) -> Result<(), CoreError> {
+        let Some(run) = self.list_learning_runs()?.into_iter().find(|run| run.run_id == run_id) else {
+            return Err(CoreError::Other(format!("Learn run not found: {run_id}")));
+        };
+        self.write_learn_state(
+            &run.run_id,
+            &run.goal,
+            &run.runtime,
+            Some(&run.permission_mode),
+            &run.status,
+            Some(executor_sid),
+        )
     }
 
     pub fn team_status(&self) -> Result<TeamStatus, CoreError> {
@@ -419,6 +720,12 @@ impl Engine {
     /// Start a focused learning conversation with a maintainer-selected permission mode. No task, workspace,
     /// capsule, or native coding session is created.
     pub async fn start_learning(&self, runtime: Option<&str>, permission_mode: &str, goal: &str) -> Result<(SessionHandle, mpsc::Receiver<RuntimeEvent>), CoreError> {
+        self.start_learning_with_sources(runtime, permission_mode, goal, &[]).await
+    }
+
+    /// Start a focused learning conversation with explicit, user-authorized source roots.
+    /// The roots are passed as bounded runtime directories in addition to any `@` mentions.
+    pub async fn start_learning_with_sources(&self, runtime: Option<&str>, permission_mode: &str, goal: &str, sources: &[String]) -> Result<(SessionHandle, mpsc::Receiver<RuntimeEvent>), CoreError> {
         let runtime = self.preferred_runtime(runtime);
         let (permission_mode, sandbox) = permission_profile(permission_mode);
         let adapter = self.adapter(&runtime)?;
@@ -428,13 +735,15 @@ impl Engine {
         let protocol = fs::read_to_string(self.home.join("protocols/deliberate-learning.md"))
             .unwrap_or_else(|_| "Clarify the goal, inspect evidence, challenge assumptions, verify counterexamples, and propose candidates for review.".into());
         let prompt = format!(
-            "You are the Methodus deliberate-learning runtime.\n\nLearning goal:\n{goal_with_mentions}\n\nFollow this protocol:\n{protocol}\n\nSeparate facts, inferences, contradictions, and unknowns. Ask consequential maintainer questions. Finish with a CandidateSet only when the evidence is sufficient; otherwise keep asking focused questions. Never claim a draft is canonical. When synthesis is ready, include a fenced `json` block with exactly {{\"candidates\":[{{\"type\":\"knowledge|method|experience\",\"kind\":\"...\",\"title\":\"...\",\"summary\":\"...\",\"learn\":\"...\",\"decide\":\"...\",\"execute\":\"...\",\"evidence\":\"...\",\"outcome\":\"...\",\"occurred_at\":\"...\",\"tags\":[\"...\"]}}],\"relations\":[],\"unresolved_questions\":[],\"contradictions\":[]}}."
+            "You are the Methodus deliberate-learning runtime.\n\nLearning goal:\n{goal_with_mentions}\n\nFollow this protocol:\n{protocol}\n\nSeparate facts, inferences, contradictions, and unknowns. Ask consequential maintainer questions. Never claim a draft is canonical. If a consequential decision or permission is needed, pause and finish with a fenced `json` block exactly like {{\"outcome\":\"needs_input\",\"question\":\"one focused question for the maintainer\",\"context\":\"why this blocks reliable learning\"}} (or use `permission_required` with `tool_name` and `tool_input`). Do not invent a CandidateSet in that case. When evidence is sufficient, finish with a CandidateSet only: a fenced `json` block with exactly {{\"candidates\":[{{\"type\":\"knowledge|method|experience\",\"kind\":\"...\",\"title\":\"...\",\"summary\":\"...\",\"learn\":\"...\",\"decide\":\"...\",\"execute\":\"...\",\"evidence\":\"...\",\"outcome\":\"...\",\"occurred_at\":\"...\",\"tags\":[\"...\"]}}],\"relations\":[],\"unresolved_questions\":[],\"contradictions\":[]}}."
         );
         self.write_learn_state(&session_id, goal, &runtime, Some(permission_mode), "running", None)?;
         self.record_learning_sources(&session_id, goal)?;
+        self.record_learning_authorized_sources(&session_id, sources)?;
         let mut extra_dirs = root_paths;
         extra_dirs.extend(mentioned_dirs);
         extra_dirs.extend(source_directories(&self.launch_cwd, goal));
+        extra_dirs.extend(authorized_source_directories(&self.launch_cwd, sources));
         extra_dirs.sort(); extra_dirs.dedup();
         let spawn = adapter.spawn(SpawnInput {
             prompt,
@@ -508,22 +817,35 @@ impl Engine {
         Ok((handle, events))
     }
 
+    /// Stop a background Learn executor while preserving its durable Methodus
+    /// run and native executor recovery id for a later resume.
+    pub async fn stop_learning(&self, runtime: &str, handle: &SessionHandle) -> Result<(), CoreError> {
+        self.adapter(runtime)?.stop(handle).await?;
+        self.mark_learning_status(&handle.session_id, "awaiting_input")?;
+        Ok(())
+    }
+
     /// Prepare a fresh focused Learn run for the selected runtime's native TUI.
     /// The runtime owns all multi-turn interaction; Methodus owns only the durable
     /// run record and candidate import after the runtime exits.
     pub fn prepare_native_learning(&self, runtime: Option<&str>, permission_mode: &str, goal: &str) -> Result<NativeLearnHandoff, CoreError> {
         let runtime = self.preferred_runtime(runtime);
         let run_id = format!("learn_{}", Uuid::new_v4());
-        self.prepare_native_learning_turn(&runtime, permission_mode, &run_id, goal, goal, None)
+        self.prepare_native_learning_turn(&runtime, permission_mode, &run_id, goal, goal, None, &[])
     }
 
     /// Prepare another native TUI turn for an existing Learn run. Claude resumes
     /// the durable UUID it was given; other runtimes start a fresh native chat with
     /// the same Methodus run context when their session ID is not available.
     pub fn continue_native_learning(&self, runtime: &str, permission_mode: &str, run_id: &str, executor_sid: Option<&str>, follow_up: &str) -> Result<NativeLearnHandoff, CoreError> {
+        self.continue_native_learning_with_sources(runtime, permission_mode, run_id, executor_sid, follow_up, &[])
+    }
+
+    /// Continue a native Learn turn with explicit source roots authorized by the Goal.
+    pub fn continue_native_learning_with_sources(&self, runtime: &str, permission_mode: &str, run_id: &str, executor_sid: Option<&str>, follow_up: &str, sources: &[String]) -> Result<NativeLearnHandoff, CoreError> {
         let goal = self.list_learning_runs()?.into_iter().find(|run| run.run_id == run_id).map(|run| run.goal).unwrap_or_else(|| follow_up.into());
         let resume_sid = (runtime == "claude-code").then_some(executor_sid).flatten().filter(|sid| Uuid::parse_str(sid).is_ok());
-        self.prepare_native_learning_turn(runtime, permission_mode, run_id, &goal, follow_up, resume_sid)
+        self.prepare_native_learning_turn(runtime, permission_mode, run_id, &goal, follow_up, resume_sid, sources)
     }
 
     /// Import an explicitly returned native Learn synthesis, if the runtime wrote
@@ -576,7 +898,7 @@ impl Engine {
         Ok(recovered)
     }
 
-    fn prepare_native_learning_turn(&self, runtime: &str, permission_mode: &str, run_id: &str, goal: &str, maintainer_message: &str, resume_sid: Option<&str>) -> Result<NativeLearnHandoff, CoreError> {
+    fn prepare_native_learning_turn(&self, runtime: &str, permission_mode: &str, run_id: &str, goal: &str, maintainer_message: &str, resume_sid: Option<&str>, sources: &[String]) -> Result<NativeLearnHandoff, CoreError> {
         if !matches!(runtime, "claude-code" | "codex" | "cursor") {
             return Err(CoreError::UnknownRuntime(runtime.into()));
         }
@@ -586,6 +908,7 @@ impl Engine {
         let mut extra_dirs = root_paths;
         extra_dirs.extend(mentioned_dirs);
         extra_dirs.extend(source_directories(&self.launch_cwd, maintainer_message));
+        extra_dirs.extend(authorized_source_directories(&self.launch_cwd, sources));
         extra_dirs.sort();
         extra_dirs.dedup();
 
@@ -596,6 +919,7 @@ impl Engine {
         };
         self.write_learn_state(run_id, goal, runtime, Some(permission_mode), "running", executor_sid.as_deref())?;
         self.record_learning_sources(run_id, maintainer_message)?;
+        self.record_learning_authorized_sources(run_id, sources)?;
         self.record_learning_event(run_id, "user", maintainer_message)?;
 
         let run_root = self.home.join("runs").join(run_id);
@@ -639,6 +963,7 @@ impl Engine {
 
         let slug = slug_for_learning(goal);
         let suffix = run_id.strip_prefix("learn_").unwrap_or(&run_id).chars().take(8).collect::<String>();
+        let revision = Uuid::new_v4().simple().to_string().chars().take(8).collect::<String>();
         let candidates_root = self.home.join("personal/candidates");
         fs::create_dir_all(&candidates_root)?;
         let set = extract_candidate_set(output).unwrap_or_else(|| CandidateSet {
@@ -652,7 +977,7 @@ impl Engine {
         let drafts = set.candidates;
         let candidate_ids = drafts.iter().enumerate().map(|(index, draft)| {
             let node_type = match draft.node_type.to_ascii_lowercase().as_str() { "method" => "method", "experience" => "experience", _ => "knowledge" };
-            (node_type.to_string(), format!("{node_type}/candidate-{slug}-{suffix}-{index}"))
+            (node_type.to_string(), format!("{node_type}/candidate-{slug}-{suffix}-{revision}-{index}"))
         }).collect::<Vec<_>>();
         let (links, unresolved_relations) = candidate_links(&set.relations, &drafts, &candidate_ids);
         let mut unresolved_questions = set.unresolved_questions.clone();
@@ -701,7 +1026,7 @@ impl Engine {
                 review_notes,
                 yaml_quote(goal),
             );
-            fs::write(candidates_root.join(format!("{node_type}-{slug}-{run_id}-{index}.md")), body)?;
+            fs::write(candidates_root.join(format!("{node_type}-{slug}-{suffix}-{revision}-{index}.md")), body)?;
             ids.push(id);
         }
         self.sync_graph()?;
@@ -880,6 +1205,26 @@ fn source_directories(cwd: &Path, text: &str) -> Vec<PathBuf> {
     }).filter(|path| path.is_dir()).collect()
 }
 
+fn authorized_source_directories(cwd: &Path, sources: &[String]) -> Vec<PathBuf> {
+    sources
+        .iter()
+        .filter_map(|source| {
+            let source = source.trim();
+            if source.is_empty() || source.contains("://") {
+                return None;
+            }
+            let (path, _) = resolve_source_path(cwd, source);
+            let path = path.canonicalize().ok()?;
+            Some(if path.is_dir() {
+                path
+            } else {
+                path.parent()?.to_path_buf()
+            })
+        })
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
 fn json_value_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -984,6 +1329,26 @@ mod tests {
     }
 
     #[test]
+    fn goal_text_creation_keeps_defaults_and_persists_resolved_mentions() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::with_runtimes(
+            Arc::new(Store::open_memory().unwrap()),
+            dir.path().to_path_buf(),
+            HashMap::new(),
+        );
+        let goal = engine
+            .create_goal_from_objective("Understand the runtime from @Cargo.toml")
+            .unwrap();
+
+        assert_eq!(goal.sources, vec!["Cargo.toml"]);
+        assert_eq!(goal.cadence, methodus_domain::Cadence::Weekly);
+        assert_eq!(goal.review_cadence, methodus_domain::Cadence::Weekly);
+        assert_eq!(goal.summary_cadence, methodus_domain::Cadence::Monthly);
+        assert_eq!(goal.source_check_cadence, methodus_domain::Cadence::Daily);
+        assert_eq!(goal.budget_usd, 20.0);
+    }
+
+    #[test]
     fn native_claude_handoff_is_interactive_and_uses_a_uuid() {
         let sid = "11111111-2222-3333-4444-555555555555";
         let (_, args) = native_learn_command(
@@ -1000,6 +1365,18 @@ mod tests {
         assert!(args.contains(&sid.to_string()));
         assert!(args.contains(&"--permission-mode".to_string()));
         assert!(!args.contains(&"--print".to_string()));
+    }
+
+    #[test]
+    fn authorized_source_roots_preserve_spaces_and_ignore_urls() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source with spaces");
+        fs::create_dir_all(&source).unwrap();
+        let roots = authorized_source_directories(
+            dir.path(),
+            &["source with spaces".into(), "https://example.test/docs".into()],
+        );
+        assert_eq!(roots, vec![source.canonicalize().unwrap()]);
     }
 
     #[test]

@@ -1,4 +1,7 @@
-//! OS notifications from the TUI process (not a desktop app).
+//! OS notifications raised by the TUI process.
+//!
+//! Unattended turns finish while the maintainer is looking at something else, so
+//! the terminal alone cannot carry news that needs acting on.
 
 use std::process::{Command, Stdio};
 
@@ -9,7 +12,7 @@ pub enum NotifyUrgency {
     Critical,
     /// Inbox item, idle question — silent OS banner.
     Normal,
-    /// Turn complete — only sent when the terminal pane looks idle/unfocused.
+    /// Background fact worth knowing but never worth acting on immediately.
     Low,
 }
 

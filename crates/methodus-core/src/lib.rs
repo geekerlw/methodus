@@ -7,6 +7,7 @@ pub mod engine;
 pub mod error;
 pub mod graph;
 pub mod home;
+pub mod learning;
 pub mod lock;
 pub mod mentions;
 

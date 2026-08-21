@@ -1,8 +1,10 @@
 # 05 — Maintainer TUI
 
-The TUI is a knowledge studio for maintainers. It prepares focused Learn runs and
-returns to review them; the selected native runtime owns the multi-turn learning
-conversation after terminal handoff. It is not a general coding-agent interface.
+The TUI is a knowledge studio for maintainers, and the only maintainer surface. It
+prepares focused Learn runs and returns to review them; the selected native runtime owns
+the multi-turn learning conversation after terminal handoff. It also runs the scheduled,
+unattended half of the product described in [`10-continuous-learning.md`](./10-continuous-learning.md).
+It is not a general coding-agent interface.
 
 ## 1. Default surface
 
@@ -50,6 +52,45 @@ explicit synthesis artifact if the runtime wrote one. The current run is restore
 a TUI restart; Claude Code resumes its durable executor UUID, while other runtimes can
 start a fresh native conversation carrying the same Learn context. “Session” means a
 Learn run only; Methodus does not manage ordinary coding sessions.
+
+### Goals
+
+Goals are the standing questions Methodus keeps working on between Learn runs. The
+panel lists each Goal with its state — `ready`, `running`, or `paused` — and how long
+until its next learning turn. The detail pane shows the prompt, all four cadences with
+their next due times, quiet hours, month-to-date spend against budget, review policy,
+and authorized sources.
+
+A Goal is created with `/goal <text>`, using the same natural-language input and `@`
+source attachments as Learn. Policy takes its defaults — weekly learning, weekly review,
+monthly summary, daily source checks, and a $20 monthly ceiling — so creation does not
+require a policy form. `/goal` without text opens this management panel; `/goals` is a
+compatible alias. Its `n` composer is the same creation flow when a person prefers to
+start there. Creation queues the first learning turn immediately; later turns follow
+the cadence.
+
+Refinement is separate. `e` opens the Goal as YAML in `$EDITOR`, where cadences,
+sources, quiet hours, budget, runtime, and review policy are all editable. The document
+contains only maintainer-owned fields; identity, timestamps, and computed due times
+never appear in it. A document that fails validation is kept as a draft so the next
+edit reopens it instead of discarding what was typed.
+
+Actions are `n` new, `Enter`/`r` learn now, `e` edit policy, `space` pause or resume,
+`s` summarize now, and `d` delete. *Now* is implemented by moving the turn's due time
+forward and waking the scheduler rather than launching a runtime directly, so
+occupancy, attention, and budget checks still apply to it.
+
+### Attention
+
+The queue of questions that unattended turns are blocked on. Each entry names its Goal,
+how long it has been waiting, and whether the runtime wants a judgment or a permission.
+
+Answering resumes the session that asked. `Enter` opens a reply composer; `Shift+Enter`
+adds a newline and plain `Enter` submits. Submitting hands the terminal to the runtime
+holding that executor session, delivering the answer as the next message. The question
+is only resolved once that handoff has run, so a failed launch leaves it in the queue.
+`d` dismisses a question without answering, for the ones a maintainer decides are moot;
+the Goal unblocks and its next scheduled turn starts fresh.
 
 ### Knowledge
 
@@ -122,6 +163,8 @@ Commands switch surfaces or start explicit maintainer actions:
 |---|---|
 | ordinary input | Start or continue the focused Learn run |
 | `/new [goal]` | Close the current context and optionally start a new Learn goal |
+| `/goal [text]` | Create a Goal, or manage Goals when no text is supplied (`/goals` is an alias) |
+| `/attention` | Answer the questions unattended turns are blocked on |
 | `/knowledge` | Browse Knowledge |
 | `/method` | Browse Methods |
 | `/experience` | Browse Experiences |
@@ -163,7 +206,33 @@ automatically durable experience. Until the richer selection view lands, the sam
 include/exclude decision is made by editing or rejecting the corresponding draft in
 Review.
 
-## 5. Status and error behavior
+## 5. Unattended work
+
+The event loop consults the scheduler between frames and launches due turns on the
+Tokio runtime. They run headless while the maintainer keeps using the terminal; results
+arrive as events the loop drains each frame.
+
+Scheduling is event-driven with a slow poll behind it. Anything a person did that could
+make work due — creating, editing, or enabling a Goal, bringing a turn forward,
+resolving a question — wakes the scheduler on the next frame, so *now* means now. The
+one-minute fallback poll exists only for the two things nobody triggers: a cadence
+coming due and the end of a quiet-hours window. A poll with nothing due is two indexed
+SQLite reads, so its interval bounds latency rather than cost.
+
+While the terminal is handed to a native runtime the loop is blocked, which is the
+behavior we want: no unattended turn starts mid-conversation. The Goal a foreground
+Learn belongs to is reported to the scheduler as occupied, so a background turn cannot
+resume the same executor session underneath the maintainer.
+
+The header carries two counters: `⚑` for open questions and `◇` for turns in flight.
+Anything that changed the graph or needs a decision is also written to the scrollback
+with the command that acts on it; a turn merely starting is status-bar news.
+
+OS notifications follow the tiers in
+[`10-continuous-learning.md`](./10-continuous-learning.md#6-attention-and-notification).
+A turn that completed with nothing new never produces one.
+
+## 6. Status and error behavior
 
 - Runtime failure keeps the conversation and durable run visible. If an executor ID is
   available, the run can be resumed; otherwise the maintainer can retry or switch
@@ -174,7 +243,7 @@ Review.
 - Publication blockers require correction. Warnings require acknowledgement.
 - Agent CLI consumer activity is not presented as a live session in the TUI.
 
-## 6. Interaction invariants
+## 7. Interaction invariants
 
 - `q` is text, never a global quit shortcut.
 - Empty-input double `Ctrl+C` within the configured window exits.
@@ -201,7 +270,7 @@ Review.
   chord.
 - Narrow terminals degrade to a clear minimum-size message rather than corrupt layout.
 
-## 7. Acceptance
+## 8. Acceptance
 
 A maintainer can, without memorizing operational CLI commands:
 
@@ -211,4 +280,6 @@ A maintainer can, without memorizing operational CLI commands:
 4. review sources, relations, duplicates, and stale state;
 5. commit Personal content and explicitly mark it for Team promotion;
 6. validate and inspect a publication diff or write a publish plan;
-7. browse the resulting graph and understand what consumer agents can retrieve.
+7. browse the resulting graph and understand what consumer agents can retrieve;
+8. write a Goal, leave the TUI open, and be interrupted only when a scheduled turn
+   needs a judgment, fails, or produces candidates.

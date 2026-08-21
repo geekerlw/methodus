@@ -4,6 +4,7 @@
 //! hands its terminal to a native runtime for a focused Learn conversation, but never
 //! proxies or manages ordinary coding sessions.
 
+mod background;
 mod control;
 
 use std::io::stdout;
@@ -29,7 +30,9 @@ pub async fn run(engine: Engine, _lock: InstanceLock) -> Result<(), Box<dyn std:
     ));
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     terminal.clear()?;
-    let result = control::run_loop(&mut terminal, engine);
+    // The draw loop is synchronous; unattended learning turns are spawned onto
+    // this handle so they keep running while the maintainer uses the terminal.
+    let result = control::run_loop(&mut terminal, engine, tokio::runtime::Handle::current());
     disable_raw_mode()?;
     let _ = stdout().execute(PopKeyboardEnhancementFlags);
     let _ = stdout().execute(DisableBracketedPaste);
