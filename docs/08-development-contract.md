@@ -7,7 +7,7 @@ longer product rationale lives in `00-product.md`–`07-learning-vs-refine.md`.
 
 | Concern | Methodus owns | Runtime/user owns |
 |---|---|---|
-| Maintainer Learn conversation | TUI, protocol, candidate capture | model/tool execution within selected runtime |
+| Maintainer Learn conversation | prepare protocol/run record, native terminal handoff, candidate import | multi-turn dialogue, tools, terminal rendering, approvals |
 | Canonical knowledge | Markdown layout, graph validation, lifecycle, review actions | direct Git edits are allowed but must pass validation |
 | Agent consumption | read-only `methodus agent` protocol and connector instructions | when to call it, how to use context, final reasoning |
 | Permissions | select/display a bounded Learn mode and map it to native flags | native allow/deny enforcement and ordinary coding permissions |
@@ -40,23 +40,22 @@ not dictate atom boundaries.
 
 ```text
 candidate → committed → stale → committed
-                       ↘ deprecated
-candidate → rejected
+candidate --reject--> deleted
 ```
 
 - Only Review can move a candidate to canonical `committed` content.
 - A stale transition is a warning derived from source freshness; it never rewrites
   prose automatically.
-- Rejected and candidate nodes remain auditable locally but are excluded from normal
-  Agent queries.
-- Deprecated nodes are history-only unless the caller explicitly requests history.
+- Candidate nodes are excluded from normal Agent queries; Review rejection deletes
+  the candidate. Legacy rejected/deprecated files are history-only cleanup items.
 - Merge always names a concrete target; never infer a target from ranking alone.
 
 ## 4. Learn output contract
 
 The deliberate-learning runtime must challenge scope, inspect evidence, seek
 counterexamples, ask consequential questions, and separate fact/inference/
-contradiction/unknown. It returns a fenced JSON object:
+contradiction/unknown. When the maintainer explicitly finalizes the learning, it writes
+the supplied run-specific return artifact with a fenced JSON object:
 
 ```json
 {"candidates":[{"type":"knowledge|method|experience","kind":"...","title":"...","summary":"...","learn":"...","decide":"...","execute":"...","evidence":"...","outcome":"...","occurred_at":"...","tags":["..."]}],"relations":[{"from":"candidate-0","relation":"validated_by","to":"candidate-1"}],"unresolved_questions":[],"contradictions":[],"runtime_skills":[{"name":"...","runtime":"claude-code","outcome":"useful","reason":"..."}]}
@@ -96,13 +95,17 @@ without inventing Methodus context.
 - CJK/IME and bracketed paste must preserve text and cursor boundaries.
 - `@` completion resolves launch-cwd paths plus absolute and `~` paths; accepting a
   directory never inserts a breaking space.
-- Arrow keys navigate lists; printable input filters. `j/k` are not hidden list
-  navigation.
+- Arrow keys navigate lists. Press `f` to enter visible filter mode; `j/k` are not
+  hidden list navigation. Review action keys remain available outside filter mode.
 - `q` is ordinary text. Empty-input double `Ctrl+C` exits within the documented
   window. `/quit` exits explicitly.
 - Filters are visible in panel titles and clear with `Esc`.
-- Detail views show complete Markdown; graph view is bounded to a focused one-hop
-  neighborhood.
+- Detail views show complete Markdown; `g` opens a focused one-hop neighborhood of
+  active (`committed` or `stale`) nodes only. Rejected nodes remain list-visible for
+  cleanup, but rejected/candidate/deprecated nodes and their edges are excluded from
+  active graph navigation.
+- Canonical-node deletion removes the Markdown source, records the action, and
+  re-syncs the projection. Review rejection follows the same removal rule.
 - Permission text belongs beside the Learn composer; runtime name belongs in the top
   bar; do not duplicate either in a footer help strip.
 

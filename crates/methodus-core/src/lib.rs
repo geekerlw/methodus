@@ -12,7 +12,7 @@ pub mod mentions;
 
 pub use config::UserConfig;
 pub use agent::{index_revision, AgentItem, AgentQuery, AgentResponse, AgentSearchResult, AGENT_PROTOCOL_VERSION};
-pub use engine::{Engine, LearnEventRecord, LearnRun, TeamStatus};
+pub use engine::{Engine, LearnEventRecord, LearnRun, NativeLearnHandoff, NativeLearnReturn, TeamStatus};
 pub use error::CoreError;
 pub use home::{ensure_home, health_checks, methodus_home, HealthCheck};
 pub use graph::{estimated_tokens, facet, read_graph_document, sources_are_stale_now, sync_graph, validate_graph, GraphDocument, GraphIssue, IssueSeverity, SourceEvidence};

@@ -35,7 +35,7 @@ pub(crate) fn claude_args(input: &SpawnInput, resume: Option<&str>) -> Vec<Strin
         args.push(sid.to_string());
     } else {
         args.push("--session-id".to_string());
-        args.push(input.session_id.clone());
+        args.push(input.executor_session_id.clone().unwrap_or_else(|| input.session_id.clone()));
     }
     args.push("--permission-mode".to_string());
     args.push(claude_permission_mode(&input.permission_mode).to_string());
@@ -108,12 +108,13 @@ async fn spawn_claude(
     }
 
     let (tx, rx) = mpsc::channel(256);
-    let fallback_sid = resume
-        .map(str::to_owned)
-        .unwrap_or_else(|| input.session_id.clone());
-    // Fresh spawn: do not claim a resumable executor sid until Claude emits init/result.
-    // Otherwise a failed first turn stores a phantom sid and the next message `--resume`s it.
-    let handle_executor_sid = resume.map(str::to_owned);
+    let fallback_sid = resume.map(str::to_owned).unwrap_or_else(|| {
+        input.executor_session_id.clone().unwrap_or_else(|| input.session_id.clone())
+    });
+    // A fresh spawn receives an explicit UUID from Methodus. Keep it on the
+    // handle immediately so a failed/empty first turn never falls back to the
+    // Methodus run id (for example, `learn_<uuid>`) on the next turn.
+    let handle_executor_sid = Some(fallback_sid.clone());
 
     tokio::spawn(async move {
         let reader = BufReader::new(stdout);
@@ -448,6 +449,7 @@ mod tests {
             prompt: "do the thing".to_string(),
             cwd: "/tmp".into(),
             session_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+            executor_session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
             permission_mode: "acceptEdits".to_string(),
             allowed_tools: Vec::new(),
             sandbox: None,
@@ -462,6 +464,16 @@ mod tests {
         assert!(args.contains(&"--session-id".to_string()));
         assert!(!args.contains(&"--resume".to_string()));
         assert!(args.contains(&"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()));
+    }
+
+    #[test]
+    fn fresh_spawn_prefers_executor_session_id_over_methodus_run_id() {
+        let mut input = sample_input();
+        input.session_id = "learn_legacy-run".into();
+        input.executor_session_id = Some("11111111-2222-3333-4444-555555555555".into());
+        let args = claude_args(&input, None);
+        assert!(args.contains(&"11111111-2222-3333-4444-555555555555".to_string()));
+        assert!(!args.contains(&"learn_legacy-run".to_string()));
     }
 
     #[test]

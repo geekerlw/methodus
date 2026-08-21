@@ -74,7 +74,12 @@ async fn spawn_codex(
     let (tx, rx) = mpsc::channel(256);
     let fallback_sid = resume
         .map(str::to_owned)
-        .unwrap_or_else(|| input.session_id.clone());
+        .unwrap_or_else(|| {
+            input
+                .executor_session_id
+                .clone()
+                .unwrap_or_else(|| input.session_id.clone())
+        });
     let fallback_sid_for_handle = fallback_sid.clone();
 
     tokio::spawn(async move {
@@ -262,6 +267,7 @@ mod tests {
             prompt: "hello".to_string(),
             cwd: PathBuf::from("/tmp/ws"),
             session_id: "m-1".to_string(),
+            executor_session_id: Some("executor-1".to_string()),
             permission_mode: String::new(),
             allowed_tools: Vec::new(),
             sandbox: Some("workspace-write".to_string()),

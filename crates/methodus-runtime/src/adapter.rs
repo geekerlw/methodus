@@ -8,8 +8,11 @@ use tokio::sync::mpsc;
 pub struct SpawnInput {
     pub prompt: String,
     pub cwd: PathBuf,
-    /// Methodus-side session id. Also passed as Claude `--session-id` on a fresh spawn.
+    /// Methodus-side Learn run id. It is never used as an executor recovery id.
     pub session_id: String,
+    /// Optional executor-side id for a fresh session. Claude requires this to be a
+    /// UUID; Codex and Cursor may ignore it and return their own id.
+    pub executor_session_id: Option<String>,
     /// Permission mode — e.g. "manual" for M2 Claude approval, "acceptEdits" for tests.
     pub permission_mode: String,
     /// Claude `--allowed-tools` entries (e.g. "Write", "Bash"). Ignored by Codex.

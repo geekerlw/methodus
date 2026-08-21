@@ -2,18 +2,25 @@
 
 Methodus integrates with agent runtimes in two deliberately separate ways:
 
-1. a **managed learning adapter** used only inside the maintainer TUI;
+1. a **native Learn handoff** used only from the maintainer TUI;
 2. an **official connector Skill** used by ordinary agents to call the read-only CLI.
 
 It does not launch or supervise ordinary coding sessions.
 
-## 1. Learning adapter
+## 1. Native Learn handoff
 
-The TUI owns a focused learning conversation. A learning adapter provides model turns
-and selected research capabilities without attempting to reproduce the full coding
-agent product.
+The TUI prepares a focused Learn run, then deliberately leaves its alternate screen
+and yields the same terminal to Claude Code, Codex, or Cursor. The selected runtime
+owns the entire multi-turn conversation, tool display, approval prompts, and terminal
+rendering. When it exits, Methodus restores its TUI and imports only the explicit
+return artifact for Review.
 
-The code-level seam is the existing `methodus_runtime::RuntimeAdapter` trait:
+Methodus never screen-scrapes or proxies the native TUI. It does not create a task
+workspace or supervise ordinary coding sessions.
+
+`SpawnInput` and `RuntimeAdapter` remain a compatibility seam for non-interactive
+integration tests and future programmatic use; they are not the execution path for
+the interactive Learn experience.
 
 ```rust
 #[async_trait]
@@ -31,47 +38,31 @@ pub trait RuntimeAdapter: Send + Sync {
 }
 ```
 
-`SpawnInput` carries the Learn prompt, launch directory, runtime session IDs,
-the maintainer-selected permission mode, allowed tools, sandbox, and extra source
-directories. `plan` maps to a read-only sandbox; `cautious` and `acceptEdits` map to
-native confirmation/auto-edit behavior inside a workspace-write sandbox. No adapter
-may emit a bypass-permissions flag.
-The adapter is allowed to mediate this focused Learn run because it is a maintainer
-workflow; it must never grow into a general task-session or workspace manager.
-The adapter returns normalized `RuntimeEvent` values to the TUI. A future extraction
-may introduce a narrower `LearningRuntime` wrapper, but it must preserve this boundary
-and must not become an ordinary coding-session manager.
-
-The current normalized event vocabulary includes:
-
-```rust
-pub enum LearnEvent {
-    SessionStarted { session_id: String },
-    AssistantText { text: String },
-    Thinking { text: String },
-    ToolCallStarted { id: String, name: String, input: Value },
-    ToolCallCompleted { id: String, output: Value, exit_code: Option<i32> },
-    TurnCompleted { stop_reason: Option<String> },
-    Result { is_error: bool, text: String, session_id: Option<String>, .. },
-    Error { message: String },
-}
-```
-
-The concrete v1 type is `methodus_domain::RuntimeEvent`; the pseudocode above omits
-serde and permission-denial fields for readability. CandidateSet detection happens in
-the core/TUI after a completed assistant response rather than as a separate adapter
-event.
-
-Adapters may use a runtime's structured CLI/API surface. PTY screen scraping is out of
-scope. Runtime-specific session IDs are stored only to resume Learn sessions.
-
+`SpawnInput` carries the Learn prompt, launch directory, the Methodus run ID
+(`session_id`), and an optional executor-side ID (`executor_session_id`) for a fresh
+runtime session, followed by the maintainer-selected permission mode, allowed tools,
+sandbox, and extra source directories. The two IDs are intentionally separate:
+`learn_*` is only a Methodus record key and must never be passed to Claude's
+`--session-id` or `--resume`; Claude receives a UUID and resumed turns use the
+executor ID stored by the run. If an old Claude run contains a non-UUID executor ID,
+the core engine starts a fresh runtime turn while preserving the same Learn run.
 Methodus exposes one portable Learn permission selector and maps it conservatively to
-each runtime. The maintainer owns the choice, it is persisted with the Learn run, and
-the selected runtime still owns individual approval prompts and enforcement.
+native controls. In Plan mode, source changes remain prohibited by the Learn protocol,
+while the runtime can request the maintainer's explicit approval for the single return
+artifact under `runs/<learn-id>/`. Cautious mode keeps confirmations; Auto edit enables
+the runtime's normal bounded auto-edit behavior. No launch path may emit a
+bypass-permissions flag. The maintainer owns the choice, and the runtime still owns
+individual approval prompts and enforcement.
+
+Claude receives a UUID distinct from the Methodus `learn_*` record key; a later Learn
+handoff can use that UUID to resume its native conversation. If an old stored Claude
+ID is invalid, Methodus begins a fresh native conversation while retaining the same
+Learn run and evidence record. Other runtimes may begin a fresh native conversation
+with the same run context when no durable runtime ID is available.
 
 ## 2. Learning protocol
 
-Every adapter receives the same runtime-independent protocol:
+Every native Learn handoff receives the same runtime-independent protocol:
 
 1. restate the goal and scope;
 2. inspect relevant committed graph nodes;
@@ -81,8 +72,10 @@ Every adapter receives the same runtime-independent protocol:
 6. separate fact, inference, contradiction, and unknown;
 7. propose a typed candidate set, never canonical writes.
 
-The protocol is versioned with Methodus. It is not installed as a general runtime
-Skill and is not copied into ordinary task workspaces.
+The protocol is versioned with Methodus. At finalization, the runtime writes the
+complete synthesis and fenced CandidateSet JSON to the exact per-turn artifact path
+provided in the handoff brief. It is not installed as a general runtime Skill and is
+not copied into ordinary task workspaces.
 
 ## 3. Connector Skill
 

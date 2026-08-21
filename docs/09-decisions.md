@@ -23,7 +23,8 @@ create a per-task workspace, copy knowledge into a project, proxy a runtime TUI,
 manage ordinary coding sessions.
 
 Methodus may start a focused Learn run because that run is a maintainer operation. It
-defaults to read-only, and the maintainer may explicitly select a bounded native
+hands the terminal to the native runtime rather than proxying it, and restores the TUI
+only when the runtime exits. The maintainer may explicitly select a bounded native
 permission mode. The Learn runtime receives an explicit protocol and source roots,
 and its executor ID is retained only to resume that Learn run.
 

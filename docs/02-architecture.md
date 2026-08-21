@@ -75,9 +75,9 @@ Planned extraction seams, not required directories, are:
 - Team repository configuration and publish validation from `engine.rs`.
 
 Retired active-path modules include Face resolution/evolution, arbitrary Skill
-management, task workspace compilation, native handoff, and ordinary coding-session
-management. Compatibility migrations may read legacy rows, but new code must not
-route product behavior through them.
+management, task workspace compilation, and ordinary coding-session management.
+Compatibility migrations may read legacy rows, but new code must not route product
+behavior through them. Focused Learn retains a small native-handoff lifecycle only.
 
 ## 4. Process model
 

@@ -1,7 +1,8 @@
 //! Methodus maintainer studio TUI.
 //!
-//! The TUI owns deliberate learning and graph curation. Ordinary coding sessions
-//! remain in the user's native Agent runtime and are never handed off here.
+//! The TUI prepares deliberate Learn runs and curates their results. It temporarily
+//! hands its terminal to a native runtime for a focused Learn conversation, but never
+//! proxies or manages ordinary coding sessions.
 
 mod control;
 

@@ -17,6 +17,7 @@ use methodus_runtime::{RuntimeAdapter, SessionHandle, SpawnInput};
 use methodus_store::Store;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -55,6 +56,27 @@ pub struct LearnRun {
     pub updated_at: String,
 }
 
+/// A prepared native interactive Learn launch. The caller temporarily yields its
+/// terminal to this command; Methodus never proxies the runtime conversation.
+#[derive(Debug, Clone)]
+pub struct NativeLearnHandoff {
+    pub run_id: String,
+    pub goal: String,
+    pub runtime: String,
+    pub cwd: PathBuf,
+    pub program: String,
+    pub args: Vec<String>,
+    pub executor_sid: Option<String>,
+    pub output_path: PathBuf,
+}
+
+/// What Methodus found after the native runtime returned control.
+#[derive(Debug, Clone)]
+pub struct NativeLearnReturn {
+    pub candidate_ids: Vec<String>,
+    pub output_recorded: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnEventRecord {
     pub at: String,
@@ -90,6 +112,81 @@ fn permission_profile(mode: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn native_learn_command(
+    runtime: &str,
+    permission_mode: &str,
+    sandbox: &str,
+    cwd: &Path,
+    extra_dirs: &[PathBuf],
+    executor_sid: Option<&str>,
+    resume: bool,
+    brief: &str,
+) -> Result<(String, Vec<String>), CoreError> {
+    match runtime {
+        "claude-code" => {
+            let mut args = Vec::new();
+            if resume {
+                let sid = executor_sid.ok_or_else(|| CoreError::Other("missing Claude session id for native Learn resume".into()))?;
+                args.extend(["--resume".into(), sid.into()]);
+            } else {
+                let sid = executor_sid.ok_or_else(|| CoreError::Other("missing Claude session id for native Learn launch".into()))?;
+                args.extend(["--session-id".into(), sid.into()]);
+            }
+            args.extend(["--permission-mode".into(), native_claude_permission_mode(permission_mode).into()]);
+            for dir in extra_dirs {
+                args.extend(["--add-dir".into(), dir.to_string_lossy().into_owned()]);
+            }
+            args.push(brief.into());
+            Ok(("claude".into(), args))
+        }
+        "codex" => {
+            // A native Learn needs one explicit, maintainer-approved write for
+            // its return artifact. Keep the runtime approval-gated instead of
+            // making that artifact impossible under a read-only sandbox.
+            let native_sandbox = if permission_mode == "plan" { "workspace-write" } else { sandbox };
+            let mut args = vec!["--cd".into(), cwd.to_string_lossy().into_owned(), "--sandbox".into(), native_sandbox.into()];
+            if permission_mode == "acceptEdits" {
+                args.push("--approve-for-me".into());
+            } else {
+                args.extend(["--ask-for-approval".into(), "on-request".into()]);
+            }
+            for dir in extra_dirs {
+                if dir != cwd {
+                    args.extend(["--add-dir".into(), dir.to_string_lossy().into_owned()]);
+                }
+            }
+            args.push(brief.into());
+            Ok(("codex".into(), args))
+        }
+        "cursor" => {
+            let mut args = vec!["agent".into(), "--workspace".into(), cwd.to_string_lossy().into_owned()];
+            if permission_mode == "plan" {
+                args.push("--plan".into());
+            } else {
+                args.push("--auto-review".into());
+            }
+            for dir in extra_dirs {
+                if dir != cwd {
+                    args.extend(["--add-dir".into(), dir.to_string_lossy().into_owned()]);
+                }
+            }
+            args.push(brief.into());
+            Ok(("cursor".into(), args))
+        }
+        other => Err(CoreError::UnknownRuntime(other.into())),
+    }
+}
+
+fn native_claude_permission_mode(mode: &str) -> &'static str {
+    match mode {
+        // Source changes remain approval-gated while the maintainer can approve
+        // the single Methodus return artifact at finalization time.
+        "plan" | "cautious" => "manual",
+        "acceptEdits" => "auto",
+        _ => "manual",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceManifest {
     sources: Vec<SourceManifestEntry>,
@@ -113,7 +210,7 @@ struct CandidateSet {
     #[serde(default)]
     unresolved_questions: Vec<String>,
     #[serde(default)]
-    contradictions: Vec<String>,
+    contradictions: Vec<Value>,
     #[serde(default)]
     runtime_skills: Vec<RuntimeSkillObservation>,
 }
@@ -121,6 +218,7 @@ struct CandidateSet {
 #[derive(Debug, Deserialize, Clone)]
 struct CandidateRelation {
     from: String,
+    #[serde(alias = "kind")]
     relation: String,
     to: String,
 }
@@ -342,6 +440,7 @@ impl Engine {
             prompt,
             cwd: self.launch_cwd.clone(),
             session_id: session_id.clone(),
+            executor_session_id: Some(Uuid::new_v4().to_string()),
             permission_mode: permission_mode.into(),
             allowed_tools: vec!["Read".into(), "Glob".into(), "Grep".into(), "WebSearch".into()],
             sandbox: Some(sandbox.into()),
@@ -369,11 +468,29 @@ impl Engine {
         extra_dirs.extend(mentioned_dirs);
         extra_dirs.extend(source_directories(&self.launch_cwd, prompt));
         extra_dirs.sort(); extra_dirs.dedup();
-        let resume = adapter.resume(executor_sid, SpawnInput {
-            prompt: prompt_with_mentions, cwd: self.launch_cwd.clone(), session_id: session_id.into(),
+        let goal = self.list_learning_runs()?.into_iter().find(|run| run.run_id == session_id).map(|run| run.goal).unwrap_or_else(|| prompt.into());
+        let input = SpawnInput {
+            prompt: prompt_with_mentions.clone(), cwd: self.launch_cwd.clone(), session_id: session_id.into(),
+            executor_session_id: None,
             permission_mode: permission_mode.into(), allowed_tools: vec!["Read".into(), "Glob".into(), "Grep".into(), "WebSearch".into()],
             sandbox: Some(sandbox.into()), extra_dirs, model: None,
-        }).await;
+        };
+        let restart_with_fresh_claude = runtime == "claude-code" && Uuid::parse_str(executor_sid).is_err();
+        let fresh_executor_sid = restart_with_fresh_claude.then(|| Uuid::new_v4().to_string());
+        let resume = if restart_with_fresh_claude {
+            let recovery_prompt = format!(
+                "The previous Claude Code session for this Learn run could not be resumed. Continue the same learning task in a fresh session.\n\nOriginal learning goal:\n{goal}\n\nMaintainer follow-up:\n{}",
+                prompt_with_mentions,
+            );
+            let _ = self.record_learning_event(session_id, "methodus", "Previous Runtime session id was invalid; started a fresh session while preserving this Learn run.");
+            adapter.spawn(SpawnInput {
+                prompt: recovery_prompt,
+                executor_session_id: fresh_executor_sid.clone(),
+                ..input
+            }).await
+        } else {
+            adapter.resume(executor_sid, input).await
+        };
         let (handle, events) = match resume {
             Ok(result) => result,
             Err(error) => {
@@ -381,10 +498,127 @@ impl Engine {
                 return Err(error.into());
             }
         };
-        let goal = self.list_learning_runs()?.into_iter().find(|run| run.run_id == session_id).map(|run| run.goal).unwrap_or_else(|| prompt.into());
-        self.write_learn_state(session_id, &goal, runtime, Some(permission_mode), "running", handle.executor_sid.as_deref().or(Some(executor_sid)))?;
+        let stored_executor_sid = handle
+            .executor_sid
+            .as_deref()
+            .or(fresh_executor_sid.as_deref())
+            .or_else(|| (!restart_with_fresh_claude).then_some(executor_sid));
+        self.write_learn_state(session_id, &goal, runtime, Some(permission_mode), "running", stored_executor_sid)?;
         self.record_learning_sources(session_id, prompt)?;
         Ok((handle, events))
+    }
+
+    /// Prepare a fresh focused Learn run for the selected runtime's native TUI.
+    /// The runtime owns all multi-turn interaction; Methodus owns only the durable
+    /// run record and candidate import after the runtime exits.
+    pub fn prepare_native_learning(&self, runtime: Option<&str>, permission_mode: &str, goal: &str) -> Result<NativeLearnHandoff, CoreError> {
+        let runtime = self.preferred_runtime(runtime);
+        let run_id = format!("learn_{}", Uuid::new_v4());
+        self.prepare_native_learning_turn(&runtime, permission_mode, &run_id, goal, goal, None)
+    }
+
+    /// Prepare another native TUI turn for an existing Learn run. Claude resumes
+    /// the durable UUID it was given; other runtimes start a fresh native chat with
+    /// the same Methodus run context when their session ID is not available.
+    pub fn continue_native_learning(&self, runtime: &str, permission_mode: &str, run_id: &str, executor_sid: Option<&str>, follow_up: &str) -> Result<NativeLearnHandoff, CoreError> {
+        let goal = self.list_learning_runs()?.into_iter().find(|run| run.run_id == run_id).map(|run| run.goal).unwrap_or_else(|| follow_up.into());
+        let resume_sid = (runtime == "claude-code").then_some(executor_sid).flatten().filter(|sid| Uuid::parse_str(sid).is_ok());
+        self.prepare_native_learning_turn(runtime, permission_mode, run_id, &goal, follow_up, resume_sid)
+    }
+
+    /// Import an explicitly returned native Learn synthesis, if the runtime wrote
+    /// one. An ordinary exit without that file remains an unfinished Learn run.
+    pub fn complete_native_learning(&self, handoff: &NativeLearnHandoff, exit_status: &str) -> Result<NativeLearnReturn, CoreError> {
+        self.record_learning_event(&handoff.run_id, "methodus", &format!("{} native TUI returned: {exit_status}", handoff.runtime))?;
+        if let Ok(output) = fs::read_to_string(&handoff.output_path) {
+            if !output.trim().is_empty() {
+                self.record_learning_event(&handoff.run_id, "assistant", output.trim())?;
+                if extract_candidate_set(&output).is_some() {
+                    let candidate_ids = self.record_learning_output_for_run(&handoff.run_id, &handoff.goal, &output)?;
+                    return Ok(NativeLearnReturn { candidate_ids, output_recorded: true });
+                }
+                self.mark_learning_status(&handoff.run_id, "awaiting_input")?;
+                return Ok(NativeLearnReturn { candidate_ids: Vec::new(), output_recorded: true });
+            }
+        }
+        let status = if exit_status == "exit 0" { "awaiting_input" } else { "failed" };
+        self.mark_learning_status(&handoff.run_id, status)?;
+        Ok(NativeLearnReturn { candidate_ids: Vec::new(), output_recorded: false })
+    }
+
+    /// Recover a final native return that was written before Methodus could import
+    /// it (for example, after a parser upgrade or interrupted TUI restoration).
+    /// Only output files paired with a Methodus-generated brief are considered;
+    /// arbitrary files under a run directory are never imported.
+    pub fn recover_pending_native_learning(&self) -> Result<Vec<(String, Vec<String>)>, CoreError> {
+        let mut recovered = Vec::new();
+        for run in self.list_learning_runs()? {
+            if run.status == "awaiting_review" || self.home.join("runs").join(&run.run_id).join("assistant.md").is_file() {
+                continue;
+            }
+            let root = self.home.join("runs").join(&run.run_id);
+            let Ok(entries) = fs::read_dir(&root) else { continue; };
+            let mut outputs = entries.flatten().filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let turn = name.strip_prefix("brief-")?.strip_suffix(".md")?;
+                let output = root.join(format!("native-output-{turn}.md"));
+                output.is_file().then_some(output)
+            }).collect::<Vec<_>>();
+            outputs.sort_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok());
+            let Some(output_path) = outputs.pop() else { continue; };
+            let Ok(output) = fs::read_to_string(output_path) else { continue; };
+            if extract_candidate_set(&output).is_some() {
+                let ids = self.record_learning_output_for_run(&run.run_id, &run.goal, &output)?;
+                self.record_learning_event(&run.run_id, "methodus", "Recovered a native Learn return artifact for Review.")?;
+                recovered.push((run.run_id, ids));
+            }
+        }
+        Ok(recovered)
+    }
+
+    fn prepare_native_learning_turn(&self, runtime: &str, permission_mode: &str, run_id: &str, goal: &str, maintainer_message: &str, resume_sid: Option<&str>) -> Result<NativeLearnHandoff, CoreError> {
+        if !matches!(runtime, "claude-code" | "codex" | "cursor") {
+            return Err(CoreError::UnknownRuntime(runtime.into()));
+        }
+        let (permission_mode, sandbox) = permission_profile(permission_mode);
+        let root_paths = self.context_roots().into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+        let (message_with_mentions, mentioned_dirs) = crate::mentions::prepare_prompt(maintainer_message, &root_paths);
+        let mut extra_dirs = root_paths;
+        extra_dirs.extend(mentioned_dirs);
+        extra_dirs.extend(source_directories(&self.launch_cwd, maintainer_message));
+        extra_dirs.sort();
+        extra_dirs.dedup();
+
+        let executor_sid = if runtime == "claude-code" {
+            resume_sid.map(str::to_owned).or_else(|| Some(Uuid::new_v4().to_string()))
+        } else {
+            None
+        };
+        self.write_learn_state(run_id, goal, runtime, Some(permission_mode), "running", executor_sid.as_deref())?;
+        self.record_learning_sources(run_id, maintainer_message)?;
+        self.record_learning_event(run_id, "user", maintainer_message)?;
+
+        let run_root = self.home.join("runs").join(run_id);
+        fs::create_dir_all(&run_root)?;
+        // The output lives outside the source repository. Give native runtimes
+        // explicit access to this one run directory, not the whole Methodus home.
+        extra_dirs.push(run_root.clone());
+        extra_dirs.sort();
+        extra_dirs.dedup();
+        let turn_id = Uuid::new_v4();
+        let output_path = run_root.join(format!("native-output-{turn_id}.md"));
+        let protocol = fs::read_to_string(self.home.join("protocols/deliberate-learning.md"))
+            .unwrap_or_else(|_| "Clarify the goal, inspect evidence, challenge assumptions, verify counterexamples, and propose candidates for review.".into());
+        let source_roots = extra_dirs.iter().map(|path| format!("- {}", path.display())).collect::<Vec<_>>().join("\n");
+        let brief = format!(
+            "You are the Methodus deliberate-learning runtime in a native interactive terminal. You own this multi-turn conversation: ask the maintainer focused questions, inspect the supplied evidence, challenge assumptions, seek counterexamples, and do not end merely because the first turn is complete.\n\nLearning goal:\n{goal}\n\nCurrent maintainer message:\n{message_with_mentions}\n\nFollow this protocol:\n{protocol}\n\nAvailable source roots:\n{source_roots}\n\nKeep facts, inferences, contradictions, and unknowns distinct. Do not make canonical Methodus graph writes or change project source files for this learning task. When the maintainer explicitly asks to finalize, write the complete synthesis to this exact file using shell tools:\n{output}\n\nIf approval is requested, approve only this return-artifact write. That file must include a fenced `json` block with exactly {{\"candidates\":[{{\"type\":\"knowledge|method|experience\",\"kind\":\"...\",\"title\":\"...\",\"summary\":\"...\",\"learn\":\"...\",\"decide\":\"...\",\"execute\":\"...\",\"evidence\":\"...\",\"outcome\":\"...\",\"occurred_at\":\"...\",\"tags\":[\"...\"]}}],\"relations\":[],\"unresolved_questions\":[],\"contradictions\":[]}}. Tell the maintainer after writing it; they can then exit this runtime to return to Methodus for review.",
+            output = output_path.display(),
+        );
+        fs::write(run_root.join(format!("brief-{turn_id}.md")), &brief)?;
+        let (program, args) = native_learn_command(runtime, permission_mode, sandbox, &self.launch_cwd, &extra_dirs, executor_sid.as_deref(), resume_sid.is_some(), &brief)?;
+        Ok(NativeLearnHandoff {
+            run_id: run_id.into(), goal: goal.into(), runtime: runtime.into(), cwd: self.launch_cwd.clone(), program, args, executor_sid, output_path,
+        })
     }
 
     /// Write a Learn transcript and a review-only CandidateSet. The candidates
@@ -426,7 +660,7 @@ impl Engine {
         let review_notes = format!(
             "### Unresolved questions\n\n{}\n\n### Contradictions\n\n{}",
             if unresolved_questions.is_empty() { "none".into() } else { unresolved_questions.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n") },
-            if set.contradictions.is_empty() { "none".into() } else { set.contradictions.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n") },
+            if set.contradictions.is_empty() { "none".into() } else { set.contradictions.iter().map(|item| format!("- {}", json_value_text(item))).collect::<Vec<_>>().join("\n") },
         );
         let state = LearnRunState {
             run_id: run_id.into(), kind: "learn".into(), status: "awaiting_review".into(), goal: goal.trim().into(),
@@ -434,7 +668,7 @@ impl Engine {
             permission_mode: existing.as_ref().map(|run| run.permission_mode.clone()).unwrap_or_else(default_permission_mode),
             executor_sid: existing.and_then(|run| run.executor_sid),
             unresolved_questions,
-            contradictions: set.contradictions.clone(),
+            contradictions: set.contradictions.iter().map(json_value_text).collect(),
             updated_at: Utc::now().to_rfc3339(),
         };
         fs::write(run_root.join("state.yaml"), serde_yaml::to_string(&state).map_err(|error| CoreError::Other(format!("serialize Learn state: {error}")))?)?;
@@ -497,33 +731,25 @@ impl Engine {
         let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
         if node.status.as_deref() != Some("candidate") { return Err(CoreError::Other(format!("{node_id} is not a candidate"))); }
         let path = self.node_path(&node)?;
-        let raw = fs::read_to_string(&path)?;
-        let updated = replace_frontmatter_value(&raw, "status", "candidate", "rejected").ok_or_else(|| CoreError::Other(format!("{node_id} has no candidate status")))?;
-        fs::write(path, updated)?;
-        self.record_review_action(node_id, "reject", "candidate rejected in Methodus Review")?;
+        fs::remove_file(path)?;
+        self.record_review_action(node_id, "reject", "candidate rejected and deleted in Methodus Review")?;
         self.sync_graph()?;
         Ok(())
     }
 
-    /// Mark a committed or stale node as historical. Deprecated nodes remain
-    /// readable through explicit Agent history queries but are never selected by
-    /// normal retrieval.
-    pub fn deprecate_graph_node(&self, node_id: &str, rationale: &str) -> Result<(), CoreError> {
+    /// Permanently remove a reviewed node from managed storage and its graph projection.
+    pub fn delete_graph_node(&self, node_id: &str, rationale: &str) -> Result<(), CoreError> {
         let node = self.store.graph_node(node_id)?.ok_or_else(|| CoreError::Other(format!("graph node not found: {node_id}")))?;
         let status = node.status.as_deref().unwrap_or("committed");
-        if !matches!(status, "committed" | "stale") {
-            return Err(CoreError::Other(format!("{node_id} cannot be deprecated from status {status}")));
+        if !matches!(status, "committed" | "stale" | "deprecated" | "rejected") {
+            return Err(CoreError::Other(format!("{node_id} cannot be deleted from status {status}; reject a candidate instead")));
+        }
+        if !(node.path.starts_with("personal/") || node.path.starts_with("teams/")) {
+            return Err(CoreError::Other(format!("{node_id} is not a managed Personal or Team node")));
         }
         let path = self.node_path(&node)?;
-        let raw = fs::read_to_string(&path)?;
-        // `stale` is a projection state derived from source fingerprints; the
-        // authored Markdown may still say `committed`. Preserve that source
-        // contract while allowing an explicitly reviewed archive action.
-        let authored_status = crate::graph::read_graph_document(&self.home, &path)?.node.status.unwrap_or_else(|| "committed".into());
-        let updated = replace_frontmatter_value(&raw, "status", &authored_status, "deprecated")
-            .ok_or_else(|| CoreError::Other(format!("{node_id} has no editable status frontmatter")))?;
-        fs::write(path, updated)?;
-        self.record_review_action(node_id, "deprecate", rationale)?;
+        fs::remove_file(path)?;
+        self.record_review_action(node_id, "delete", rationale)?;
         self.sync_graph()?;
         Ok(())
     }
@@ -588,10 +814,7 @@ impl Engine {
         let candidate_doc = crate::graph::read_graph_document(&self.home, &candidate_path)?;
         let target_raw = fs::read_to_string(&target_path)?;
         fs::write(&target_path, format!("{}\n\n## Merged evidence from {}\n\n{}\n", target_raw.trim_end(), candidate_id, candidate_doc.body.trim()))?;
-        let raw = fs::read_to_string(&candidate_path)?;
-        let updated = replace_frontmatter_value(&raw, "status", "candidate", "rejected").unwrap_or(raw);
-        let updated = if updated.lines().any(|line| line.trim_start().starts_with("merged_into:")) { updated } else { updated.replacen("---\n", &format!("---\nmerged_into: {target_id}\n"), 1) };
-        fs::write(candidate_path, updated)?;
+        fs::remove_file(candidate_path)?;
         self.record_review_action(candidate_id, "merge", &format!("merged into {target_id}"))?;
         self.sync_graph()?;
         Ok(())
@@ -655,6 +878,14 @@ fn source_directories(cwd: &Path, text: &str) -> Vec<PathBuf> {
         let (path, _) = resolve_source_path(cwd, &token);
         if path.is_dir() { path } else { path.parent().unwrap_or(cwd).to_path_buf() }
     }).filter(|path| path.is_dir()).collect()
+}
+
+fn json_value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Object(fields) => fields.iter().map(|(key, value)| format!("{key}: {}", json_value_text(value))).collect::<Vec<_>>().join("; "),
+        other => other.to_string(),
+    }
 }
 
 fn extract_candidate_set(answer: &str) -> Option<CandidateSet> {
@@ -753,12 +984,57 @@ mod tests {
     }
 
     #[test]
+    fn native_claude_handoff_is_interactive_and_uses_a_uuid() {
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let (_, args) = native_learn_command(
+            "claude-code",
+            "plan",
+            "read-only",
+            Path::new("/tmp/work"),
+            &[PathBuf::from("/tmp/source")],
+            Some(sid),
+            false,
+            "learn this",
+        ).unwrap();
+        assert!(args.contains(&"--session-id".to_string()));
+        assert!(args.contains(&sid.to_string()));
+        assert!(args.contains(&"--permission-mode".to_string()));
+        assert!(!args.contains(&"--print".to_string()));
+    }
+
+    #[test]
+    fn native_learn_return_imports_a_structured_candidate_set() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::with_runtimes(Arc::new(Store::open_memory().unwrap()), dir.path().to_path_buf(), HashMap::new());
+        let run_id = "learn_native";
+        engine.write_learn_state(run_id, "signal handling", "claude-code", Some("plan"), "running", Some("11111111-2222-3333-4444-555555555555")).unwrap();
+        let output_path = dir.path().join("native-output.md");
+        fs::write(&output_path, "```json\n{\"candidates\":[{\"type\":\"knowledge\",\"kind\":\"diagnostic-signal\",\"title\":\"Signal marker\",\"learn\":\"Read it.\"}]}\n```").unwrap();
+        let handoff = NativeLearnHandoff {
+            run_id: run_id.into(), goal: "signal handling".into(), runtime: "claude-code".into(), cwd: dir.path().to_path_buf(), program: "claude".into(), args: Vec::new(), executor_sid: Some("11111111-2222-3333-4444-555555555555".into()), output_path,
+        };
+        let returned = engine.complete_native_learning(&handoff, "exit 0").unwrap();
+        assert!(returned.output_recorded);
+        assert_eq!(returned.candidate_ids.len(), 1);
+        let run = engine.list_learning_runs().unwrap().into_iter().find(|run| run.run_id == run_id).unwrap();
+        assert_eq!(run.status, "awaiting_review");
+    }
+
+    #[test]
     fn extracts_structured_candidate_set_from_runtime_response() {
         let answer = "结论如下：\n```json\n{\"candidates\":[{\"type\":\"knowledge\",\"kind\":\"diagnostic-signal\",\"title\":\"Previous shutdown reason\",\"learn\":\"Read the reason first.\",\"tags\":[\"shutdown\"]}]}\n```";
         let set = extract_candidate_set(answer).unwrap();
         assert_eq!(set.candidates.len(), 1);
         assert_eq!(set.candidates[0].node_type, "knowledge");
         assert_eq!(set.candidates[0].kind.as_deref(), Some("diagnostic-signal"));
+    }
+
+    #[test]
+    fn candidate_set_accepts_runtime_relation_aliases_and_structured_contradictions() {
+        let answer = "```json\n{\"candidates\":[{\"type\":\"knowledge\",\"title\":\"Signal\"}],\"relations\":[{\"from\":\"candidate-0\",\"kind\":\"details\",\"to\":\"knowledge/existing\"}],\"contradictions\":[{\"claim_a\":\"old\",\"claim_b\":\"new\"}]}\n```";
+        let set = extract_candidate_set(answer).unwrap();
+        assert_eq!(set.relations[0].relation, "details");
+        assert_eq!(json_value_text(&set.contradictions[0]), "claim_a: old; claim_b: new");
     }
 
     #[test]
@@ -820,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_stale_nodes_can_be_revalidated_or_archived() {
+    fn projected_stale_nodes_can_be_revalidated() {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join("personal/knowledge")).unwrap();
         fs::write(dir.path().join("evidence.txt"), "one").unwrap();
@@ -840,10 +1116,31 @@ mod tests {
         fs::write(dir.path().join("evidence.txt"), "one").unwrap();
         engine.revalidate_graph_node(&stale.id, "checked source").unwrap();
         assert_eq!(engine.list_graph_nodes(Some("Source")).unwrap().pop().unwrap().status.as_deref(), Some("committed"));
-        fs::write(dir.path().join("evidence.txt"), "two").unwrap();
+    }
+
+    #[test]
+    fn deleting_a_canonical_node_removes_its_projection() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("personal/knowledge")).unwrap();
+        fs::write(dir.path().join("personal/knowledge/remove.md"), "---\nid: knowledge/remove\ntitle: Remove me\nnode_type: knowledge\nkind: rule\nstatus: committed\nvisibility: personal\nsummary: Temporary\n---\n\n## Learn\nTemporary\n").unwrap();
+        let engine = Engine::with_runtimes(Arc::new(Store::open_memory().unwrap()), dir.path().to_path_buf(), HashMap::new());
         engine.sync_graph().unwrap();
-        let stale = engine.list_graph_nodes(Some("Source")).unwrap().pop().unwrap();
-        engine.deprecate_graph_node(&stale.id, "superseded").unwrap();
-        assert_eq!(engine.list_graph_nodes(Some("Source")).unwrap().pop().unwrap().status.as_deref(), Some("deprecated"));
+        engine.delete_graph_node("knowledge/remove", "test deletion").unwrap();
+        assert!(!dir.path().join("personal/knowledge/remove.md").exists());
+        assert!(engine.list_graph_nodes(Some("Remove me")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejecting_a_candidate_deletes_its_source_and_projection() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("personal/candidates")).unwrap();
+        let engine = Engine::with_runtimes(Arc::new(Store::open_memory().unwrap()), dir.path().to_path_buf(), HashMap::new());
+        engine.record_learning_output("Discard me", "```json\n{\"candidates\":[{\"type\":\"knowledge\",\"kind\":\"rule\",\"title\":\"Discard me\",\"summary\":\"Temporary\",\"learn\":\"No\",\"execute\":\"No\"}]}\n```").unwrap();
+        let candidate = engine.list_graph_nodes(Some("Discard me")).unwrap().into_iter().find(|node| node.status.as_deref() == Some("candidate")).unwrap();
+        let source = dir.path().join(&candidate.path);
+        assert!(source.exists());
+        engine.reject_graph_candidate(&candidate.id).unwrap();
+        assert!(!source.exists());
+        assert!(engine.list_graph_nodes(Some("Discard me")).unwrap().is_empty());
     }
 }

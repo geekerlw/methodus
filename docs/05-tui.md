@@ -1,8 +1,8 @@
 # 05 — Maintainer TUI
 
-The TUI is a knowledge studio for maintainers. It is allowed to host a focused Learn
-conversation because questioning, source evidence, candidate decomposition, and Review
-are Methodus-owned interactions. It is not a general coding-agent interface.
+The TUI is a knowledge studio for maintainers. It prepares focused Learn runs and
+returns to review them; the selected native runtime owns the multi-turn learning
+conversation after terminal handoff. It is not a general coding-agent interface.
 
 ## 1. Default surface
 
@@ -44,10 +44,12 @@ The home surface. It shows:
 - usage and runtime state;
 - proposed CandidateSet when synthesis is ready.
 
-Learn supports continuing the active runtime conversation in the same TUI process;
-the current run is restored from its durable state after a TUI restart when the
-runtime exposes a resumable executor ID. “Session” means a Learn run only; Methodus
-does not manage ordinary coding sessions.
+Learn returns control to the selected runtime's native TUI for the actual research
+conversation. After that TUI exits, Methodus restores its screen and imports an
+explicit synthesis artifact if the runtime wrote one. The current run is restored after
+a TUI restart; Claude Code resumes its durable executor UUID, while other runtimes can
+start a fresh native conversation carrying the same Learn context. “Session” means a
+Learn run only; Methodus does not manage ordinary coding sessions.
 
 ### Knowledge
 
@@ -124,7 +126,6 @@ Commands switch surfaces or start explicit maintainer actions:
 | `/method` | Browse Methods |
 | `/experience` | Browse Experiences |
 | `/review` | Open candidate Review |
-| `/graph` | Open the Knowledge graph at the first indexed node |
 | `/team` | Inspect Team status; `v` validates, `d` refreshes diff, `p` writes a publish plan |
 | `/health` | Inspect source, graph, repository, and connector health |
 | `/runtime [id]` | Open the runtime picker or directly select `claude-code`, `codex`, or `cursor` |
@@ -132,13 +133,14 @@ Commands switch surfaces or start explicit maintainer actions:
 | `/open [path]` | Open the current node, Methodus home, or an explicit local path |
 | `/quit` | Exit Methodus |
 
-There is no ordinary task command, workspace command, runtime handoff, Skill browser,
-or MCP setup surface.
+There is no ordinary task command, task workspace command, Skill browser, or MCP setup
+surface. Native handoff exists only for focused Learn runs.
 
 ## 4. Candidate-set flow
 
-When the learning runtime proposes output, Methodus persists the assistant response
-and writes one review-only Markdown draft per candidate. The current v1 Review panel
+When the learning runtime finalizes, it writes its synthesis to the run-specific return
+artifact. After the native TUI exits, Methodus imports that output and writes one
+review-only Markdown draft per candidate. The current v1 Review panel
 lets the maintainer filter candidates, open the complete draft, edit it externally,
 and apply explicit lifecycle actions. A richer structured selection view is the next
 draft-editing extension:
@@ -177,12 +179,23 @@ Review.
 - `q` is text, never a global quit shortcut.
 - Empty-input double `Ctrl+C` within the configured window exits.
 - `Esc` closes or backs out; it never destroys a Learn run.
-- Arrow keys navigate lists; printable characters filter and never act as hidden
-  `j/k` navigation.
-- Filters are visibly rendered wherever typing changes a list.
+- Arrow keys navigate lists. Rejected candidates remain visible in Knowledge, Method,
+  and Experience for cleanup; deprecated and review-only candidates remain out of
+  those lists. Rejected nodes do not participate in active graph neighborhoods.
+- Filters are visibly rendered in panel titles. Press `f` to enter filter mode, type
+  the query, then press `Enter` to apply or `Esc` to close it; this keeps Review
+  approval actions available as direct keys.
 - `Shift+Tab` cycles the visible permission mode; the choice applies to the next
   runtime turn and persists in `config.yaml`.
 - Enter opens complete content; full Markdown remains accessible.
+- `g` opens the selected active node's one-hop graph neighborhood; there is no
+  separate graph command.
+- Detail views reserve a fixed bottom action strip. It always displays the available
+  node actions and turns into an explicit “press the same key again” confirmation
+  prompt for delete, revalidate, and Review decisions.
+- Review rejection immediately deletes the candidate source and records the decision.
+  In a canonical node detail, `d` permanently removes the managed node and its graph
+  projection; there is no archive or recovery-copy state.
 - Destructive or publication actions require an explicit target and confirmation;
   implementation must use a visible second-step confirmation, not an implicit key
   chord.

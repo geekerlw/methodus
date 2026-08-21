@@ -2,9 +2,10 @@
 
 This roadmap is the implementation order for the product contract. The active product
 boundary is deliberately narrow: Methodus is a maintainer knowledge studio and a
-read-only Agent sidecar. Ordinary coding sessions, task workspaces, native handoff,
-MCP, Face, arbitrary Skill management, and automatic Skill evolution are not roadmap
-items.
+read-only Agent sidecar. Ordinary coding sessions, task workspaces, MCP, Face,
+arbitrary Skill management, and automatic Skill evolution are not roadmap items.
+Focused Learn retains native runtime handoff because its investigation is inherently
+multi-turn and runtime-owned.
 
 ## Current baseline (implemented)
 
@@ -136,7 +137,8 @@ Next:
 
 - no MCP server in the default architecture;
 - no ordinary task workspace or repository copy managed by Methodus;
-- no runtime handoff or proxying of Claude/Codex/Cursor TUI interaction;
+- no runtime handoff or proxying of ordinary coding sessions; focused Learn hands the
+  terminal to the selected native runtime and never proxies its UI;
 - no monitoring of ordinary developer transcripts;
 - no automatic graph writes from consumer Agents;
 - no arbitrary Skill install, generated Skill, marketplace, or Skill evolution;

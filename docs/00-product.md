@@ -21,10 +21,10 @@ Methodus is not:
 - an autonomous system that rewrites canonical knowledge after every session.
 
 The product deliberately separates two moments of work. Maintainers use Methodus to
-learn, curate, and publish durable engineering memory; developers use Claude Code,
-Codex, Cursor, or another native runtime for the actual task. Methodus is present at
-the edge of that task through a read-only connector, but it does not become the task
-runtime or take over the runtime's terminal interaction.
+prepare, curate, and publish durable engineering memory; developers use Claude Code,
+Codex, Cursor, or another native runtime for the actual task. A Learn run is prepared
+by Methodus but then handed to the selected runtime's native terminal UI, which owns
+the multi-turn research conversation. Methodus returns only after that runtime exits.
 
 ## 2. Users and value
 
@@ -136,12 +136,14 @@ Method / abnormal shutdown diagnosis
 
 ```text
 maintainer states a learning goal in the TUI
-  → Methodus retrieves existing graph context
-  → learning runtime questions scope and assumptions
+  → Methodus records the run, sources, protocol, and return-artifact path
+  → terminal hands off to the selected native learning runtime
+  → learning runtime questions scope and assumptions across multiple turns
   → maintainer attaches selected evidence sources
   → runtime investigates, contrasts, and seeks counterexamples
   → maintainer confirms consequential judgments
-  → runtime proposes a candidate set and typed relations
+  → runtime writes a candidate set and typed relations to the run return artifact
+  → Methodus resumes and imports the review-only candidates
   → maintainer splits, merges, edits, accepts, or rejects
   → accepted nodes become Personal
   → explicit promotion publishes selected nodes to Team through Git
@@ -198,7 +200,7 @@ maintainers decide how to update knowledge.
 
 ### Maintainer TUI
 
-- default Learn conversation;
+- default Learn launcher and native-runtime handoff;
 - Knowledge, Method, Experience, and graph browsing;
 - candidate-set review and editing; richer split/relation editing is an incremental
   maintainer-surface extension;

@@ -77,9 +77,11 @@ connector contains instructions only—it does not contain your knowledge graph.
 
 ## Learn in the TUI
 
-The home screen is a focused learning conversation. Type an ordinary message to state
-what you want to understand; Methodus keeps the Runtime conversation and evidence
-record under the current Learn run.
+The home screen starts a focused learning conversation. Type an ordinary message to
+state what you want to understand; Methodus records the goal and hands the terminal to
+your selected native Runtime. Continue the investigation there just as you normally
+would. When you ask it to finalize, it writes a Review-only return artifact; exit the
+Runtime and Methodus restores the TUI to import the candidate set.
 
 | Action | Key or command |
 |---|---|
@@ -90,12 +92,13 @@ record under the current Learn run.
 | Switch Runtime | `/runtime` or `/runtime codex` |
 | Start a fresh learning goal | `/new` |
 | Browse knowledge and review | `/knowledge`, `/method`, `/experience`, `/review` |
-| Inspect graph relations | `/graph` or `g` in a list/detail view |
+| Inspect graph relations | Select an active node, then press `g` |
 | Leave Methodus | `/quit`; `Ctrl+C` twice is the escape hatch |
 
 The learning Runtime is instructed to clarify scope, challenge assumptions, inspect
 evidence, seek counterexamples, separate fact from inference, and return a structured
-CandidateSet only when the evidence is sufficient.
+CandidateSet only when the evidence is sufficient. Methodus does not proxy this
+conversation, so runtime tool views, approvals, and multi-turn interaction stay native.
 
 `/new` closes the current Learn context. `quit` only exits the TUI: an active Learn run
 is restored on the next launch, while a run waiting for Review remains a review record
@@ -137,12 +140,11 @@ connector tells the native agent to continue normally.
 Only reviewed content is available to consumer agents:
 
 ```text
-candidate → committed → stale → revalidated
-                    ↘ deprecated
-candidate → rejected
+candidate → committed → stale → committed
+candidate --reject--> deleted
 ```
 
-- `candidate` and `rejected` content is excluded from Agent retrieval.
+- `candidate` content is excluded from Agent retrieval; Review rejection deletes it.
 - `stale` content is returned only when strongly relevant and carries a warning.
 - `deprecated` content is retained for explicit history queries.
 - Source changes never rewrite a conclusion automatically; maintainers decide what to
