@@ -7,6 +7,14 @@
 
 # Rust
 /target/
+**/node_modules/
+apps/methodus-desktop/dist/
+apps/methodus-desktop/src-tauri/target/
+apps/methodus-desktop/src-tauri/gen/
+apps/methodus-desktop/src-tauri/icons/android/
+apps/methodus-desktop/src-tauri/icons/ios/
+apps/methodus-desktop/src-tauri/icons/Square*Logo.png
+apps/methodus-desktop/src-tauri/icons/StoreLogo.png
 **/*.rs.bk
 Cargo.lock.orig
 
