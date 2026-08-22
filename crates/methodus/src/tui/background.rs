@@ -60,25 +60,41 @@ impl BackgroundEvent {
     /// Only things a person must act on are worth interrupting for; a turn that
     /// completed with nothing new is left to the status bar.
     pub fn notification(&self) -> Option<(String, String, NotifyUrgency)> {
-        let (title, urgency) = match self {
+        let (title, body, urgency) = match self {
             Self::TurnFinished(outcome) if outcome.needs_attention() => {
-                ("Methodus needs you", NotifyUrgency::Critical)
+                (
+                    "Methodus needs you",
+                    format!("{} Open /attention to answer.", self.status_line()),
+                    NotifyUrgency::Critical,
+                )
             }
             Self::TurnFinished(outcome) if !outcome.candidate_ids.is_empty() => {
-                ("Methodus review ready", NotifyUrgency::Normal)
+                (
+                    "Methodus review ready",
+                    format!("{} Open /review to inspect them.", self.status_line()),
+                    NotifyUrgency::Normal,
+                )
             }
-            Self::TurnFailed { .. } | Self::SchedulerFailed { .. } => {
-                ("Methodus scheduler", NotifyUrgency::Critical)
-            }
-            Self::Blocked(_) => ("Methodus budget", NotifyUrgency::Normal),
+            Self::TurnFailed { .. } | Self::SchedulerFailed { .. } => (
+                "Methodus scheduler",
+                format!("{} Open Methodus to inspect the run.", self.status_line()),
+                NotifyUrgency::Critical,
+            ),
+            Self::Blocked(_) => (
+                "Methodus budget",
+                format!("{} Open /goals to adjust the Goal.", self.status_line()),
+                NotifyUrgency::Normal,
+            ),
             // Stale nodes are a standing fact, not an interruption: the next
             // review picks them up whether or not anyone reads the banner.
-            Self::SourcesChecked { newly_stale } if *newly_stale > 0 => {
-                ("Methodus sources", NotifyUrgency::Low)
-            }
+            Self::SourcesChecked { newly_stale } if *newly_stale > 0 => (
+                "Methodus sources",
+                format!("{} Open /health or /review.", self.status_line()),
+                NotifyUrgency::Low,
+            ),
             _ => return None,
         };
-        Some((title.to_string(), self.status_line(), urgency))
+        Some((title.to_string(), body, urgency))
     }
 }
 
@@ -288,17 +304,19 @@ mod tests {
         assert_eq!(title, "Methodus review ready");
         assert_eq!(urgency, NotifyUrgency::Normal);
         assert!(body.contains("1 candidate"));
+        assert!(body.contains("/review"));
     }
 
     #[test]
     fn work_that_blocks_on_a_person_is_critical() {
         let mut blocked = outcome();
         blocked.attention = Some(attention());
-        let (title, _, urgency) = BackgroundEvent::TurnFinished(Box::new(blocked))
+        let (title, body, urgency) = BackgroundEvent::TurnFinished(Box::new(blocked))
             .notification()
             .expect("a hand-off should notify");
         assert_eq!(title, "Methodus needs you");
         assert_eq!(urgency, NotifyUrgency::Critical);
+        assert!(body.contains("/attention"));
     }
 
     #[test]

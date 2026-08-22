@@ -17,7 +17,9 @@ use methodus_store::Store;
 
 use crate::error::CoreError;
 
-pub use attention::{envelope_title, parse_envelope, AttentionEnvelope};
+pub use attention::{
+    envelope_title, parse_envelope, parse_learning_recommendation, AttentionEnvelope,
+};
 pub use goal::{goal_prompt_for, parse_form, render_form, GoalForm};
 pub use schedule::{
     plan_tick, BlockReason, BlockedGoal, ScheduledTurn, TickInput, TickPlan,

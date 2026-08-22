@@ -21,10 +21,12 @@ Methodus is not:
 - an autonomous system that rewrites canonical knowledge after every session.
 
 The product deliberately separates two moments of work. Maintainers use Methodus to
-prepare, curate, and publish durable engineering memory; developers use Claude Code,
-Codex, Cursor, or another native runtime for the actual task. A Learn run is prepared
-by Methodus but then handed to the selected runtime's native terminal UI, which owns
-the multi-turn research conversation. Methodus returns only after that runtime exits.
+use, learn, curate, and publish durable engineering memory; developers use Claude
+Code, Codex, Cursor, or another native runtime for the actual task. Ordinary TUI input
+is a Use question against the reviewed graph. Both Use and Learn start native runtimes
+from Methodus-managed workspaces; Learn state and return artifacts remain under
+`runs/<learn-id>/`. The selected runtime owns the multi-turn conversation, and Methodus
+returns only after that runtime exits.
 
 ## 2. Users and value
 
@@ -152,14 +154,40 @@ maintainer states a learning goal in the TUI
 One Learn run may propose zero or more Knowledge, Method, and Experience nodes. The
 research record remains attached to the run; it is not forced into the graph.
 
-### 5.2 Agent consumption
+### 5.2 Methodus Use
+
+```text
+maintainer asks a question in the TUI
+  → Methodus creates a managed Use workspace and prepares a graph environment, Team directory structure, and inventory contract
+  → selected native Runtime receives the graph directories and the question
+  → TUI hands over the terminal to the Runtime
+  → Runtime reads, reasons, and answers with facts, inferences, recommendations, and uncertainty
+  → if committed evidence is insufficient, Runtime writes one learning recommendation return object
+  → TUI is restored; the recommendation enters /attention and can become a Learn Goal
+  → otherwise follow-up questions can resume the same native Use session
+```
+
+Use is an answer surface, not a canonical graph write path. Methodus prepares the
+environment but does not preselect an answer with a local keyword heuristic. The
+Runtime reads the complete relevant Markdown nodes itself. Temporary notes and plans
+belong in the Methodus-managed Use workspace; graph content, project files, and
+explicit evidence remain protected. Use never creates candidates or treats a stale
+node as a current rule without warning.
+
+When Use cannot answer from committed evidence, its contract forbids invention and
+requires a concrete `learning_recommended` Learn task. Methodus records that return
+as a HumanAttention item rather than letting the Runtime create a Goal directly. The
+maintainer can accept the task or edit it in `/attention`; acceptance uses the same
+default cadence, budget, and first-turn scheduling as `/goal <text>`.
+
+### 5.3 Agent consumption
 
 ```text
 developer asks Claude/Codex to diagnose or design
   → connector Skill recognizes a high-value task
-  → Skill calls `methodus agent prepare`
-  → CLI returns a bounded Method/Knowledge/Experience bundle
-  → agent calls search/get/related only when more detail is needed
+  → Skill calls `methodus agent manifest`
+  → CLI returns graph roots and the complete consumer-visible inventory
+  → native agent selects relevant nodes and calls get/related
   → native runtime performs the work and owns all user interaction
 ```
 
@@ -200,7 +228,8 @@ maintainers decide how to update knowledge.
 
 ### Maintainer TUI
 
-- default Learn launcher and native-runtime handoff;
+- default Use question surface and Runtime synthesis from a Methodus-managed workspace;
+- explicit Learn launcher and native-runtime handoff;
 - Knowledge, Method, Experience, and graph browsing;
 - candidate-set review and editing; richer split/relation editing is an incremental
   maintainer-surface extension;
@@ -209,14 +238,15 @@ maintainers decide how to update knowledge.
 - Team repository status, validation, diff, and publish-plan generation;
 - learning runtime selection and learning-session resume.
 
-The home screen is an agent-like Learn conversation. Slash commands switch to the
-management panels; they do not turn Methodus into a general coding-agent shell.
+The home screen is an agent-like Use conversation. `/learn` is the explicit deliberate
+learning entry point; slash commands also switch to the management panels. Methodus is
+not a general coding-agent shell.
 
 ### Agent CLI
 
 A small, stable, non-interactive, read-only interface under `methodus agent`:
 
-- `prepare`, `search`, `get`, `related`, and `status`;
+- `manifest`, `search`, `get`, `related`, and `status`;
 - Markdown output by default and structured JSON on request;
 - bounded result sizes, explicit node IDs, lifecycle state, evidence, and rationale.
 

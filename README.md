@@ -36,7 +36,8 @@ terminal workflow.
 
 ```text
 Maintainer
-  → focused Learn conversation, or a Goal on a cadence
+  → Use question from the reviewed graph
+  → explicit Learn conversation, or a Goal on a cadence
   → evidence, counterexamples, and open questions
   → structured CandidateSet
   → Review: edit, approve, reject, merge
@@ -44,8 +45,8 @@ Maintainer
 
 Developer in a native agent runtime
   → connector Skill
-  → methodus agent (read-only)
-  → relevant Method / Knowledge / Experience
+  → methodus agent manifest (read-only)
+  → native agent selects and reads relevant nodes
   → native runtime continues the task
 ```
 
@@ -78,41 +79,61 @@ connector contains instructions only—it does not contain your knowledge graph.
 Keep the process open in `tmux`. Methodus schedules its own work while it runs, so a
 closed terminal is a paused system.
 
-## Learn in the TUI
+## Use and Learn in the TUI
 
-The home screen starts a focused learning conversation. Type an ordinary message to
-state what you want to understand; Methodus records the goal and hands the terminal to
-your selected native Runtime. Continue the investigation there just as you normally
-would. When you ask it to finalize, it writes a Review-only return artifact; exit the
-Runtime and Methodus restores the TUI to import the candidate set.
+The home screen is Methodus Use. Type an ordinary question and Methodus prepares a
+graph environment plus an inventory contract, creates a Methodus-managed runtime
+workspace, then hands the terminal to the selected native Runtime. The Runtime reads
+relevant Knowledge, Methods, and Experiences itself and owns the answer conversation.
+The graph, project directory, and explicit `@` sources are protected by the Use
+contract; temporary notes and plans belong in the managed workspace. Use does not
+create learning candidates. Follow-up questions can resume the same Use conversation;
+`@` can attach a local source as additional evidence.
+
+If the Runtime cannot find sufficient committed evidence, the Use contract requires it
+to avoid guessing and write one `learning_recommended` return object with a concrete
+Learn task. Methodus places that recommendation in `/attention`; pressing `Enter`
+accepts it as a new Learn Goal, while typed text replaces the task before creation.
+
+Learning is explicit. `/learn <text>` starts a focused native learning conversation;
+`/learn` enters Learn mode so the next message continues or starts that run. When the
+runtime finalizes, it writes a Review-only return artifact; exit the Runtime and
+Methodus restores the TUI to import the candidate set.
 
 | Action | Key or command |
 |---|---|
-| Start or continue Learn | Type a message, then `Enter` |
+| Ask Methodus | Type a question, then `Enter` |
+| Start or continue Learn | `/learn [text]` |
 | Attach a source | Type `@`, choose a path, then `Tab` or `Enter` |
 | Add a line break | `Shift+Enter` |
-| Cycle Runtime permission | `Shift+Tab` |
+| Cycle Use/Learn Runtime permission | `Shift+Tab` (Use or Learn mode) |
 | Switch Runtime | `/runtime` or `/runtime codex` |
-| Start a fresh learning goal | `/new` |
+| Clear the current session | `/new` (`/new <goal>` remains a Learn shortcut) |
 | Browse knowledge and review | `/knowledge`, `/method`, `/experience`, `/review` |
 | Create or manage scheduled learning | `/goal [text]` (`/goals` is an alias) |
-| Answer a blocked scheduled turn | `/attention` |
+| Handle questions and learning recommendations | `/attention` |
 | Inspect graph relations | Select an active node, then press `g` |
 | Leave Methodus | `/quit`; `Ctrl+C` twice is the escape hatch |
 
-The learning Runtime is instructed to clarify scope, challenge assumptions, inspect
-evidence, seek counterexamples, separate fact from inference, and return a structured
-CandidateSet only when the evidence is sufficient. Methodus does not proxy this
-conversation, so runtime tool views, approvals, and multi-turn interaction stay native.
+The Use Runtime receives a Methodus-managed environment contract, the selected Team and
+Personal/Team directory structure, an inventory of consumer-visible Markdown nodes,
+and the opened graph directories. It is instructed to inspect the files itself and
+separate graph-backed facts, inferences, stale evidence, and unknowns. Its permission
+mode follows the same mapping as Learn, but its writable surface is the managed Use
+workspace. Learn uses the corresponding `workspaces/learn/<run-id>/` directory and
+keeps its return artifact under `runs/<run-id>/`. The Learn Runtime is instructed to clarify scope, challenge assumptions,
+inspect evidence, seek counterexamples, and return a structured CandidateSet only when
+the evidence is sufficient. Both Use and Learn hand the terminal to the native runtime;
+only Learn imports a return artifact into Review.
 
 `/goal <text>` creates a persistent Goal using the same natural-language input and `@`
 source attachments as Learn. Cadence, budget, and other policy fields are filled with
 their defaults. `/goal` without text opens the management view; `/goals` remains a
 compatible alias, and `e` opens advanced YAML editing.
 
-`/new` closes the current Learn context. `quit` only exits the TUI: an active Learn run
-is restored on the next launch, while a run waiting for Review remains a review record
-instead of reopening a Runtime conversation.
+`/new` clears the current Use or Learn context and returns to Use. `quit` only exits the
+TUI: an active Learn run is restored on the next launch, while a run waiting for Review
+remains a review record instead of reopening a Runtime conversation.
 
 ## Keep learning on a cadence
 
@@ -162,23 +183,20 @@ For substantial diagnosis, design, research, document, or presentation work, the
 connector can call the read-only protocol:
 
 ```bash
-methodus agent prepare \
-  --goal "Diagnose abnormal device shutdown" \
-  --budget 1200
+methodus agent manifest --format json
 
-methodus agent search \
-  --query "previous shutdown reason" \
-  --type knowledge,experience
+methodus agent get knowledge/previous-shutdown-reason --facet all
 
-methodus agent get knowledge/previous-shutdown-reason --facet execute
 methodus agent related knowledge/previous-shutdown-reason
 methodus agent status
 ```
 
-The protocol returns bounded Markdown by default or JSON with `--format json`. It is
-read-only by construction: it cannot create graph nodes, modify candidates, start a
-Runtime, or read an ordinary coding transcript. If Methodus is unavailable, the
-connector tells the native agent to continue normally.
+The manifest gives the native agent the graph roots and complete consumer-visible
+inventory. The native agent chooses relevant nodes, then reads their full bodies with
+`get` or follows authored relations with `related`. The protocol is read-only by
+construction: it cannot create graph nodes, modify candidates, start a Runtime, or
+read an ordinary coding transcript. If Methodus is unavailable, the connector tells
+the native agent to continue normally.
 
 ## Trust model
 
@@ -209,6 +227,9 @@ candidate --reject--> deleted
 │   └── candidates/         # Review-only drafts
 ├── teams/<team-id>/        # Local Git-backed Team roots
 ├── runs/                   # Learn transcripts, sources, and review audit
+├── workspaces/             # Methodus-managed Learn and Use runtime workspaces
+│   ├── learn/<run-id>/
+│   └── use/<session-id>/
 └── connectors/             # Connector ownership/version metadata
 ```
 
@@ -224,7 +245,7 @@ changes.
 - A terminal Learn, Schedule, and Review workbench
 - A Markdown-first Knowledge / Method / Experience graph
 - A local evidence and freshness tracker
-- A bounded, deterministic Agent retrieval CLI
+- A read-only Agent graph-environment CLI
 - A small connector Skill for Claude Code, Codex, and Cursor
 
 ### It is not

@@ -1,8 +1,8 @@
 //! Methodus maintainer studio TUI.
 //!
-//! The TUI prepares deliberate Learn runs and curates their results. It temporarily
-//! hands its terminal to a native runtime for a focused Learn conversation, but never
-//! proxies or manages ordinary coding sessions.
+//! The TUI answers graph-read-only Use questions from a Methodus-managed workspace,
+//! prepares deliberate Learn runs, and curates their results. It temporarily
+//! hands its terminal to a native runtime for the focused conversation.
 
 mod background;
 mod control;
@@ -20,7 +20,10 @@ use crossterm::{
 use methodus_core::{Engine, InstanceLock};
 use ratatui::prelude::{CrosstermBackend, Terminal};
 
-pub async fn run(engine: Engine, _lock: InstanceLock) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    engine: Engine,
+    _lock: InstanceLock,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     stdout().execute(EnableBracketedPaste)?;

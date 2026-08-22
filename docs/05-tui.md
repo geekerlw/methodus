@@ -1,42 +1,69 @@
 # 05 — Maintainer TUI
 
-The TUI is a knowledge studio for maintainers, and the only maintainer surface. It
-prepares focused Learn runs and returns to review them; the selected native runtime owns
-the multi-turn learning conversation after terminal handoff. It also runs the scheduled,
-unattended half of the product described in [`10-continuous-learning.md`](./10-continuous-learning.md).
-It is not a general coding-agent interface.
+The TUI is a knowledge studio for maintainers, and the only maintainer surface. Its
+default Use composer answers questions from the reviewed graph; `/learn` prepares a
+focused Learn run and hands the terminal to the selected native runtime. It also runs
+the scheduled, unattended half of the product described in
+[`10-continuous-learning.md`](./10-continuous-learning.md). It is not a general
+coding-agent interface.
 
 ## 1. Default surface
 
 ```text
-┌ ◈ Methodus · Learn                    runtime · Personal + Team ┐
+┌ ◈ Methodus · Use                     runtime · Personal + Team ┐
 │                                                                    │
-│ methodus  What do you want to understand or make repeatable?       │
+│ methodus  Ask about an existing Method, Knowledge, or Experience.  │
 │                                                                    │
-│ you       Learn how we diagnose abnormal device shutdown.          │
+│ you       How should we diagnose abnormal device shutdown?          │
 │                                                                    │
 │ methodus  Existing graph context                                   │
 │           • previous shutdown reason                               │
 │           • watchdog reset                                         │
 │                                                                    │
-│           Before researching: which device/runtime scope applies?  │
+│           Recommendation: start with the watchdog reset signal…    │
 │                                                                    │
 ├────────────────────────────────────────────────────────────────────┤
-│ › attach @source or answer                                           │
+│ › ask Methodus · @source for additional evidence                     │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
 The composer supports CJK/IME input, bracketed paste, `Shift+Enter` newline, file/source
 mentions, discoverable slash commands, and double `Ctrl+C` exit. The top bar shows the
-concrete learning runtime name. The permission mode is visible beside the composer;
-`Shift+Tab` cycles read-only plan, controlled execution, and auto edit. Methodus maps the
-selection to native runtime controls and never selects a permission-bypass mode.
+concrete Runtime name. Use protects the graph and attached evidence while its
+managed workspace follows the same permission mode as Learn. The composer displays
+that mode and `Shift+Tab` cycles guided workspace, controlled execution, and auto edit
+for both Use and Learn.
+Methodus maps the Learn selection to native runtime controls and never selects a
+permission-bypass mode.
 
 ## 2. Primary panels
 
+### Use
+
+The home surface. Ordinary input is a question against the committed and stale graph.
+Methodus creates `workspaces/use/<session-id>/`, writes a `METHODUS_USE.md` contract
+and inventory there, opens only the consumer-visible Knowledge, Method, and Experience
+directories, and hands the terminal to the selected native Runtime from that workspace.
+Temporary notes and plans stay in that workspace; the graph, project directory, and
+explicit `@` sources are not to be modified. A Use follow-up resumes the same native session when the
+Runtime supports it, while a new `/new` clears it. The Use turn itself never creates a Learn run or a
+CandidateSet.
+
+If the Runtime cannot find sufficient committed evidence, the Use contract requires a
+single `learning_recommended` return object instead of an invented answer. Methodus
+opens it in `/attention`; `Enter` creates a Learn Goal from the recommended task, and
+typed text replaces that task before the Goal is created. The Runtime never creates a
+Goal directly.
+
+`@` mentions add explicit local source paths to the question. They are passed as
+protected evidence directories to the Runtime alongside the prepared graph
+environment. The Use composer displays the same permission mode as Learn and
+`Shift+Tab` cycles it for either mode.
+
 ### Learn
 
-The home surface. It shows:
+`/learn` switches the composer into deliberate Learn mode. `/learn <text>` starts the
+same flow immediately. Learn shows:
 
 - goal and current learning phase;
 - retrieved existing nodes;
@@ -46,7 +73,8 @@ The home surface. It shows:
 - usage and runtime state;
 - proposed CandidateSet when synthesis is ready.
 
-Learn returns control to the selected runtime's native TUI for the actual research
+Learn creates `workspaces/learn/<run-id>/` as the native runtime's working directory
+and returns control to the selected runtime's native TUI for the actual research
 conversation. After that TUI exits, Methodus restores its screen and imports an
 explicit synthesis artifact if the runtime wrote one. The current run is restored after
 a TUI restart; Claude Code resumes its durable executor UUID, while other runtimes can
@@ -82,13 +110,17 @@ occupancy, attention, and budget checks still apply to it.
 
 ### Attention
 
-The queue of questions that unattended turns are blocked on. Each entry names its Goal,
-how long it has been waiting, and whether the runtime wants a judgment or a permission.
+The queue of maintainer decisions and runtime learning recommendations. Each entry
+names its Goal or Use session, how long it has been waiting, and whether the runtime
+wants a judgment, a permission, or a new Learn task.
 
 Answering resumes the session that asked. `Enter` opens a reply composer; `Shift+Enter`
 adds a newline and plain `Enter` submits. Submitting hands the terminal to the runtime
 holding that executor session, delivering the answer as the next message. The question
 is only resolved once that handoff has run, so a failed launch leaves it in the queue.
+Use-to-Learn recommendations are the exception: they do not resume the Use runtime;
+plain `Enter` accepts the proposed task and creates a new Learn Goal, while typed text
+edits it first. The Goal receives the same default cadence and budget as `/goal <text>`.
 `d` dismisses a question without answering, for the ones a maintainer decides are moot;
 the Goal unblocks and its next scheduled turn starts fresh.
 
@@ -132,6 +164,23 @@ Actions:
 
 Merge never picks a target implicitly.
 
+When a Knowledge candidate should revise an existing node, `m` first opens the
+committed Knowledge target picker. `Enter` on a target opens a facet-level patch
+review instead of writing immediately. The patch review shows the selected facet
+side by side as `target` and `candidate`:
+
+- `↑`/`↓` changes the facet (`Learn`, `Decide`, `Execute`, or `Evidence`);
+- `Space` or `a` accepts the candidate facet, while `k` keeps the target facet;
+- the initial state keeps every target facet, so nothing is applied by accident;
+- `Enter` previews the selected patch, and a second `Enter` confirms it;
+- only accepted candidate facets replace target sections. Target frontmatter and
+  unselected sections remain intact, and the candidate is removed only after the
+  write succeeds.
+
+The review audit records the target and the exact accepted facets. The runtime's
+prose `patch` proposal remains evidence for this decision; it does not bypass the
+maintainer's facet selection.
+
 ### Graph
 
 The graph is a navigation aid, not decorative force-directed animation. The first
@@ -161,10 +210,11 @@ Commands switch surfaces or start explicit maintainer actions:
 
 | Command | Result |
 |---|---|
-| ordinary input | Start or continue the focused Learn run |
-| `/new [goal]` | Close the current context and optionally start a new Learn goal |
+| ordinary input | Ask Methodus from the reviewed graph and continue Use |
+| `/learn [text]` | Start or continue a deliberate Learn run |
+| `/new [goal]` | Clear the current context and return to Use; with a goal, start Learn |
 | `/goal [text]` | Create a Goal, or manage Goals when no text is supplied (`/goals` is an alias) |
-| `/attention` | Answer the questions unattended turns are blocked on |
+| `/attention` | Handle runtime questions and learning recommendations |
 | `/knowledge` | Browse Knowledge |
 | `/method` | Browse Methods |
 | `/experience` | Browse Experiences |
@@ -177,16 +227,17 @@ Commands switch surfaces or start explicit maintainer actions:
 | `/quit` | Exit Methodus |
 
 There is no ordinary task command, task workspace command, Skill browser, or MCP setup
-surface. Native handoff exists only for focused Learn runs.
+surface. Both Use and focused Learn hand the terminal to a native Runtime; only Learn
+returns a structured artifact for Methodus to import into Review.
 
 ## 4. Candidate-set flow
 
 When the learning runtime finalizes, it writes its synthesis to the run-specific return
 artifact. After the native TUI exits, Methodus imports that output and writes one
-review-only Markdown draft per candidate. The current v1 Review panel
-lets the maintainer filter candidates, open the complete draft, edit it externally,
-and apply explicit lifecycle actions. A richer structured selection view is the next
-draft-editing extension:
+review-only Markdown draft per candidate. The Review panel lets the maintainer filter
+candidates, open the complete draft, edit it externally, and apply explicit lifecycle
+actions. When a candidate targets existing Knowledge, the facet-level patch review
+described above provides the structured conflict decision:
 
 ```text
 Candidate set · Learn run learn_...
@@ -202,9 +253,8 @@ Enter inspect · Space include · s split · m merge drafts · r review
 ```
 
 The unchecked research Experience illustrates the default: a Learn transcript is not
-automatically durable experience. Until the richer selection view lands, the same
-include/exclude decision is made by editing or rejecting the corresponding draft in
-Review.
+automatically durable experience. Candidate inclusion/exclusion still happens by
+editing, approving, or rejecting the corresponding draft in Review.
 
 ## 5. Unattended work
 
@@ -254,8 +304,8 @@ A turn that completed with nothing new never produces one.
 - Filters are visibly rendered in panel titles. Press `f` to enter filter mode, type
   the query, then press `Enter` to apply or `Esc` to close it; this keeps Review
   approval actions available as direct keys.
-- `Shift+Tab` cycles the visible permission mode; the choice applies to the next
-  runtime turn and persists in `config.yaml`.
+- `Shift+Tab` cycles the visible permission mode; the choice applies to the next Use or
+  Learn runtime turn and persists in `config.yaml`.
 - Enter opens complete content; full Markdown remains accessible.
 - `g` opens the selected active node's one-hop graph neighborhood; there is no
   separate graph command.

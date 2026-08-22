@@ -24,25 +24,54 @@ const DEFAULT_QUESTION: &str =
 pub fn parse_envelope(output: &str) -> Option<AttentionEnvelope> {
     candidate_blocks(output).into_iter().find_map(|block| {
         let value: serde_json::Value = serde_json::from_str(block.trim()).ok()?;
-        let kind = match value.get("outcome")?.as_str()? {
-            "needs_input" => AttentionKind::Question,
-            "permission_required" => AttentionKind::Permission,
-            _ => return None,
-        };
-        let question = value
-            .get("question")
+        parse_value(&value)
+    })
+}
+
+/// Parse only the explicit Use-to-Learn handoff. Native Use has a separate
+/// return contract from unattended Learn turns, so a malformed or unrelated
+/// JSON object must never become a learning recommendation by accident.
+pub fn parse_learning_recommendation(output: &str) -> Option<AttentionEnvelope> {
+    candidate_blocks(output).into_iter().find_map(|block| {
+        let value: serde_json::Value = serde_json::from_str(block.trim()).ok()?;
+        if value.get("outcome")?.as_str()? != "learning_recommended" {
+            return None;
+        }
+        let task = value
+            .get("learning_task")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|question| !question.is_empty())
-            .unwrap_or(DEFAULT_QUESTION)
-            .to_string();
-        Some(AttentionEnvelope {
-            kind,
-            question,
-            context: string_field(&value, "context"),
-            tool_name: string_field(&value, "tool_name"),
-            tool_input: value.get("tool_input").map(ToString::to_string),
+            .filter(|task| !task.is_empty())?;
+        let envelope = parse_value(&value)?;
+        (envelope.question == task).then_some(envelope)
+    })
+}
+
+fn parse_value(value: &serde_json::Value) -> Option<AttentionEnvelope> {
+    let outcome = value.get("outcome")?.as_str()?;
+    let kind = match outcome {
+        "needs_input" | "learning_recommended" => AttentionKind::Question,
+        "permission_required" => AttentionKind::Permission,
+        _ => return None,
+    };
+    let question = value
+        .get(if outcome == "learning_recommended" {
+            "learning_task"
+        } else {
+            "question"
         })
+        .or_else(|| value.get("question"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .unwrap_or(DEFAULT_QUESTION)
+        .to_string();
+    Some(AttentionEnvelope {
+        kind,
+        question,
+        context: string_field(value, "context"),
+        tool_name: string_field(value, "tool_name"),
+        tool_input: value.get("tool_input").map(ToString::to_string),
     })
 }
 
@@ -74,12 +103,61 @@ fn candidate_blocks(output: &str) -> Vec<String> {
     if !current.trim().is_empty() {
         blocks.push(current);
     }
-    if let (Some(start), Some(end)) = (output.find('{'), output.rfind('}')) {
-        if start < end {
-            blocks.push(output[start..=end].to_string());
+    for block in balanced_json_objects(output) {
+        if !blocks.iter().any(|existing| existing.trim() == block.trim()) {
+            blocks.push(block);
         }
     }
     blocks
+}
+
+/// Find complete JSON objects embedded in ordinary runtime prose.
+///
+/// Runtimes do not always preserve the fenced block from the contract when a
+/// turn is resumed. A first/last-brace slice is too broad when the prose also
+/// contains examples or several objects, so scan balanced objects while
+/// respecting JSON strings and escapes.
+fn balanced_json_objects(output: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    for (start, character) in output.char_indices() {
+        if character != '{' {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, character) in output[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match character {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let end = start + offset + character.len_utf8();
+                        let candidate = output[start..end].to_string();
+                        if serde_json::from_str::<serde_json::Value>(&candidate).is_ok()
+                            && !objects.iter().any(|object| object == &candidate)
+                        {
+                            objects.push(candidate);
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    objects
 }
 
 /// A short headline for the attention queue, derived from the question itself.
@@ -132,6 +210,27 @@ mod tests {
     }
 
     #[test]
+    fn a_learning_recommendation_becomes_a_question_for_attention() {
+        let output = "{\"outcome\":\"learning_recommended\",\"learning_task\":\"Investigate the missing shutdown evidence\",\"context\":\"The graph has no committed node for this case.\"}";
+        let envelope = parse_envelope(output).unwrap();
+        assert_eq!(envelope.kind, AttentionKind::Question);
+        assert_eq!(envelope.question, "Investigate the missing shutdown evidence");
+        assert_eq!(
+            envelope.context.as_deref(),
+            Some("The graph has no committed node for this case.")
+        );
+        assert_eq!(parse_learning_recommendation(output), Some(envelope));
+        assert!(parse_learning_recommendation(
+            r#"{"outcome":"needs_input","question":"Which source is authoritative?"}"#
+        )
+        .is_none());
+        assert!(parse_learning_recommendation(
+            r#"{"outcome":"learning_recommended","context":"missing task"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
     fn a_candidate_set_is_never_mistaken_for_a_question() {
         let output = "```json\n{\"candidates\":[{\"title\":\"Retry policy\",\
             \"question\":\"why?\"}]}\n```";
@@ -149,6 +248,17 @@ mod tests {
         let output = "I need a decision. {\"outcome\":\"needs_input\",\
             \"question\":\"Ship it?\"} Thanks.";
         assert_eq!(parse_envelope(output).unwrap().question, "Ship it?");
+    }
+
+    #[test]
+    fn an_embedded_envelope_survives_other_json_like_prose() {
+        let output = "The example {\"old\":true} is not authoritative. The resumed turn returned {\"outcome\":\"needs_input\",\"question\":\"Which source is approved?\",\"context\":\"The workspace is empty.\"} and stopped.";
+        let envelope = parse_envelope(output).unwrap();
+        assert_eq!(envelope.question, "Which source is approved?");
+        assert_eq!(
+            envelope.context.as_deref(),
+            Some("The workspace is empty.")
+        );
     }
 
     #[test]

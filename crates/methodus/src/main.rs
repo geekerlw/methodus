@@ -49,12 +49,9 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
-    /// Return a bounded context bundle for a goal.
-    Prepare {
-        #[arg(long)]
-        goal: String,
-        #[arg(long, default_value_t = 1200)]
-        budget: i64,
+    /// Return the graph environment and complete consumer-visible inventory.
+    #[command(alias = "environment")]
+    Manifest {
         #[arg(long, value_delimiter = ',')]
         scope: Vec<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
@@ -165,11 +162,9 @@ fn run_agent(command: AgentCommand) -> Result<(), Box<dyn std::error::Error + Se
     let store = Store::open_read_only(&db)?;
     let query = AgentQuery::new(&store, &home);
     match command {
-        AgentCommand::Prepare { goal, budget, scope, format } => {
-            if goal.trim().is_empty() { return Err("--goal cannot be empty".into()); }
-            if budget <= 0 { return Err("--budget must be positive".into()); }
-            let response = query.prepare(&goal, budget, &scope)?;
-            print_payload(&response, format, |value| render_prepare(value));
+        AgentCommand::Manifest { scope, format } => {
+            let manifest = query.manifest(&scope)?;
+            print_payload(&manifest, format, render_manifest);
         }
         AgentCommand::Search { query: text, node_type, kind, scope, limit, format } => {
             let result = query.search(&text, &node_type, &kind, &scope, limit)?;
@@ -212,11 +207,92 @@ where T: serde::Serialize, F: FnOnce(serde_json::Value) -> String {
     match format { OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".into())), OutputFormat::Markdown => println!("{}", markdown(json)), }
 }
 
-fn render_prepare(value: serde_json::Value) -> String {
-    let mut out = format!("# Methodus context\n\n- protocol: {}\n- goal: {}\n- index_revision: {}\n- estimated_tokens: {} / {}\n", scalar(&value["protocol_version"]), scalar(&value["goal"]), scalar(&value["index_revision"]), scalar(&value["estimated_tokens"]), scalar(&value["budget_tokens"]));
-    if let Some(items) = value["items"].as_array() { for item in items { out.push_str(&format!("\n## {} · {}\n\n{}\n\n_Why selected: {}_\n", scalar(&item["title"]), scalar(&item["facet"]), scalar(&item["content"]), scalar(&item["rationale"]))); if let Some(warnings) = item["warnings"].as_array() { for warning in warnings { out.push_str(&format!("\n⚠ {}\n", scalar(warning))); } } } }
-    if let Some(ids) = value["lazy_ids"].as_array() { if !ids.is_empty() { out.push_str("\n## Lazy references\n\n"); for id in ids { out.push_str(&format!("- {}\n", scalar(id))); } } }
-    if let Some(warnings) = value["warnings"].as_array() { if !warnings.is_empty() { out.push_str("\n## Warnings\n\n"); for warning in warnings { out.push_str(&format!("- {}\n", scalar(warning))); } } }
+fn render_manifest(value: serde_json::Value) -> String {
+    let mut out = format!(
+        "# Methodus graph environment\n\n- protocol: {}\n- command: {}\n- index_revision: {}\n- home: {}\n- selected_team: {}\n- visible_nodes: {}\n",
+        scalar(&value["protocol_version"]),
+        scalar(&value["command"]),
+        scalar(&value["index_revision"]),
+        scalar(&value["home"]),
+        scalar(&value["selected_team"]),
+        value["items"].as_array().map_or(0, Vec::len),
+    );
+    out.push_str("\n## Directory structure\n\n");
+    if let Some(directories) = value["directory_structure"].as_array() {
+        if directories.is_empty() {
+            out.push_str("- none\n");
+        } else {
+            for directory in directories {
+                let suffix = if directory["exists"].as_bool().unwrap_or(false) {
+                    ""
+                } else {
+                    " (missing)"
+                };
+                out.push_str(&format!(
+                    "- {}{}\n  {}\n",
+                    scalar(&directory["path"]),
+                    suffix,
+                    scalar(&directory["absolute_path"]),
+                ));
+            }
+        }
+    }
+    out.push_str("\n## Graph roots\n\n");
+    if let Some(roots) = value["graph_roots"].as_array() {
+        if roots.is_empty() {
+            out.push_str("- none\n");
+        } else {
+            for root in roots {
+                out.push_str(&format!("- {}\n", scalar(root)));
+            }
+        }
+    }
+    out.push_str("\n## Consumer-visible inventory\n\n");
+    if let Some(items) = value["items"].as_array() {
+        if items.is_empty() {
+            out.push_str("No committed or stale Knowledge, Method, or Experience nodes are indexed.\n");
+        } else {
+            for item in items {
+                out.push_str(&format!(
+                    "### {} · {}\n\n- id: {}\n- status: {}\n- visibility: {}\n- kind: {}\n- summary: {}\n- relative_path: {}\n- absolute_path: {}\n- facets: {}\n",
+                    scalar(&item["node_type"]),
+                    scalar(&item["title"]),
+                    scalar(&item["id"]),
+                    scalar(&item["status"]),
+                    scalar(&item["visibility"]),
+                    scalar(&item["kind"]),
+                    scalar(&item["summary"]),
+                    scalar(&item["path"]),
+                    scalar(&item["absolute_path"]),
+                    item["facets"]
+                        .as_array()
+                        .map(|facets| facets.iter().map(scalar).collect::<Vec<_>>().join(", "))
+                        .filter(|facets| !facets.is_empty())
+                        .unwrap_or_else(|| "none".into()),
+                ));
+                if let Some(tags) = item["tags"].as_array() {
+                    if !tags.is_empty() {
+                        out.push_str(&format!(
+                            "- tags: {}\n",
+                            tags.iter().map(scalar).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                }
+                out.push('\n');
+            }
+        }
+    }
+    if let Some(warnings) = value["warnings"].as_array() {
+        if !warnings.is_empty() {
+            out.push_str("## Warnings\n\n");
+            for warning in warnings {
+                out.push_str(&format!("- {}\n", scalar(warning)));
+            }
+        }
+    }
+    out.push_str(
+        "\n## Reading contract\n\n- This is an inventory, not a preselected answer. Choose relevant nodes using the user's question.\n- The selected Team and Personal/Team directory structure show where to inspect the authoritative files.\n- Read selected node bodies with `methodus agent get <id> --facet all` or inspect files under the listed graph roots.\n- Use `methodus agent related <id>` for authored graph relations.\n- Candidate, rejected, and deprecated nodes are not consumer-visible.\n- Label stale nodes and do not present them as unqualified current rules.\n",
+    );
     out
 }
 
@@ -299,7 +375,7 @@ fn connector_metadata_path(home: &std::path::Path, runtime: &str) -> std::path::
 fn write_connector_metadata(home: &std::path::Path, runtime: &str, target: &std::path::Path, state: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = connector_metadata_path(home, runtime);
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-    std::fs::write(path, format!("runtime: {runtime}\npath: {:?}\nversion: 1\nstate: {state}\nchecked_at: {:?}\n", target.display().to_string(), chrono::Utc::now().to_rfc3339()))?;
+    std::fs::write(path, format!("runtime: {runtime}\npath: {:?}\nversion: 2\nstate: {state}\nchecked_at: {:?}\n", target.display().to_string(), chrono::Utc::now().to_rfc3339()))?;
     Ok(())
 }
 
@@ -349,8 +425,8 @@ mod tests {
 
     #[test]
     fn agent_error_codes_are_stable() {
-        assert_eq!(error_exit_code(&methodus_core::CoreError::Other("--goal cannot be empty".into())), 2);
-        assert_eq!(error_exit_code(&methodus_core::CoreError::Other("--budget must be positive".into())), 2);
+        assert_eq!(error_exit_code(&methodus_core::CoreError::Other("--scope cannot be empty".into())), 2);
+        assert_eq!(error_exit_code(&methodus_core::CoreError::Other("--depth is limited to 1".into())), 2);
         assert_eq!(error_exit_code(&methodus_core::CoreError::Other("agent node not found: knowledge/missing".into())), 4);
         assert_eq!(error_exit_code(&methodus_core::CoreError::UnknownRuntime("other".into())), 5);
     }

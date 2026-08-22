@@ -167,8 +167,10 @@ fn query_hits(query: &str, value: &str) -> bool {
     value == query || value == format!("{query}/")
 }
 
-/// The launch repository is readable in place during Learn. Methodus does not
-/// maintain a project registry or copy source files into a task workspace.
+/// The launch repository is a source for resolving explicit `@` mentions and
+/// relative source references. Native runtimes themselves run from a workspace
+/// managed by Methodus; this function does not grant the launch repository by
+/// default.
 pub fn context_roots(home: &Path, launch_cwd: &Path) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     let mut seen: Vec<PathBuf> = Vec::new();

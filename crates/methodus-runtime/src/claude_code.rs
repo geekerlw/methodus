@@ -29,13 +29,23 @@ pub(crate) fn claude_args(input: &SpawnInput, resume: Option<&str>) -> Vec<Strin
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
+        // Claude only includes incremental assistant messages in stream-json
+        // when this flag is set. Without it, the TUI may appear idle until the
+        // final result arrives, and some CLI versions emit no usable answer
+        // event for a short turn.
+        "--include-partial-messages".to_string(),
     ];
     if let Some(sid) = resume {
         args.push("--resume".to_string());
         args.push(sid.to_string());
     } else {
         args.push("--session-id".to_string());
-        args.push(input.executor_session_id.clone().unwrap_or_else(|| input.session_id.clone()));
+        args.push(
+            input
+                .executor_session_id
+                .clone()
+                .unwrap_or_else(|| input.session_id.clone()),
+        );
     }
     args.push("--permission-mode".to_string());
     args.push(claude_permission_mode(&input.permission_mode).to_string());
@@ -109,7 +119,10 @@ async fn spawn_claude(
 
     let (tx, rx) = mpsc::channel(256);
     let fallback_sid = resume.map(str::to_owned).unwrap_or_else(|| {
-        input.executor_session_id.clone().unwrap_or_else(|| input.session_id.clone())
+        input
+            .executor_session_id
+            .clone()
+            .unwrap_or_else(|| input.session_id.clone())
     });
     // A fresh spawn receives an explicit UUID from Methodus. Keep it on the
     // handle immediately so a failed/empty first turn never falls back to the
@@ -120,13 +133,34 @@ async fn spawn_claude(
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut saw_result = false;
+        let mut emitted_partial_text = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
             }
             let events = parse_claude_event(&line, &fallback_sid);
+            let is_partial_stream = serde_json::from_str::<serde_json::Value>(&line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .map(|kind| kind == "stream_event")
+                })
+                .unwrap_or(false);
             for event in events {
+                if is_partial_stream && matches!(&event, RuntimeEvent::AssistantText { .. }) {
+                    emitted_partial_text = true;
+                } else if emitted_partial_text
+                    && matches!(&event, RuntimeEvent::AssistantText { .. })
+                {
+                    // With --include-partial-messages Claude emits both the
+                    // incremental text deltas and the completed assistant
+                    // message. The latter is the same answer in full, so do
+                    // not append it a second time in Methodus.
+                    continue;
+                }
                 if matches!(event, RuntimeEvent::Result { .. }) {
                     saw_result = true;
                 }
@@ -296,6 +330,8 @@ fn parse_claude_event(line: &str, fallback_session_id: &str) -> Vec<RuntimeEvent
 
         "assistant" => parse_assistant_content(&value),
 
+        "stream_event" => parse_stream_event(&value),
+
         "result" => {
             let is_error = value
                 .get("is_error")
@@ -338,6 +374,69 @@ fn parse_claude_event(line: &str, fallback_session_id: &str) -> Vec<RuntimeEvent
             }]
         }
 
+        _ => Vec::new(),
+    }
+}
+
+/// Parse Claude's optional raw API stream events. Claude Code emits these when
+/// `--include-partial-messages` is combined with `--output-format stream-json`.
+fn parse_stream_event(value: &serde_json::Value) -> Vec<RuntimeEvent> {
+    let Some(event) = value.get("event") else {
+        return Vec::new();
+    };
+    match event.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "content_block_delta" => {
+            let Some(delta) = event.get("delta") else {
+                return Vec::new();
+            };
+            match delta.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "text_delta" => delta
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .filter(|text| !text.is_empty())
+                    .map(|text| {
+                        vec![RuntimeEvent::AssistantText {
+                            text: text.to_owned(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                "thinking_delta" => delta
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .filter(|text| !text.is_empty())
+                    .map(|text| {
+                        vec![RuntimeEvent::Thinking {
+                            text: text.to_owned(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+        "content_block_start" => {
+            let Some(block) = event.get("content_block") else {
+                return Vec::new();
+            };
+            if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                return Vec::new();
+            }
+            vec![RuntimeEvent::ToolCallStarted {
+                id: block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                name: block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                input: block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }]
+        }
         _ => Vec::new(),
     }
 }
@@ -489,6 +588,7 @@ mod tests {
         let mut input = sample_input();
         input.extra_dirs = vec!["/tmp/proj".into()];
         let args = claude_args(&input, None);
+        assert!(args.contains(&"--include-partial-messages".to_string()));
         assert!(args.contains(&"--add-dir".to_string()));
         assert!(args.contains(&"/tmp/proj".to_string()));
         assert!(args.iter().any(|a| a == "--"));
@@ -503,11 +603,7 @@ mod tests {
         let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","session_id":"sid","errors":["No conversation found with session ID: sid"],"permission_denials":[]}"#;
         let events = parse_claude_event(line, "fallback");
         match &events[0] {
-            RuntimeEvent::Result {
-                is_error,
-                text,
-                ..
-            } => {
+            RuntimeEvent::Result { is_error, text, .. } => {
                 assert!(*is_error);
                 assert!(text.contains("No conversation found"));
             }
@@ -548,6 +644,14 @@ mod tests {
             RuntimeEvent::AssistantText { text } => assert_eq!(text, "Four"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_partial_stream_text_delta() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}"#;
+        let events = parse_claude_event(line, "s1");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], RuntimeEvent::AssistantText { text } if text == "Hello"));
     }
 
     #[test]

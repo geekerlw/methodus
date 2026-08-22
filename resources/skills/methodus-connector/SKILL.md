@@ -1,8 +1,8 @@
 ---
 name: methodus
-version: 1
+version: 2
 x-methodus-managed: true
-description: Use the local Methodus engineering memory for substantial diagnosis, design, research, document, and presentation work. Retrieve reviewed Methods, Knowledge, and Experience with the read-only methodus agent CLI; skip it for trivial mechanical edits.
+description: Use the local Methodus engineering memory for substantial diagnosis, design, research, document, and presentation work. Inspect the reviewed graph through its read-only environment manifest; skip it for trivial mechanical edits.
 ---
 
 # Methodus connector
@@ -13,10 +13,18 @@ and it does not contain the project source itself.
 For substantial work involving diagnosis, incident investigation, design decisions,
 code behavior/history, competitive research, formal documents, or presentations:
 
-1. Call `methodus agent prepare --goal "<the user's current goal>" --budget 1200`.
-2. Use the returned Method and Execute/Decide facets as working context.
-3. Call `methodus agent search`, `get`, or `related` only when the returned lazy IDs
-   or evidence require more detail.
+1. Call `methodus agent manifest --format json` (the `environment` alias is also
+   supported). This returns the selected Team, Personal/Team directory structure, graph
+   roots, revision, and complete consumer-visible inventory. It is an environment
+   contract, not an answer or a preselected context bundle.
+2. Use the user's question and the inventory's titles, summaries, tags, facets, and
+   evidence references to decide which nodes are relevant. Methodus does not make that
+   semantic selection for you.
+3. Read the selected node bodies with
+   `methodus agent get <node-id> --facet all --format markdown`. Use
+   `methodus agent related <node-id>` to follow authored graph relationships. The
+   absolute paths, directory structure, and graph roots in the manifest may be inspected
+   directly when the runtime's read tools permit it.
 4. Treat `stale` items as historical hypotheses. Revalidate them against the current
    repository before presenting them as current rules.
 5. Cite Methodus node IDs and source references when they materially affect the answer.
@@ -27,4 +35,5 @@ the task normally and say that Methodus context was unavailable only when releva
 
 This connector is read-only. Do not create, edit, promote, or publish Methodus content
 from an Agent session. Maintainers use the Methodus TUI Learn and Review surfaces for
-all writes.
+all writes. `search` remains available as an explicit lexical fallback, but must not
+replace the manifest-first flow or be treated as a complete answer context.

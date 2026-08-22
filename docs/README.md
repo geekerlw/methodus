@@ -34,9 +34,10 @@ adds the other half — the scheduled work Methodus does when nobody is watching
    surface stays possible. Agent runtimes use a stable, non-interactive, read-only CLI.
 3. **One official connector Skill.** Methodus does not manage a general Skill library.
    Its shipped connector only teaches a runtime when and how to call the CLI.
-4. **No MCP and no ordinary task workspace.** Agent knowledge is retrieved on demand;
-   files are not copied into per-task directories and Methodus does not take over
-   normal coding sessions.
+4. **No MCP and no ordinary coding-task workspace.** Agent knowledge is exposed
+   through a manifest and read on demand; files are not copied into project/task
+   directories and Methodus does not take over normal coding sessions. Its own Use
+   and Learn handoffs use managed operational workspaces under Methodus home.
 5. **Curated engineering memory, not generic RAG.** Code, Git, docs, PRs, and logs are
    evidence used during Learn. Only reviewed conclusions are published.
 6. **Markdown + Git remain open.** Team repositories can be edited and reviewed with

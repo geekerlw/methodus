@@ -10,17 +10,20 @@ Methodus owns learning, curation, graph navigation, review, and Personal → Tea
 publication. It is not another coding agent and is not the place where an ordinary
 developer's task is executed.
 
-The main TUI view is intentionally an agent-like Learn conversation. Slash commands
-switch to Knowledge, Method, Experience, Review, Graph, Team, Health, Help, and runtime
-settings. A maintainer can do the full knowledge workflow without memorizing a long
-CLI command list.
+The main TUI view is an agent-like Use conversation: ordinary questions prepare a
+reviewed-graph environment and a Methodus-managed workspace, then hand the terminal to the selected native
+Runtime for answers or recommendations. `/learn` is the explicit deliberate-learning
+command. Slash commands also switch to Knowledge, Method,
+Experience, Review, Graph, Team, Health, Help, and runtime settings. A maintainer can do
+the full knowledge workflow without memorizing a long CLI command list.
 
 ## D2 — Native runtimes remain native
 
 Claude Code, Codex, Cursor, or another runtime owns ordinary task interaction, tools,
 permissions, terminal rendering, and its own session lifecycle. Methodus does not
-create a per-task workspace, copy knowledge into a project, proxy a runtime TUI, or
-manage ordinary coding sessions.
+create an ordinary coding-task workspace, copy knowledge into a project, proxy a
+runtime TUI, or manage ordinary coding sessions. It may create managed workspaces for
+its own Use and focused Learn handoffs.
 
 Methodus may start a focused Learn run because that run is a maintainer operation. It
 hands the terminal to the native runtime rather than proxying it, and restores the TUI
@@ -34,10 +37,11 @@ The first integration is one official connector Skill per supported runtime form
 The Skill calls a local, read-only `methodus agent` CLI. There is no MCP server in the
 default product.
 
-The connector contains instructions, not a copy of the graph. It can prepare/search/
+The connector contains instructions, not a copy of the graph. It can manifest/search/
 get/relate/status, but cannot create, edit, approve, promote, deprecate, or publish
-content. If Methodus is unavailable, the runtime continues the user task without
-inventing context.
+content. The manifest is an environment contract; the native runtime chooses relevant
+nodes and reads them explicitly. If Methodus is unavailable, the runtime continues the
+user task without inventing context.
 
 Methodus does not manage arbitrary runtime Skills. A Skill observed during a task may
 be recorded as evidence in an Experience, so a maintainer can later make a cautious
@@ -111,13 +115,14 @@ and connector updates are ownership-aware and must never overwrite an unrelated 
 Skill. All destructive Review actions require a concrete target, rationale, and visible
 confirmation.
 
-## D9 — Performance is bounded before it is clever
+## D9 — The Runtime chooses context; Methodus exposes evidence safely
 
-Agent retrieval is deterministic for a fixed index revision, bounded by item count and
-estimated tokens, and limited to one-hop relation expansion in protocol v1. Graph
-visualization is a focused neighborhood, not a full force-directed rendering. Embeddings
-or background services are considered only after real engineering-query evaluation
-shows that lexical/tag/scope retrieval is insufficient.
+The Connector receives a complete consumer-visible manifest for a fixed index revision,
+then the native Runtime chooses relevant nodes and reads their bodies explicitly. Node
+reads and relation expansion remain bounded, with one-hop relations in protocol v1;
+graph visualization is a focused neighborhood, not a full force-directed rendering.
+Embeddings or background services are considered only after real engineering-query
+evaluation shows that manifest-first native reasoning is insufficient.
 
 ## D10 — One maintainer surface, and it is the terminal
 
@@ -127,8 +132,9 @@ budgets, the attention queue, and OS notifications — lives in the TUI instead.
 The desktop app was justified by three capabilities the TUI was assumed to lack:
 scheduling, notification, and a place to review knowledge calmly. None of the three
 turned out to require a window. A TUI holding a Tokio runtime schedules work between
-frames; `osascript` and `notify-send` reach the same notification centre; review was
-already a TUI panel.
+frames; terminal-native notifications keep Ghostty notifications attached to the
+current surface (with `osascript` and `notify-send` as platform fallbacks); review
+was already a TUI panel.
 
 What the desktop app could not do is the thing the product depends on most. Answering a
 blocked runtime means resuming its session, and a native runtime needs a real TTY. The

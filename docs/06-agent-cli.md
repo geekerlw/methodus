@@ -1,7 +1,8 @@
 # 06 — Agent CLI and connector protocol
 
 `methodus agent` is a machine-facing, read-only protocol used by the official connector
-Skill. It is not the maintainer workflow.
+Skill. It is not the maintainer workflow and it does not answer the user's question on
+behalf of the native runtime.
 
 ## 1. Contract
 
@@ -11,24 +12,32 @@ Skill. It is not the maintainer workflow.
 - stable exit codes and schema version;
 - no graph, repository, configuration, feedback, or index mutation;
 - no network or LLM calls;
-- deterministic results for a fixed index and arguments;
-- bounded nodes and estimated tokens.
+- the manifest is a complete inventory of consumer-visible nodes for the requested
+  scope; it does not perform question-based context selection;
+- node bodies are read explicitly with `get`, so the native runtime decides what is
+  relevant and how much evidence it needs.
 
 The maintainer TUI (or an explicit `methodus doctor`) refreshes the SQLite projection.
-An agent invocation only reads the last validated projection, so a connector cannot
+An Agent invocation only reads the last validated projection, so a connector cannot
 silently rewrite the graph while a developer is working.
 
 ## 2. Commands
 
-### `prepare`
+### `manifest`
 
 ```text
-methodus agent prepare --goal <text> [--budget <tokens>]
-                       [--scope personal,team] [--format markdown|json]
+methodus agent manifest [--scope personal,team] [--format markdown|json]
 ```
 
-Returns the best entry Method, selected Knowledge facets, reusable Experience lessons,
-selection rationale, status/source warnings, and lazy node IDs.
+The `environment` alias is accepted for callers that prefer that name. The response
+contains the graph snapshot revision, Methodus home, selected Team, Personal/Team
+directory structure, graph roots, and every consumer-visible committed or stale
+Knowledge, Method, and Experience node. Each item contains its stable ID, summary,
+tags, facets, evidence references, relative path, and absolute path. Candidate,
+rejected, and deprecated nodes are not listed.
+
+This is the only first step for the connector. It is an environment/inventory contract,
+not a preselected answer bundle.
 
 ### `search`
 
@@ -38,18 +47,20 @@ methodus agent search --query <text> [--type knowledge,method,experience]
                       [--limit <n>] [--format markdown|json]
 ```
 
-Returns metadata and match rationale, not full bodies.
+Returns bounded metadata and lexical match rationale. It is an explicit fallback
+locator, not the connector's default context-selection mechanism and not full-body
+evidence.
 
 ### `get`
 
 ```text
 methodus agent get <node-id> [--facet learn|decide|execute|evidence|all]
-                 [--format markdown|json]
+                 [--history] [--format markdown|json]
 ```
 
-Returns one canonical node. Candidate and rejected nodes are never accessible through
-this interface. Deprecated nodes require an explicit history flag; stale nodes always
-include a warning.
+Returns one canonical node body. Candidate and rejected nodes are never accessible
+through this interface. Deprecated nodes require an explicit history flag; stale nodes
+always include a warning.
 
 ### `related`
 
@@ -58,8 +69,7 @@ methodus agent related <node-id> [--relation <type>] [--depth 1]
                      [--limit <n>] [--format markdown|json]
 ```
 
-Depth is one in v1. This prevents accidental graph explosions and unpredictable token
-use.
+Depth is one in v1. This prevents accidental graph explosions and unpredictable output.
 
 ### `status`
 
@@ -69,75 +79,93 @@ methodus agent status [--format markdown|json]
 
 Reports protocol version, a stable index revision for the current projection, the
 selected Team ID, Personal/Team root availability, and stale/error counts. The
-revision must be derived from indexed content (not query time), so a runtime can tell
-whether two responses came from the same graph snapshot.
-It does not expose credentials or maintainer transcripts.
+revision is derived from indexed content rather than query time, so a runtime can tell
+whether two responses came from the same graph snapshot. It does not expose credentials
+or maintainer transcripts.
 
-## 3. Markdown response
+## 3. Manifest response
 
-Example `prepare` response:
+Example Markdown:
 
 ```markdown
-# Methodus context
+# Methodus graph environment
 
 - protocol: 1
+- command: manifest
 - index_revision: sha256:<content-derived revision>
-- goal: Diagnose abnormal device shutdown
-- estimated_tokens: 910 / 1200
+- home: /Users/example/.methodus
+- selected_team: default
+- visible_nodes: 2
 
-## Method
+## Directory structure
 
-### method/abnormal-shutdown-triage · Execute
-Why selected: exact diagnostic intent and device/power scope.
+- personal/knowledge
+  /Users/example/.methodus/personal/knowledge
+- personal/methods
+  /Users/example/.methodus/personal/methods
+- teams/default/knowledge
+  /Users/example/.methodus/teams/default/knowledge
+- teams/default/methods
+  /Users/example/.methodus/teams/default/methods
+- teams/default/experiences (missing)
+  /Users/example/.methodus/teams/default/experiences
 
-1. Read the previous shutdown reason.
-2. Inspect the final pre-shutdown window for crash/watchdog evidence.
-3. Branch by controlled shutdown, crash, watchdog, or abrupt power loss.
+## Graph roots
 
-## Knowledge
+- /Users/example/.methodus/personal/knowledge
+- /Users/example/.methodus/personal/methods
 
-### knowledge/previous-shutdown-reason · Execute
-...
+## Consumer-visible inventory
 
-## Experience lessons
+### method · Shutdown triage
 
-### experience/device-x-power-loss
-Missing persisted shutdown reason can itself indicate power loss before persistence.
-
-## Lazy references
-
-- knowledge/pre-shutdown-crash-detection
-
-## Warnings
-
-- knowledge/previous-shutdown-reason is stale: referenced source changed after a82c31f.
+- id: method/shutdown-triage
+- status: committed
+- visibility: personal
+- kind: diagnosis
+- summary: A repeatable shutdown investigation.
+- relative_path: personal/methods/shutdown-triage.md
+- absolute_path: /Users/example/.methodus/personal/methods/shutdown-triage.md
+- facets: Decide, Execute
 ```
 
-## 4. JSON envelope
+The JSON form has the same fields:
 
 ```json
 {
   "protocol_version": 1,
-  "command": "prepare",
-  "goal": "Diagnose abnormal device shutdown",
-  "index_revision": "...",
-  "estimated_tokens": 910,
-  "budget_tokens": 1200,
-  "items": [
+  "command": "manifest",
+  "index_revision": "sha256:<content-derived revision>",
+  "home": "/Users/example/.methodus",
+  "selected_team": "default",
+  "directory_structure": [
     {
-      "id": "method/abnormal-shutdown-triage",
-      "node_type": "method",
-      "facet": "execute",
-      "status": "committed",
-      "visibility": "team",
-      "rationale": "...",
-      "content": "...",
-      "path": "teams/default/knowledge/previous-shutdown-reason.md",
-      "content_hash": "...",
-      "warnings": []
+      "path": "personal/knowledge",
+      "absolute_path": "/Users/example/.methodus/personal/knowledge",
+      "exists": true
+    },
+    {
+      "path": "teams/default/knowledge",
+      "absolute_path": "/Users/example/.methodus/teams/default/knowledge",
+      "exists": true
     }
   ],
-  "lazy_ids": [],
+  "graph_roots": ["/Users/example/.methodus/personal/methods"],
+  "items": [
+    {
+      "id": "method/shutdown-triage",
+      "node_type": "method",
+      "title": "Shutdown triage",
+      "status": "committed",
+      "visibility": "personal",
+      "summary": "A repeatable shutdown investigation.",
+      "path": "personal/methods/shutdown-triage.md",
+      "absolute_path": "/Users/example/.methodus/personal/methods/shutdown-triage.md",
+      "facets": ["Decide", "Execute"],
+      "tags": [],
+      "sources": []
+    }
+  ],
   "warnings": []
 }
 ```
@@ -146,28 +174,29 @@ Fields may be added compatibly within a protocol version; removing or changing f
 meaning requires a version increment. Connector Skills declare the protocol range they
 support.
 
-The connector must treat `protocol_version`, `index_revision`, lifecycle status, and
-warnings as data, not prose decoration. It may quote a node only together with its ID
-and source path/hash when those fields are available.
+## 4. Runtime reading protocol
 
-## 5. Selection policy
+The connector follows this sequence:
 
-- default budget: 1,200 estimated tokens;
-- hard item count and per-item content caps;
-- Method before supporting Knowledge, then compact Experience lessons;
-- `Execute` and `Decide` preferred for action tasks;
-- Personal and Team are both eligible unless scope is restricted;
-- committed outranks stale;
-- stale is included only when strongly relevant or explicitly requested;
-- deprecated is history-only;
-- candidate/rejected is excluded;
-- graph expansion follows a bounded allowlist of relation types.
+```text
+manifest
+  → native runtime semantically compares the inventory, selected Team, and directory structure with the user's question
+  → get selected nodes with the needed facets
+  → related for authored graph neighbors when useful
+  → revalidate stale claims against the current repository
+  → answer with facts, inferences, recommendations, and unknowns separated
+```
 
-## 6. Exit codes
+Methodus does not rank or preselect the answer context. The runtime must cite node IDs
+and source references when a claim materially relies on Methodus. If no relevant
+committed evidence is found, it must say so rather than inventing a Methodus-backed
+answer.
+
+## 5. Exit codes
 
 | Code | Meaning |
 |---:|---|
-| 0 | success, including a valid empty result |
+| 0 | success, including a valid empty manifest |
 | 2 | invalid arguments |
 | 3 | Methodus home/index unavailable |
 | 4 | requested node unavailable or not consumer-visible |
@@ -177,9 +206,9 @@ and source path/hash when those fields are available.
 The connector should continue the user's task without Methodus for codes 3–6 and may
 surface a concise note. It must never invent a successful Methodus response.
 
-## 7. Connector triggering
+## 6. Connector triggering
 
-The Skill should call `prepare` for substantial:
+The Skill should call `manifest` for substantial:
 
 - diagnosis and incident investigation;
 - architecture/design decisions;

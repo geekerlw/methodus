@@ -38,10 +38,15 @@ change triggers re-indexing.
 │       ├── assistant.md         # last synthesized runtime response
 │       ├── sources.yaml         # attached source locators and fingerprints
 │       └── publish-plan.md      # only for publish_<id> runs
+├── workspaces/
+│   ├── learn/<run-id>/           # native Learn runtime cwd
+│   └── use/<session-id>/         # native Use runtime cwd
 └── connectors/                 # connector ownership/version metadata
 ```
 
-There is no ordinary task workspace and no graph materialization into agent projects.
+There is no ordinary coding-task workspace and no graph materialization into agent
+projects. Methodus does create managed runtime workspaces for its own Learn and Use
+handoffs; these are operational locations, not project copies.
 The runtime keeps the live conversation in the TUI and writes the event stream,
 synthesized response, source manifest, and candidate files when a CandidateSet is
 detected. These are operational records and must never become Agent-visible graph
@@ -104,7 +109,7 @@ What was inspected, what remains inferred, contradictions, and open questions.
 ```
 
 Facet headings are optional when irrelevant, but `Execute` is required for procedural
-Knowledge that should be returned by `prepare`.
+Knowledge that should be usable by a consuming Runtime.
 
 ## 5. Method nodes
 
@@ -222,12 +227,20 @@ A Learn run proposes a set rather than one mandatory document:
 
 ```json
 {
+  "graph_review": {
+    "searched": true,
+    "relevant_nodes": [{"id": "knowledge/existing", "reason": "same boundary"}],
+    "no_match_reason": null
+  },
   "candidates": [
     {
       "type": "method",
       "kind": "diagnostic-workflow",
       "title": "Abnormal shutdown triage",
       "summary": "Separate controlled exit, crash, watchdog, and power loss.",
+      "disposition": "new",
+      "target": null,
+      "patch": null,
       "learn": "...",
       "decide": "...",
       "execute": "...",
@@ -239,6 +252,9 @@ A Learn run proposes a set rather than one mandatory document:
       "kind": "diagnostic-signal",
       "title": "Previous shutdown reason",
       "summary": "Read the persisted reason before inspecting the final log window.",
+      "disposition": "revise",
+      "target": "knowledge/previous-shutdown-reason",
+      "patch": "Update the Execute facet to read the persisted reason before the final log window.",
       "learn": "...",
       "execute": "...",
       "evidence": "...",

@@ -1,11 +1,14 @@
 # 01 — Runtime integration
 
-Methodus integrates with agent runtimes in two deliberately separate ways:
+Methodus integrates with agent runtimes in three deliberately separate ways:
 
-1. a **native Learn handoff** used only from the maintainer TUI;
-2. an **official connector Skill** used by ordinary agents to call the read-only CLI.
+1. a **native Use handoff** used from the maintainer TUI for graph-backed questions;
+2. a **native Learn handoff** used from the maintainer TUI for deliberate research;
+3. an **official connector Skill** used by ordinary agents to call the read-only CLI.
 
-It does not launch or supervise ordinary coding sessions.
+It does not launch or supervise ordinary coding sessions. Use and Learn both leave the
+Methodus alternate screen and restore it after the native runtime exits; only Learn has
+a durable run and return-artifact import.
 
 ## 1. Native Learn handoff
 
@@ -38,7 +41,7 @@ pub trait RuntimeAdapter: Send + Sync {
 }
 ```
 
-`SpawnInput` carries the Learn prompt, launch directory, the Methodus run ID
+`SpawnInput` carries the Learn prompt, Methodus-managed runtime workspace, the Methodus run ID
 (`session_id`), and an optional executor-side ID (`executor_session_id`) for a fresh
 runtime session, followed by the maintainer-selected permission mode, allowed tools,
 sandbox, and extra source directories. The two IDs are intentionally separate:
@@ -58,19 +61,24 @@ Claude receives a UUID distinct from the Methodus `learn_*` record key; a later 
 handoff can use that UUID to resume its native conversation. If an old stored Claude
 ID is invalid, Methodus begins a fresh native conversation while retaining the same
 Learn run and evidence record. Other runtimes may begin a fresh native conversation
-with the same run context when no durable runtime ID is available.
+with the same run context when no durable runtime ID is available. The workspace is
+created under Methodus home at `workspaces/learn/<run-id>/`; the launch repository is
+used only to resolve explicit `@` or registered source paths and is not the runtime's
+working directory.
 
 ## 2. Learning protocol
 
 Every native Learn handoff receives the same runtime-independent protocol:
 
-1. restate the goal and scope;
-2. inspect relevant committed graph nodes;
-3. identify assumptions and missing evidence;
-4. ask the maintainer only consequential questions;
-5. investigate attached sources and seek counterexamples;
-6. separate fact, inference, contradiction, and unknown;
-7. propose a typed candidate set, never canonical writes.
+1. read `METHODUS_LEARN.md` and its graph inventory;
+2. restate the goal and scope;
+3. inspect relevant committed or stale graph nodes;
+4. identify assumptions and missing evidence;
+5. ask the maintainer only consequential questions;
+6. investigate attached sources and seek counterexamples;
+7. separate fact, inference, contradiction, and unknown;
+8. classify each candidate as new or an explicit revision/merge/revalidation/
+   supersession proposal, never a canonical write.
 
 The protocol is versioned with Methodus. At finalization, the runtime writes the
 complete synthesis and fenced CandidateSet JSON to the exact per-turn artifact path
@@ -84,10 +92,12 @@ the only Skill that Methodus installs or updates.
 
 The connector contains no Team or Personal knowledge. It teaches the agent to:
 
-- call `methodus agent prepare` before substantial diagnosis, design, research,
+- call `methodus agent manifest` before substantial diagnosis, design, research,
   document, or presentation work;
-- skip Methodus for trivial questions and mechanical edits;
-- call `search`, `get`, or `related` only when the prepared bundle is insufficient;
+- treat the manifest as an environment/inventory contract, not a preselected answer;
+- select relevant nodes using the user's question, then call `get --facet all` and
+  `related` to inspect their bodies and authored neighbors;
+- use `search` only as an explicit lexical fallback, never as the complete context;
 - treat `stale` content as a hypothesis that must be revalidated;
 - cite node IDs and evidence when relying on Methodus;
 - continue normally when Methodus is unavailable;
@@ -140,7 +150,7 @@ common denominator.
   explicitly switch runtimes.
 - If the connector cannot find `methodus`, it should tell the agent to continue
   without Methodus rather than block the task.
-- If CLI output is invalid or over budget, the connector treats it as unavailable and
-  must not invent Methodus claims.
+- If CLI output is invalid or a requested node cannot be read, the connector treats
+  Methodus as unavailable and must not invent Methodus claims.
 - Connector compatibility is checked with golden invocation tests, not assumed from
   prose alone.

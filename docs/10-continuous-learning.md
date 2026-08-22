@@ -136,7 +136,7 @@ until their adapter can supply one; this is a known gap, not a design choice.
 | `LearningGoal` | Long-lived human intent and policy |
 | `GoalRun` | The link binding one Learn run to its Goal and work kind |
 | `GoalUsage` | Month-to-date spend for one Goal |
-| `HumanAttention` | A question or permission request blocking a run |
+| `HumanAttention` | A question, permission request, or runtime learning recommendation needing maintainer action |
 | CandidateSet | Review-only output of a completed turn |
 
 A turn ends in exactly one of three dispositions:
@@ -178,8 +178,14 @@ against one executor session.
 ## 6. Attention and notification
 
 The attention queue is the maintainer's inbox, and it is deliberately small: it holds
-only things that block progress. Candidates ready for review are not attention; they
-are Review.
+only things that need a maintainer decision or follow-up. Candidates ready for review
+are not attention; they are Review.
+
+The native Use surface also uses this queue for an evidence gap. Its contract requires
+the Runtime to return one concrete `learning_recommended` task instead of guessing.
+Methodus records it as attention with the Use session as its run ID. Accepting the
+item creates a fresh Learn Goal with the normal defaults; it never turns an unreviewed
+Use answer directly into canonical knowledge.
 
 OS notifications are reserved for what a person must act on:
 
@@ -191,6 +197,11 @@ OS notifications are reserved for what a person must act on:
 | A Goal hit its budget | normal, silent |
 | Sources went stale | low |
 | A turn finished with nothing new | none — the status bar suffices |
+
+When the TUI is running in Ghostty, Methodus emits the terminal's OSC 9 desktop
+notification sequence. Ghostty remains the notification owner, so selecting the
+notification returns to the terminal surface that raised it instead of opening a
+Script Editor notification. Other terminals use the platform notification fallback.
 
 Notifying about ordinary progress trains people to ignore notifications, which costs
 more than the missed information is worth.

@@ -37,6 +37,10 @@ pub(crate) fn codex_args(input: &SpawnInput, resume: Option<&str>) -> Vec<String
         args.push("-C".to_string());
         args.push(input.cwd.to_string_lossy().into_owned());
     }
+    for dir in &input.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
     args.push(input.prompt.clone());
     args
 }
@@ -295,6 +299,15 @@ mod tests {
         assert!(args.contains(&"019fthread".to_string()));
         assert!(args.contains(&"--sandbox".to_string()));
         assert!(args.contains(&"workspace-write".to_string()));
+    }
+
+    #[test]
+    fn spawn_args_include_extra_read_roots() {
+        let mut input = sample_input();
+        input.extra_dirs.push(PathBuf::from("/tmp/methodus/knowledge"));
+        let args = codex_args(&input, None);
+        assert!(args.contains(&"--add-dir".to_string()));
+        assert!(args.contains(&"/tmp/methodus/knowledge".to_string()));
     }
 
     #[test]

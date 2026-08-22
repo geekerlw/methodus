@@ -25,7 +25,7 @@ The repository already has a usable vertical slice:
 - Learn runs persist state, events, executor IDs, unresolved questions, contradictions,
   and review-only CandidateSet drafts so a TUI restart can resume a run;
 - Review supports edit, deprecate, stale revalidation, and a review audit trail;
-- `methodus agent prepare/search/get/related/status` is read-only and bounded;
+- `methodus agent manifest/search/get/related/status` is read-only;
 - `methodus setup` installs the one official connector Skill; `doctor` reports local
   health.
 
@@ -56,14 +56,15 @@ compatibility; new behavior uses the Markdown graph.
 
 **Status: complete for protocol v1; evaluation remains.**
 
-Completed: `prepare`, `search`, `get`, `related`, and `status`; Markdown/JSON output;
-type/kind/scope filters; token and item bounds; candidate/rejected exclusion; stale
-warnings; read-only SQLite opening.
+Completed: `manifest`, `search`, `get`, `related`, and `status`; Markdown/JSON output;
+type/kind/scope filters; complete consumer-visible inventory; candidate/rejected
+exclusion; stale warnings; read-only SQLite opening.
 
 Remaining evaluation work is deliberately product validation rather than a new
 architecture: add golden fixtures for diagnosis, design decision, change history,
-research, document, and presentation goals; measure deterministic scoring and index
-revision; and verify connector fallback when the home/index is unavailable.
+research, document, and presentation goals; verify that native runtimes make good
+semantic selections from the manifest; and verify connector fallback when the
+home/index is unavailable.
 
 ## M3 — Official connector Skill
 
@@ -125,20 +126,20 @@ Next:
 
 **Status: planned.**
 
-- evaluate retrieval precision, stale warnings, token bounds, and fallback behavior
-  on a real engineering-query corpus;
+- evaluate manifest usability, semantic node selection, stale warnings, and fallback
+  behavior on a real engineering-query corpus;
 - improve large-graph navigation with bounded neighborhood queries and lazy details;
 - add accessibility, CJK/IME, filtering, and error-state regression fixtures;
 - add performance budgets for graph sync and Agent CLI startup;
-- only consider embeddings after deterministic retrieval has been measured and shown
+- only consider embeddings if manifest-first native reasoning is measured and shown
   insufficient.
 
 ## Non-goals / permanent constraints
 
 - no MCP server in the default architecture;
 - no ordinary task workspace or repository copy managed by Methodus;
-- no runtime handoff or proxying of ordinary coding sessions; focused Learn hands the
-  terminal to the selected native runtime and never proxies its UI;
+- no runtime handoff or proxying of ordinary coding sessions; Use and focused Learn
+  hand the terminal to the selected native runtime and never proxy its UI;
 - no monitoring of ordinary developer transcripts;
 - no automatic graph writes from consumer Agents;
 - no arbitrary Skill install, generated Skill, marketplace, or Skill evolution;

@@ -9,7 +9,7 @@ Knowledge from trajectories.
 | Dimension | Learn | Refinement |
 |---|---|---|
 | Trigger | Maintainer starts a learning goal | Existing node is stale, contradicted, duplicated, or inadequate |
-| Input | Selected sources, existing graph context, maintainer answers | Existing node, evidence delta, related Experience |
+| Input | Selected sources, `METHODUS_LEARN.md` existing graph context, maintainer answers | Existing node, evidence delta, related Experience |
 | Runtime role | Investigate, challenge, synthesize candidates | Propose the smallest evidence-backed change |
 | Output | CandidateSet: zero or more Knowledge/Method/Experience + relations | Diff or replacement candidate against explicit target |
 | Canonical write | Never automatic | Never automatic |
@@ -20,7 +20,7 @@ Knowledge from trajectories.
 ```text
 Goal
   → Scope challenge
-  → Existing-knowledge inspection
+  → Runtime reads `METHODUS_LEARN.md` and inspects existing nodes
   → Evidence plan
   → Investigation
   → Counterexample/adversarial verification
@@ -107,6 +107,12 @@ Refinement proposes the smallest useful change:
 
 Refinement is an explicit maintainer action. A stale source can trigger a suggestion,
 but it never causes an automatic rewrite or promotion.
+
+For a candidate-to-Knowledge merge, Review resolves conflicts at facet level. The
+maintainer compares the candidate and target `Learn`, `Decide`, `Execute`, and
+`Evidence` sections, explicitly accepts zero or more candidate facets, and confirms
+the resulting patch. Unselected target sections and frontmatter are preserved; the
+candidate proposal is never appended wholesale.
 
 It must not silently rewrite a node, overwrite a Team file, install a Skill, or infer
 success merely because an agent produced an answer.

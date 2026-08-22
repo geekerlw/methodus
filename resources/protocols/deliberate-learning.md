@@ -16,11 +16,26 @@ task workspace.
 - Before ending, return a structured CandidateSet in the assistant response. Do not
   write a return file or claim that Methodus has committed anything.
 
+## Existing knowledge and integration
+
+Before investigating external sources, read the Methodus-managed
+`METHODUS_LEARN.md` snapshot in the runtime workspace. Search its inventory,
+then read the complete Markdown body of every relevant committed or stale
+Knowledge, Method, or Experience node from the listed graph directories.
+Compare new evidence with those nodes before proposing a result. The runtime,
+not Methodus's Rust layer, decides whether a conclusion is new, a revision,
+duplicate, stale rule, or contradiction.
+
+Every candidate must declare `disposition` as `new`, `revise`, `merge`,
+`revalidate`, or `supersede`. Non-`new` candidates must include the exact
+canonical `target` node ID and a facet-level `patch`. The runtime must never
+edit graph files; these are proposals for human Review only.
+
 When candidates are ready, include this machine-readable block (the surrounding
 explanation may remain human-readable). The block is a proposal, never a commit:
 
 ```json
-{"candidates":[{"type":"knowledge","kind":"procedure","title":"...","summary":"...","learn":"...","decide":"...","execute":"...","evidence":"...","outcome":"...","occurred_at":"...","tags":["..."]}],"relations":[{"from":"candidate-0","relation":"derived_from","to":"knowledge/existing-node"}],"unresolved_questions":[],"contradictions":[],"runtime_skills":[{"name":"...","runtime":"claude-code","outcome":"useful","reason":"..."}]}
+{"graph_review":{"searched":true,"relevant_nodes":[{"id":"knowledge/existing-node","reason":"same operational boundary"}],"no_match_reason":null},"candidates":[{"type":"knowledge","kind":"procedure","title":"...","summary":"...","disposition":"revise","target":"knowledge/existing-node","patch":"Update the Execute facet to ...","learn":"...","decide":"...","execute":"...","evidence":"...","outcome":"...","occurred_at":"...","tags":["..."]}],"relations":[{"from":"candidate-0","relation":"derived_from","to":"knowledge/existing-node"}],"unresolved_questions":[],"contradictions":[],"runtime_skills":[{"name":"...","runtime":"claude-code","outcome":"useful","reason":"..."}]}
 ```
 
 ## Synthesis contract

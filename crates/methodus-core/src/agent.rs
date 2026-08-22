@@ -2,6 +2,7 @@
 //! task/workspace/session orchestration: runtimes call it through `methodus agent`.
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use methodus_domain::GraphNode;
@@ -9,8 +10,9 @@ use methodus_store::Store;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::config::UserConfig;
 use crate::error::CoreError;
-use crate::graph::{estimated_tokens, facet, read_graph_document, GraphDocument, SourceEvidence};
+use crate::graph::{facet, read_graph_document, GraphDocument, SourceEvidence};
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 
@@ -33,19 +35,6 @@ pub struct AgentItem {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AgentResponse {
-    pub protocol_version: u32,
-    pub command: String,
-    pub goal: String,
-    pub index_revision: String,
-    pub estimated_tokens: i64,
-    pub budget_tokens: Option<i64>,
-    pub items: Vec<AgentItem>,
-    pub lazy_ids: Vec<String>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct AgentSearchResult {
     pub id: String,
     pub node_type: String,
@@ -58,6 +47,46 @@ pub struct AgentSearchResult {
     pub content_hash: String,
     pub score: i64,
     pub rationale: String,
+    pub warnings: Vec<String>,
+}
+
+/// An inventory of the consumer-visible graph. It does not select content for a
+/// question; it tells a runtime where the authoritative Markdown files are and
+/// what each file contains.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentManifestItem {
+    pub id: String,
+    pub node_type: String,
+    pub kind: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub visibility: String,
+    pub summary: String,
+    pub path: String,
+    pub absolute_path: String,
+    pub scope: Option<String>,
+    pub tags: Vec<String>,
+    pub facets: Vec<String>,
+    pub sources: Vec<SourceEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentDirectory {
+    pub path: String,
+    pub absolute_path: String,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentManifest {
+    pub protocol_version: u32,
+    pub command: String,
+    pub index_revision: String,
+    pub home: String,
+    pub selected_team: String,
+    pub directory_structure: Vec<AgentDirectory>,
+    pub graph_roots: Vec<String>,
+    pub items: Vec<AgentManifestItem>,
     pub warnings: Vec<String>,
 }
 
@@ -75,78 +104,84 @@ impl<'a> AgentQuery<'a> {
         index_revision(self.store)
     }
 
-    pub fn prepare(&self, goal: &str, budget_tokens: i64, scopes: &[String]) -> Result<AgentResponse, CoreError> {
-        let terms = terms(goal);
+    /// Return the consumer-visible graph inventory without trying to answer a
+    /// question. This is used by the interactive Use runtime as an environment
+    /// manifest; the runtime is responsible for reading and reasoning over the
+    /// listed Markdown files.
+    pub fn manifest(&self, scopes: &[String]) -> Result<AgentManifest, CoreError> {
         let revision = self.index_revision()?;
-        let mut candidates = self.visible_nodes(scopes)?.into_iter().filter_map(|node| {
-            let score = score_node(&node, &terms);
-            (score > 0).then_some((score, node))
-        }).collect::<Vec<_>>();
-        candidates.sort_by(|(left_score, left), (right_score, right)| {
-            type_rank(&left.node_type).cmp(&type_rank(&right.node_type))
-                .then_with(|| right_score.cmp(left_score))
+        let mut items = self
+            .visible_nodes(scopes)?
+            .into_iter()
+            .filter_map(|node| {
+                let path = safe_node_path(self.home, &node.path).ok()?;
+                let document = read_graph_document(self.home, &path).ok()?;
+                let facets = document
+                    .body
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("## "))
+                    .map(str::trim)
+                    .filter(|heading| !heading.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                Some(AgentManifestItem {
+                    id: node.id,
+                    node_type: node.node_type,
+                    kind: document.kind,
+                    title: node.title,
+                    status: node.status.unwrap_or_else(|| "committed".into()),
+                    visibility: node.visibility,
+                    summary: node.summary.unwrap_or_default(),
+                    path: node.path,
+                    absolute_path: path.display().to_string(),
+                    scope: node.scope,
+                    tags: node.tags,
+                    facets,
+                    sources: document.sources,
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            type_rank(&left.node_type)
+                .cmp(&type_rank(&right.node_type))
                 .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
                 .then_with(|| left.id.cmp(&right.id))
         });
-
-        let mut items = Vec::new();
+        let selected_team = UserConfig::load(self.home).selected_team().to_string();
+        let directory_structure = directory_structure(self.home, &selected_team);
+        let mut graph_roots = directory_structure
+            .iter()
+            .filter(|directory| {
+                directory.exists
+                    && Path::new(&directory.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| matches!(name, "knowledge" | "methods" | "experiences"))
+            })
+            .map(|directory| PathBuf::from(&directory.absolute_path))
+            .collect::<Vec<_>>();
+        graph_roots.sort();
+        graph_roots.dedup();
         let mut warnings = Vec::new();
-        let mut used = 0_i64;
-        let mut truncated = false;
-        for (score, node) in candidates.iter().take(24) {
-            let facet_name = preferred_facet(node);
-            let mut content = match self.node_content(node, facet_name) {
-                Ok(content) => content,
-                Err(error) => {
-                    warnings.push(format!("skipped unreadable node {}: {}", node.id, error));
-                    continue;
-                }
-            };
-            let mut estimate = estimated_tokens(&content);
-            if items.is_empty() && estimate > budget_tokens.max(1) {
-                let max_chars = budget_tokens.max(1).saturating_mul(4) as usize;
-                content = content.chars().take(max_chars).collect();
-                estimate = estimated_tokens(&content);
-                truncated = true;
-            }
-            if !items.is_empty() && used + estimate > budget_tokens.max(1) { continue; }
-            match self.item(node, facet_name, content, format!("matched task terms with score {score}")) {
-                Ok(item) => {
-                    used += estimate;
-                    items.push(item);
-                }
-                Err(error) => warnings.push(format!("skipped unreadable node {}: {}", node.id, error)),
-            }
-            if items.len() >= 8 || used >= budget_tokens.max(1) { break; }
+        if items.is_empty() {
+            warnings.push("no consumer-visible Methodus nodes are indexed".into());
         }
-
-        let selected = items.iter().map(|item| item.id.as_str()).collect::<HashSet<_>>();
-        let mut lazy_ids = Vec::new();
-        for item in &items {
-            for edge in self.store.graph_edges_for(&item.id)? {
-                let related = if edge.from_id == item.id { edge.to_id } else { edge.from_id };
-                if !selected.contains(related.as_str()) && !lazy_ids.contains(&related) {
-                    if let Some(node) = self.store.graph_node(&related)? {
-                        let status = node.status.as_deref().unwrap_or("committed");
-                        if matches!(status, "committed" | "stale") { lazy_ids.push(related); }
-                    }
-                }
-            }
+        if items.iter().any(|item| item.status == "stale") {
+            warnings.push("the graph contains stale nodes; revalidate their source evidence before treating them as current".into());
         }
-        lazy_ids.truncate(12);
-        if items.is_empty() { warnings.push("no committed or strongly relevant stale nodes matched the goal".into()); }
-        if truncated { warnings.push("the first selected facet was truncated to fit the requested token budget".into()); }
-        if self.store.list_graph_nodes(None)?.iter().any(|node| node.status.as_deref() == Some("stale")) {
-            warnings.push("the graph contains stale nodes; inspect warnings before applying historical rules".into());
-        }
-        Ok(AgentResponse {
+        Ok(AgentManifest {
             protocol_version: AGENT_PROTOCOL_VERSION,
-            command: "prepare".into(),
-            goal: goal.into(),
+            command: "manifest".into(),
             index_revision: revision,
-            estimated_tokens: used,
-            budget_tokens: Some(budget_tokens.max(1)),
-            items, lazy_ids, warnings,
+            home: self.home.display().to_string(),
+            selected_team,
+            directory_structure,
+            graph_roots: graph_roots
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            items,
+            warnings,
         })
     }
 
@@ -259,6 +294,50 @@ impl<'a> AgentQuery<'a> {
     }
 }
 
+fn directory_structure(home: &Path, selected_team: &str) -> Vec<AgentDirectory> {
+    let mut paths = vec![
+        "graph".to_string(),
+        "graph/knowledge".to_string(),
+        "graph/methods".to_string(),
+        "graph/experiences".to_string(),
+        "personal".to_string(),
+        "personal/knowledge".to_string(),
+        "personal/methods".to_string(),
+        "personal/experiences".to_string(),
+        "teams".to_string(),
+        "teams/default".to_string(),
+        "teams/default/knowledge".to_string(),
+        "teams/default/methods".to_string(),
+        "teams/default/experiences".to_string(),
+    ];
+    for suffix in ["", "/knowledge", "/methods", "/experiences"] {
+        paths.push(format!("teams/{selected_team}{suffix}"));
+    }
+    let teams = home.join("teams");
+    if let Ok(entries) = fs::read_dir(&teams) {
+        for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
+            let Some(team_id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            for suffix in ["", "/knowledge", "/methods", "/experiences"] {
+                paths.push(format!("teams/{team_id}{suffix}"));
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths.into_iter()
+        .map(|path| {
+            let absolute_path = home.join(&path);
+            AgentDirectory {
+                path,
+                absolute_path: absolute_path.display().to_string(),
+                exists: absolute_path.is_dir(),
+            }
+        })
+        .collect()
+}
+
 fn consumer_document_valid(node: &GraphNode, document: &GraphDocument) -> bool {
     let required = ["id", "title", "node_type", "kind", "status", "visibility", "summary"];
     required.iter().all(|key| document.frontmatter_keys.contains(*key))
@@ -307,7 +386,67 @@ pub fn index_revision(store: &Store) -> Result<String, CoreError> {
 
 fn preferred_facet(node: &GraphNode) -> &'static str { match node.node_type.as_str() { "method" | "knowledge" => "Execute", "experience" => "Reusable lesson", _ => "all" } }
 fn type_rank(node_type: &str) -> u8 { match node_type { "method" => 0, "knowledge" => 1, "experience" => 2, _ => 3 } }
-fn terms(input: &str) -> Vec<String> { input.split_whitespace().filter_map(|term| { let normalized = term.trim_matches(|ch: char| !ch.is_alphanumeric() && !('\u{4e00}'..='\u{9fff}').contains(&ch)).to_lowercase(); (!normalized.is_empty()).then_some(normalized) }).collect() }
+
+/// Tokenize mixed natural-language questions without requiring spaces between
+/// Chinese words and Latin identifiers. CJK runs keep the full phrase and add
+/// bigrams so a question like `nxm进程崩溃后怎么处理` can match a title such as
+/// `nxm 进程崩溃的信号处理与恢复链路`.
+fn terms(input: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut ascii = String::new();
+    let mut cjk = String::new();
+    let flush_ascii = |terms: &mut Vec<String>, ascii: &mut String| {
+        if !ascii.is_empty() {
+            terms.push(ascii.to_lowercase());
+            ascii.clear();
+        }
+    };
+    let flush_cjk = |terms: &mut Vec<String>, cjk: &mut String| {
+        if cjk.is_empty() {
+            return;
+        }
+        let chars = cjk.chars().collect::<Vec<_>>();
+        terms.push(cjk.clone());
+        if chars.len() > 1 {
+            for pair in chars.windows(2) {
+                terms.push(pair.iter().collect());
+            }
+        }
+        cjk.clear();
+    };
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            flush_cjk(&mut terms, &mut cjk);
+            ascii.push(ch);
+        } else if is_cjk(ch) {
+            flush_ascii(&mut terms, &mut ascii);
+            cjk.push(ch);
+        } else {
+            flush_ascii(&mut terms, &mut ascii);
+            flush_cjk(&mut terms, &mut cjk);
+        }
+    }
+    flush_ascii(&mut terms, &mut ascii);
+    flush_cjk(&mut terms, &mut cjk);
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn is_cjk(ch: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&ch)
+        || ('\u{3400}'..='\u{4dbf}').contains(&ch)
+        || ('\u{f900}'..='\u{faff}').contains(&ch)
+}
+
+fn term_matches(text: &str, term: &str) -> bool {
+    if term.chars().any(is_cjk) {
+        text.contains(term)
+    } else {
+        text.split_whitespace()
+            .any(|word| word.trim_matches(|ch: char| !ch.is_alphanumeric()).eq(term))
+    }
+}
 fn score_node(node: &GraphNode, terms: &[String]) -> i64 {
     let title = node.title.to_lowercase();
     let summary = node.summary.clone().unwrap_or_default().to_lowercase();
@@ -315,8 +454,8 @@ fn score_node(node: &GraphNode, terms: &[String]) -> i64 {
     let score = terms.iter().map(|term| {
         // Keep hyphenated titles such as `pre-shutdown` from becoming a false
         // exact hit for `shutdown`, while still matching normal prose words.
-        let title_hit = title.split_whitespace().any(|word| word.trim_matches(|ch: char| !ch.is_alphanumeric()).eq(term));
-        let summary_hit = summary.split_whitespace().any(|word| word.trim_matches(|ch: char| !ch.is_alphanumeric()).eq(term));
+        let title_hit = term_matches(&title, term);
+        let summary_hit = term_matches(&summary, term);
         if title_hit { 8 } else if summary_hit || metadata.contains(term) { 3 } else { 0 }
     }).sum::<i64>();
     if score == 0 { return 0; }
@@ -328,20 +467,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-
-    #[test]
-    fn prepare_returns_bounded_execute_context_and_lazy_relations() {
-        let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("graph/knowledge")).unwrap();
-        fs::write(dir.path().join("graph/knowledge/shutdown.md"), "---\nid: knowledge/shutdown\ntitle: Previous shutdown reason\nnode_type: knowledge\nkind: diagnostic-signal\nstatus: committed\nvisibility: personal\nsummary: Read the previous shutdown reason before investigating crashes.\nlinks:\n  next_step: [knowledge/crash]\n---\n\n## Execute\nRead the previous shutdown reason and branch by controlled exit, watchdog, crash, or power loss.\n").unwrap();
-        fs::write(dir.path().join("graph/knowledge/crash.md"), "---\nid: knowledge/crash\ntitle: Pre-shutdown crash detection\nnode_type: knowledge\nkind: diagnostic-signal\nstatus: committed\nvisibility: personal\nsummary: Inspect the final log window for crash evidence.\n---\n\n## Execute\nInspect the final log window.\n").unwrap();
-        let store = Store::open_memory().unwrap();
-        crate::graph::sync_graph(&store, dir.path()).unwrap();
-        let response = AgentQuery::new(&store, dir.path()).prepare("abnormal shutdown reason", 200, &[]).unwrap();
-        assert_eq!(response.items[0].id, "knowledge/shutdown");
-        assert!(response.lazy_ids.contains(&"knowledge/crash".to_string()));
-        assert!(response.estimated_tokens <= 200);
-    }
 
     #[test]
     fn index_revision_is_stable_for_an_unchanged_projection() {
@@ -360,14 +485,48 @@ mod tests {
     }
 
     #[test]
-    fn prepare_excludes_indexed_documents_that_fail_consumer_validation() {
+    fn manifest_returns_the_full_visible_inventory_without_question_selection() {
         let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("graph/knowledge")).unwrap();
-        fs::write(dir.path().join("graph/knowledge/incomplete.md"), "---\nid: knowledge/incomplete\ntitle: Incomplete\nnode_type: knowledge\nstatus: committed\nsummary: Missing kind and visibility\n---\n\n## Execute\nDo not expose this.\n").unwrap();
+        fs::create_dir_all(dir.path().join("personal/knowledge")).unwrap();
+        fs::create_dir_all(dir.path().join("personal/methods")).unwrap();
+        fs::create_dir_all(dir.path().join("teams/default/knowledge")).unwrap();
+        fs::create_dir_all(dir.path().join("teams/default/methods")).unwrap();
+        fs::create_dir_all(dir.path().join("teams/default/experiences")).unwrap();
+        fs::write(
+            dir.path().join("personal/knowledge/shutdown.md"),
+            "---\nid: knowledge/shutdown\ntitle: Shutdown signals\nnode_type: knowledge\nkind: diagnostic-signal\nstatus: committed\nvisibility: personal\nsummary: Signals that distinguish shutdown causes.\ntags: [power]\n---\n\n## Execute\nRead the final shutdown window.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("personal/methods/triage.md"),
+            "---\nid: method/triage\ntitle: Shutdown triage\nnode_type: method\nkind: diagnosis\nstatus: committed\nvisibility: personal\nsummary: A repeatable shutdown investigation.\n---\n\n## Decide\nBranch by the observed signal.\n",
+        )
+        .unwrap();
         let store = Store::open_memory().unwrap();
         crate::graph::sync_graph(&store, dir.path()).unwrap();
-        let response = AgentQuery::new(&store, dir.path()).prepare("incomplete", 200, &[]).unwrap();
-        assert!(response.items.is_empty());
-        assert!(response.warnings.iter().any(|warning| warning.contains("no committed")));
+
+        let manifest = AgentQuery::new(&store, dir.path())
+            .manifest(&[])
+            .unwrap();
+
+        assert_eq!(manifest.command, "manifest");
+        assert_eq!(manifest.selected_team, "default");
+        assert_eq!(manifest.items.len(), 2);
+        assert!(manifest.items.iter().any(|item| item.id == "knowledge/shutdown"));
+        assert!(manifest.items.iter().any(|item| item.id == "method/triage"));
+        assert!(manifest
+            .graph_roots
+            .contains(&dir.path().join("personal/knowledge").display().to_string()));
+        assert!(manifest.directory_structure.iter().any(|directory| {
+            directory.path == "teams/default/knowledge" && directory.exists
+        }));
+        let shutdown = manifest
+            .items
+            .iter()
+            .find(|item| item.id == "knowledge/shutdown")
+            .unwrap();
+        assert_eq!(shutdown.path, "personal/knowledge/shutdown.md");
+        assert_eq!(shutdown.absolute_path, dir.path().join(&shutdown.path).display().to_string());
+        assert_eq!(shutdown.facets, vec!["Execute"]);
     }
 }

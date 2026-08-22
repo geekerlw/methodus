@@ -43,7 +43,7 @@ pub fn ensure_home(home: &Path) -> Result<(), CoreError> {
 fn seed_home(home: &Path) -> Result<(), CoreError> {
     for sub in [
         "protocols", "personal/knowledge", "personal/methods",
-        "personal/experiences", "personal/candidates", "teams/default/knowledge", "teams/default/methods", "teams/default/experiences", "runs", "connectors",
+        "personal/experiences", "personal/candidates", "teams/default/knowledge", "teams/default/methods", "teams/default/experiences", "runs", "workspaces/learn", "workspaces/use", "connectors",
     ] {
         fs::create_dir_all(home.join(sub))?;
     }

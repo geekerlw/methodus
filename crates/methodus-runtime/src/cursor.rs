@@ -47,6 +47,12 @@ pub(crate) fn cursor_args(input: &SpawnInput, resume: Option<&str>) -> Vec<Strin
         args.push(sid.to_string());
     }
     args.push(cursor_permission_flag(&input.permission_mode).to_string());
+    for dir in &input.extra_dirs {
+        if dir != &input.cwd {
+            args.push("--add-dir".to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+    }
     if let Some(ref model) = input.model {
         args.push("--model".to_string());
         args.push(model.clone());
@@ -366,6 +372,15 @@ mod tests {
         let args = cursor_args(&sample_input(), Some("cur-sid-1"));
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"cur-sid-1".to_string()));
+    }
+
+    #[test]
+    fn spawn_args_include_extra_read_roots() {
+        let mut input = sample_input();
+        input.extra_dirs.push(PathBuf::from("/tmp/methodus/knowledge"));
+        let args = cursor_args(&input, None);
+        assert!(args.contains(&"--add-dir".to_string()));
+        assert!(args.contains(&"/tmp/methodus/knowledge".to_string()));
     }
 
     #[test]

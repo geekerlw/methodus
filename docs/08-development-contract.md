@@ -14,9 +14,10 @@ longer product rationale lives in `00-product.md`–`07-learning-vs-refine.md`.
 | Ordinary coding session | nothing | Claude Code, Codex, Cursor, or another native runtime |
 | Team publication | status, validation, diff, publish plan | Git commit, push, merge, remote review |
 
-A change that makes Methodus proxy a normal Agent conversation, create a task
-workspace, copy graph content into a project, or write graph content from a consumer
-Agent violates the contract.
+A change that makes Methodus proxy a normal Agent conversation, create an ordinary
+coding-task workspace, copy graph content into a project, or write graph content from
+a consumer Agent violates the contract. Methodus-managed runtime workspaces for its
+own Learn and Use handoffs are allowed and remain operational, not canonical content.
 
 ## 2. Canonical file rules
 
@@ -49,20 +50,31 @@ candidate --reject--> deleted
 - Candidate nodes are excluded from normal Agent queries; Review rejection deletes
   the candidate. Legacy rejected/deprecated files are history-only cleanup items.
 - Merge always names a concrete target; never infer a target from ranking alone.
+- Knowledge merge is facet-level and confirmation-gated: only explicitly accepted
+  candidate `Learn`, `Decide`, `Execute`, or `Evidence` sections may replace the
+  target. Frontmatter and unselected target sections are preserved; the candidate
+  is deleted only after the canonical write succeeds.
 
 ## 4. Learn output contract
 
 The deliberate-learning runtime must challenge scope, inspect evidence, seek
 counterexamples, ask consequential questions, and separate fact/inference/
-contradiction/unknown. When the maintainer explicitly finalizes the learning, it writes
-the supplied run-specific return artifact with a fenced JSON object:
+contradiction/unknown. Before external investigation it must read the
+run-specific `METHODUS_LEARN.md` graph snapshot, inspect relevant existing node
+bodies, and decide whether each durable conclusion is new or an integration
+proposal against an existing node. When the maintainer explicitly finalizes the
+learning, it writes the supplied run-specific return artifact with a fenced JSON
+object:
 
 ```json
-{"candidates":[{"type":"knowledge|method|experience","kind":"...","title":"...","summary":"...","learn":"...","decide":"...","execute":"...","evidence":"...","outcome":"...","occurred_at":"...","tags":["..."]}],"relations":[{"from":"candidate-0","relation":"validated_by","to":"candidate-1"}],"unresolved_questions":[],"contradictions":[],"runtime_skills":[{"name":"...","runtime":"claude-code","outcome":"useful","reason":"..."}]}
+{"graph_review":{"searched":true,"relevant_nodes":[{"id":"knowledge/existing","reason":"same boundary"}],"no_match_reason":null},"candidates":[{"type":"knowledge|method|experience","kind":"...","title":"...","summary":"...","disposition":"new|revise|merge|revalidate|supersede","target":"knowledge/existing","patch":"facet-level proposed change, or empty for new","learn":"...","decide":"...","execute":"...","evidence":"...","outcome":"...","occurred_at":"...","tags":["..."]}],"relations":[{"from":"candidate-0","relation":"validated_by","to":"candidate-1"}],"unresolved_questions":[],"contradictions":[],"runtime_skills":[{"name":"...","runtime":"claude-code","outcome":"useful","reason":"..."}]}
 ```
 
 Methodus assigns operational IDs and writes one Markdown draft per candidate. Runtime
-output is never treated as committed just because JSON parses. Candidate relation
+output is never treated as committed just because JSON parses. For `revise`, `merge`,
+`revalidate`, or `supersede`, `target` must be an exact canonical node ID and
+`patch` must describe the proposed facet-level change; Methodus records this as a
+Review proposal and never applies it automatically. Candidate relation
 references may use `candidate-<index>`, a canonical ID, or an exact candidate title;
 unresolved endpoints remain visible for Review instead of being silently guessed. If
 evidence is not sufficient, the runtime should ask another focused question or return
@@ -76,7 +88,7 @@ Skill installation or evolution.
 The connector may invoke only:
 
 ```text
-methodus agent prepare --goal <text> [--budget <n>] [--scope personal,team]
+methodus agent manifest [--scope personal,team]
 methodus agent search --query <text> [--type ...] [--kind ...] [--scope ...]
 methodus agent get <id> [--facet ...] [--history]
 methodus agent related <id> [--relation ...] [--depth 1]
@@ -84,8 +96,9 @@ methodus agent status
 ```
 
 The process opens SQLite read-only, does not migrate or sync, never calls an LLM, and
-prints only the requested Markdown/JSON payload to stdout. Results are bounded by
-item count and estimated tokens. On failure, the connector continues the user task
+prints only the requested Markdown/JSON payload to stdout. The manifest exposes the
+complete consumer-visible inventory and graph roots; `get` and `related` are explicit
+reads chosen by the native Runtime. On failure, the connector continues the user task
 without inventing Methodus context.
 
 ## 6. TUI invariants

@@ -68,7 +68,7 @@ large, extract it without changing the boundaries below.
 
 Planned extraction seams, not required directories, are:
 
-- deterministic retrieval and token budgeting from `agent.rs`;
+- manifest assembly and explicit read boundaries from `agent.rs`;
 - Learn state and CandidateSet parsing from `engine.rs`;
 - source adapters and freshness checks from `graph.rs`;
 - review/edit/deprecate/revalidate operations from `engine.rs`;
@@ -104,7 +104,7 @@ Each connector invocation starts a short-lived process:
 
 1. parse and validate arguments;
 2. open the current index read-only;
-3. retrieve and budget results deterministically;
+3. return the requested manifest, node body, or relation metadata;
 4. write Markdown or JSON to stdout;
 5. exit with a documented code.
 
@@ -113,22 +113,41 @@ this path.
 
 ## 5. Retrieval pipeline
 
-`prepare(goal, budget)` is deterministic in v1:
+The external Connector flow is manifest-first:
 
 ```text
-normalize goal
-  → lexical/tag/scope recall over committed + eligible stale nodes
-  → select Methods matching intent
-  → expand a bounded set of typed relations
-  → rank Knowledge and reusable Experience lessons
-  → prefer committed over stale
-  → select facets under token budget
-  → emit rationale, lifecycle, source status, and lazy node IDs
+manifest
+  → expose graph roots, revision, and the complete consumer-visible inventory
+  → native Runtime semantically selects relevant nodes for the user's question
+  → get selected node bodies and related graph neighbors
+  → native Runtime revalidates stale evidence and reasons about the answer
 ```
 
 The native agent remains the reasoning model. Methodus does not make a second LLM call
-for ordinary consumption. Semantic embeddings may be added later only if evaluated
-against a real engineering-query corpus.
+or make a lexical preselection for ordinary consumption. The explicit `search` command
+is still available as a bounded metadata locator, but it is not the Connector's default
+context-selection mechanism.
+
+The maintainer TUI Use path deliberately does not use this selection pipeline to
+precompute an answer. It prepares a temporary Use contract and inventory, opens the
+validated graph directories as protected evidence, and hands the question to the
+native Runtime from its Methodus-managed workspace:
+
+```text
+Use question
+  → write METHODUS_USE.md with graph revision, node inventory, facets, and sources
+  → open only consumer-visible graph directories plus explicit @ sources
+  → hand the terminal to the native Runtime from a Methodus-managed Use workspace using Learn's permission mapping
+  → Runtime reads and reasons over the relevant Markdown files
+  → if evidence is insufficient, write a learning_recommended return object
+  → restore the TUI, route the recommendation to /attention, and retain the native session ID when resumable
+```
+
+The same environment contract is used by both TUI Use and the external Connector. TUI
+Use materializes it as `METHODUS_USE.md`, opens the graph roots and selected Team
+directory structure, and keeps writes scoped to `workspaces/use/<session-id>`; the
+external Connector receives the same inventory from `methodus agent manifest` and asks the native
+Runtime to read selected nodes through `get` or its permitted file tools.
 
 ## 6. Learn pipeline
 
@@ -179,7 +198,7 @@ The repository currently provides the following vertical slice:
 | Learn | Runtime-backed Learn conversation with explicit permission mode; deliberate-learning protocol; durable event stream; structured CandidateSet JSON; transcript and candidate files under `runs/` and `personal/candidates/` |
 | Review | TUI inspect, commit Personal, reject, mark Team visibility, and explicit Knowledge merge target |
 | Team | selected Team status, Git diff, validation summary, and non-mutating publish plan |
-| Agent boundary | `methodus agent prepare/search/get/related/status`; read-only SQLite; candidate/rejected exclusion; bounded results |
+| Agent boundary | `methodus agent manifest/search/get/related/status`; read-only SQLite; candidate/rejected exclusion; explicit node reads |
 | Connector | `methodus setup` installs the single official read-only connector Skill; it contains no graph data |
 
 Candidate editing, stale revalidation, deprecation, Team selection, and connector
